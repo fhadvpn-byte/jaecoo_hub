@@ -8,13 +8,39 @@ from google import genai
 from google.genai import types
 
 DB_NAME = "jaecoo_knowledge.db"
+CONFIG_FILE = "config.json"
 
 # ==========================================
-# 1. قالب المخرجات المهيكل (Pydantic Schema)
+# 1. إدارة الإعدادات الدائمة (Config Manager)
+# ==========================================
+def load_config() -> dict:
+    default_cfg = {
+        "gemini_api_key": "",
+        "tg_api_id": "",
+        "tg_api_hash": "",
+        "tg_group": "",
+        "auto_reply_enabled": False,
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                default_cfg.update(data)
+        except Exception:
+            pass
+    return default_cfg
+
+
+def save_config(cfg: dict):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+# ==========================================
+# 2. القالب المهيكل للبطاقة الفنية (Schema)
 # ==========================================
 class KnowledgeCardSchema(BaseModel):
     is_worth_archiving: bool = Field(
-        description="هل النقاش يحتوي على معلومة مفيدة أو سؤال أو رأي يستحق الأرشفة؟ (False فقط للردود الفارغة مثل: هلا، شكراً، ملصقات فقط)"
+        description="True إذا كان النقاش أو الصورة أو الصوت يحتوي على معلومة فنية أو تجربة أو سؤال مفيد. False للتحيات القصيرة والردود الفارغة."
     )
     category: Literal[
         "الأعطال والتشخيص",
@@ -24,11 +50,11 @@ class KnowledgeCardSchema(BaseModel):
         "الصيانة الدورية والوكالات",
         "الإكسسوارات والتجهيزات",
         "تجارب القيادة والأداء الفعلي",
-        "نبض القروب والدردشة العامة"
-    ] = Field(description="القسم الأنسب من الأقسام الثمانية المعتمدة")
+        "نبض القروب والدردشة العامة",
+    ] = Field(description="القسم الأنسب من الأقسام الثمانية")
 
     car_model: Literal["Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"] = Field(
-        description="طراز السيارة المذكور في النقاش"
+        description="طراز السيارة"
     )
     sub_system: Literal[
         "المحرك والتيربو",
@@ -38,50 +64,45 @@ class KnowledgeCardSchema(BaseModel):
         "التكييف والتبريد",
         "العضلات والفرامل والتعليق",
         "الهيكل الخارجي والمقصورة",
-        "عام"
-    ] = Field(description="النظام الفرعي للسيارة المتعلق بالموضوع")
+        "عام",
+    ] = Field(description="النظام الفرعي للسيارة")
 
-    title: str = Field(description="عنوان واضح ومختصر للبطاقة لا يتجاوز 10 كلمات")
-    problem_or_topic: str = Field(description="ملخص المشكلة المطروحة أو الموضوع الأساسي بدقة")
-    solution_or_summary: str = Field(description="الحل المستخلص من ردود الأعضاء، أو خلاصة التجربة والرأي")
+    title: str = Field(description="عنوان واضح ومختصر للبطاقة (5 إلى 10 كلمات)")
+    problem_or_topic: str = Field(description="ملخص المشكلة أو الاستفسار أو الموضوع بدقة")
+    solution_or_summary: str = Field(description="الحل التفصيلي المستخلص من الردود أو الصوت أو الصورة")
     part_numbers_or_specs: Optional[str] = Field(
         default="",
-        description="أرقام قطع الغيار، مقاسات، لزوجة زيت، أو أسماء أجهزة/تطبيقات ذُكرت في النقاش إن وجدت"
+        description="أرقام قطع الغيار (Part Numbers)، المقاسات، لزوجة الزيت، التكلفة، أو أسماء الأجهزة والتطبيقات",
     )
     is_verified_solution: bool = Field(
-        description="True إذا أكد صاحب المشكلة أو أكثر من عضو خبير أن الحل مجرب وناجح فعلياً"
+        description="True إذا تضمن النقاش حلاً مجرباً ومؤكداً"
     )
-    keywords: str = Field(description="كلمات مفتاحية مفصولة بفاصلة لتسهيل البحث السريع")
+    keywords: str = Field(description="كلمات مفتاحية مفصولة بفاصلة")
 
-# ==========================================
-# 2. البرومبت الهندسي (System Prompt)
-# ==========================================
+
 SYSTEM_PROMPT = """
-أنت مهندس سيارات خبير ومحلل بيانات متخصص في سيارات جايكو (Jaecoo J7 و Jaecoo J8).
-مهمتك هي قراءة سلسلة رسائل (سؤال مع ردوده) مسحوبة من قروب ملاك جايكو في التلجرام، وتحويلها إلى "بطاقة معرفة فنية موحدة".
+أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7 و Jaecoo J8) ومحلل بيانات القروب.
+مهمتك قراءة نقاشات الأعضاء (نصوص، سلاسل ردود، صور قطع غيار/فواتير/شاشات أعطال، أو بصمات صوتية) وتحويلها إلى بطاقة معرفة فنية.
 
-قواعد التحليل والتصنيف الصارمة:
-1. ادمج السياق: قد يبدأ النقاش بسؤال عن عطل، وتأتي الإجابة في الرد الثالث أو الرابع. استخلص المشكلة من البداية والحل النهائي من الردود.
-2. توزيع الأقسام الثمانية:
-   - "الأعطال والتشخيص": إذا كان النقاش يعرض مشكلة فنية أو كود عطل أو ظاهرة غريبة ولم يصل الأعضاء لحل نهائي مؤكد بعد، أو كان التركيز على تشخيص السبب.
-   - "الإصلاحات والحلول المؤكدة": إذا تضمن النقاش خطوات إصلاح واضحة، أو حل مشكلة في الوكالة/ورشة، أو طريقة برمجة/إصلاح يدوي نجحت بالفعل.
-   - "بنك القطع البديلة والمطابقات": إذا ذكر النقاش قطعة غيار من سيارة أخرى (مثل تويوتا، هيونداي، شيري...) تركب على الجايكو، أو بطارية متوافقة (مثل AGM)، أو بواجي وفلاتر بديلة مع أرقامها.
-   - "الأنظمة الذكية والشاشات": لكل ما يخص شاشة السيارة، أندرويد أوتو، أبل كار بلاي، أجهزة الـ AI Box (مثل Carlinkit)، تحديثات السوفتوير، الداش كام، والأوامر الصوتية.
-   - "الصيانة الدورية والوكالات": لتكاليف وفواتير الصيانة الدورية، لزوجة الزيوت، الضمان، وتقييم فروع الوكالة ومراكز الخدمة.
-   - "الإكسسوارات والتجهيزات": لروابط وصور الكماليات (فرشات، حمايات، حوامل جوال، مفاتيح، تجهيزات البر والرحلات).
-   - "تجارب القيادة والأداء الفعلي": للانطباعات حول العزل، الرساوة، الأداء في العقبات والمرتفعات الجبلية، استهلاك الوقود، وتجربة الدفع الرباعي.
-   - "نبض القروب والدردشة العامة": للنقاشات العامة، الاستفسارات الشرائية العامة، أو السواليف المفيدة التي لا تندرج تحت الأقسام الفنية.
-3. حافظ على المصطلحات الفنية والأرقام: إذا ذُكر رقم قطعة أو مقاس أو اسم برنامج أو سعر، اكتبه بدقة في الحقل المخصص.
+قواعد العمل:
+1. ادمج السؤال مع جميع الردود التابعة له لاستخلاص المشكلة من جهة والحل النهائي من جهة أخرى.
+2. إذا أُرفقت صورة (كرتون قطعة غيار، فاتورة صيانة، شاشة طبلون، إكسسوار)، استخرج رقم القطعة أو الكود أو السعر بدقة وضعها في حقل المواصفات.
+3. إذا أُرفق ملف صوتي، فرّغ محتواه الفني واستخلص منه التشخيص أو الحل مباشرة.
+4. صنّف البطاقة بدقة في أحد الأقسام الثمانية المعتمدة.
 """
 
 # ==========================================
-# 3. إدارة قاعدة البيانات (SQLite)
+# 3. إدارة قاعدة البيانات (SQLite + WAL)
 # ==========================================
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME, timeout=20, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
-    cursor.execute("""
+
+def init_db():
+    conn = get_db_connection()
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_msg_id INTEGER UNIQUE,
@@ -103,10 +124,10 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_name: str, raw_text: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
+    conn = get_db_connection()
+    conn.execute("""
         INSERT OR REPLACE INTO knowledge_cards (
             telegram_msg_id, thread_url, category, car_model, sub_system,
             title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
@@ -122,24 +143,28 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
         card_data["problem_or_topic"],
         card_data["solution_or_summary"],
         card_data.get("part_numbers_or_specs", ""),
-        1 if card_data["is_verified_solution"] else 0,
-        card_data["keywords"],
+        1 if card_data.get("is_verified_solution") else 0,
+        card_data.get("keywords", ""),
         author_name,
         raw_text,
-        datetime.now().strftime("%Y-%m-%d %H:%M")
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
     ))
     conn.commit()
     conn.close()
 
 # ==========================================
-# 4. دالة التحليل بالذكاء الاصطناعي (Gemini)
+# 4. دوال الذكاء الاصطناعي (تحليل + وسائط + بحث + ملخص)
 # ==========================================
-def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes: bytes = None, mime_type: str = None) -> dict:
+def analyze_thread_with_ai(
+    thread_text: str,
+    api_key: str,
+    media_bytes: bytes = None,
+    mime_type: str = None,
+) -> dict:
     client = genai.Client(api_key=api_key)
+    prompt = f"حلل المحتوى التالي من قروب ملاك جايكو واستخرج البطاقة الفنية المهيكلة:\n\n{thread_text}"
+    contents = [prompt]
 
-    contents = [f"حلل سلسلة النقاش التالية من قروب جايكو واستخرج البطاقة الفنية:\n\n{thread_text}"]
-
-    # دعم الوسائط المتعددة (بصمة صوتية أو صورة قطعة غيار/فاتورة)
     if media_bytes and mime_type:
         contents.append(types.Part.from_bytes(data=media_bytes, mime_type=mime_type))
 
@@ -150,7 +175,64 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes: bytes = 
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_schema=KnowledgeCardSchema,
-            temperature=0.1
-        )
+            temperature=0.1,
+        ),
     )
     return json.loads(response.text)
+
+
+def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:
+    """تُستخدم للرد التلقائي في التلجرام أو من داخل المنصة إذا تكرر سؤال له حل معتمد"""
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT title, car_model, problem_or_topic, solution_or_summary, part_numbers_or_specs, author_name "
+        "FROM knowledge_cards WHERE is_verified_solution = 1 ORDER BY id DESC LIMIT 100"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return None
+
+    archive_context = "\n".join([
+        f"- [{r[1]}] {r[0]} | المشكلة: {r[2]} | الحل: {r[3]} | القطع: {r[4]} (مشاركة: {r[5]})"
+        for r in rows
+    ])
+
+    client = genai.Client(api_key=api_key)
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            f"الأرشيف المعتمد لقروب جايكو:\n{archive_context}\n\n"
+            f"سؤال العضو الحالي:\n{question_text}\n\n"
+            "إذا كان سؤال العضو له حل واضح في الأرشيف أعلاه، اكتب إجابة مختصرة وودودة تبدأ بـ "
+            "'💠 أهلاً بك! تمت مناقشة هذا الموضوع سابقاً في القروب وإليك الخلاصة المعتمدة:' متبوعة بالحل واسم صاحب التجربة. "
+            "أما إذا لم يكن السؤال موجوداً في الأرشيف، فاكتب كلمة NO_MATCH فقط."
+        ),
+        config=types.GenerateContentConfig(temperature=0.1),
+    )
+    reply = res.text.strip()
+    return None if "NO_MATCH" in reply else reply
+
+
+def generate_daily_pulse_summary(api_key: str) -> str:
+    """توليد نشرة ملخص نبض القروب من آخر البطاقات المسجلة"""
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT category, car_model, title, solution_or_summary, author_name FROM knowledge_cards ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return "لا توجد بيانات كافية لتوليد الملخص."
+
+    items = "\n".join([f"- ({r[0]} | {r[1]}) {r[2]}: {r[3]} [بواسطة: {r[4]}]" for r in rows])
+    client = genai.Client(api_key=api_key)
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=(
+            f"بناءً على أحدث المواضيع الموثقة في قروب جايكو:\n{items}\n\n"
+            "صِغ نشرة موجزة ومنظمة بعنوان '⚡ الموجز الذكي لنبض قروب جايكو' تصلح للنشر في القروب أو القراءة السريعة، "
+            "تبرز أهم الحلول المكتشفة، القطع البديلة، وأبرز النقاشات في نقاط أنيقة."
+        ),
+    )
+    return res.text
