@@ -152,29 +152,24 @@ def _stored_card_count() -> int:
 
 
 async def _open_client(cfg: dict, logs: list):
-    """يتصل بجلسة الحساب عبر String Session، ثم بملف الجلسة المحلي إن وُجد."""
+    """يفضل ملف الجلسة المحلي مباشرة، ثم الجلسة النصية إن لم يوجد الملف."""
     api_id, api_hash = _api_credentials(cfg)
-    session_text = _session_string(cfg)
-    if session_text:
-        try:
-            client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30)
-        except Exception as exc:
-            return None, f"تعذر قراءة TELEGRAM_SESSION. تأكد أنها String Session صالحة. التفاصيل: {exc}"
-        if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية (String Session)."):
-            return client, None
-        return None, "جلسة TELEGRAM_SESSION غير موثقة. ضع String Session الحالية لحسابك الشخصي في أسرار Streamlit."
-
     if os.path.exists(PERSONAL_SESSION_FILE):
         session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
         client = TelegramClient(session_name, api_id, api_hash, timeout=30)
         if await _connect_saved_client(client, logs, "تم الاتصال بملف الجلسة المحلي user_session.session."):
             return client, None
-        return None, "ملف user_session.session المحلي غير موثق."
 
-    return None, (
-        "جلسة تيليجرام غير مُعرّفة. أضف المفتاح TELEGRAM_SESSION في Secrets على Streamlit Cloud "
-        "بقيمة String Session لحسابك الشخصي. ملف user_session.session غير موجود على السحابة."
-    )
+    session_text = _session_string(cfg)
+    if session_text:
+        try:
+            client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30)
+        except Exception:
+            client = None
+        if client is not None and await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية."):
+            return client, None
+
+    return None, "تعذر الاتصال بجلسة تيليجرام."
 
 
 async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
