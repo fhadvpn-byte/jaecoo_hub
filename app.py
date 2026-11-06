@@ -78,6 +78,11 @@ st.markdown("""
         font-weight: 800;
         color: #00e1ff;
     }
+    .k-card,
+    .k-card * {
+        direction: rtl !important;
+        text-align: right !important;
+    }
     .k-card {
         background: linear-gradient(145deg, rgba(16, 40, 69, 0.85), rgba(9, 24, 44, 0.92));
         border: 1px solid rgba(0, 212, 255, 0.25);
@@ -86,11 +91,17 @@ st.markdown("""
         margin-bottom: 16px;
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     }
+    .k-tags {
+        direction: rtl !important;
+        text-align: right !important;
+    }
     .k-title {
         color: #00e1ff;
         font-size: 1.25rem;
         font-weight: 700;
         margin: 10px 0;
+        direction: rtl !important;
+        text-align: right !important;
     }
     .k-tag {
         display: inline-block;
@@ -101,6 +112,8 @@ st.markdown("""
         padding: 3px 10px;
         font-size: 0.82rem;
         margin-left: 6px;
+        direction: rtl !important;
+        text-align: right !important;
     }
     .k-section {
         background: rgba(6, 17, 33, 0.65);
@@ -109,6 +122,8 @@ st.markdown("""
         border-radius: 8px;
         margin-top: 10px;
         font-size: 0.95rem;
+        direction: rtl !important;
+        text-align: right !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -385,7 +400,7 @@ else:
 
         st.markdown(f"""
         <div class="k-card">
-            <div>
+            <div class="k-tags">
                 <span class="k-tag">🚙 {car_safe}</span>
                 <span class="k-tag">⚙️ {sub_safe}</span>
                 <span class="k-tag">📂 {cat_safe}</span>
