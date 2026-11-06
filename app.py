@@ -739,7 +739,7 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
         key="public_lab_file",
     )
 
-limit_val = st.slider("عدد الرسائل", min_value=1, max_value=500, value=300, step=1, key="public_pull_limit")
+limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
 sync_feedback = st.empty()
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):
