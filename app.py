@@ -2,6 +2,7 @@ import hmac
 import html
 import os
 import secrets
+from pathlib import Path
 import threading
 import time
 from datetime import timedelta
@@ -72,12 +73,37 @@ def auto_sync_status():
 # ==========================================
 # 1. إعدادات الصفحة والتصميم (هوية حسم الذكية)
 # ==========================================
+PAGE_TITLE = "منصة جايكو الذكية للأعطال والحلول"
+
 st.set_page_config(
-    page_title="منصة جايكو الذكية | هوية حسم",
+    page_title=PAGE_TITLE,
     page_icon="💠",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+def _publish_share_title(title: str) -> None:
+    """يثبت عنوان HTML الذي يقرأه تيليجرام قبل تشغيل واجهة Streamlit."""
+    try:
+        index = Path(st.__file__).resolve().parent / "static" / "index.html"
+        html_text = index.read_text(encoding="utf-8")
+        replacement = (
+            f"<title>{title}</title>\n"
+            f'    <meta property="og:title" content="{title}" />\n'
+            f'    <meta name="twitter:title" content="{title}" />'
+        )
+        if f"<title>{title}</title>" in html_text and 'property="og:title"' in html_text:
+            return
+        updated = html_text.replace("<title>Streamlit</title>", replacement, 1)
+        if updated == html_text:
+            return
+        index.write_text(updated, encoding="utf-8")
+    except Exception:
+        return
+
+
+_publish_share_title(PAGE_TITLE)
 
 _SETTING_SOURCES = {
     "groq_api_key": ("groq_api_key", "GROQ_API_KEY", "gemini_api_key"),
