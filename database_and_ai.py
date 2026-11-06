@@ -1,6 +1,7 @@
-import sqlite3
 import json
 import os
+import re
+import sqlite3
 from datetime import datetime
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
@@ -69,8 +70,8 @@ class KnowledgeCardSchema(BaseModel):
     problem_or_topic: str = Field(description="وصف المشكلة بالعربية الفصحى حصراً. ممنوع nan وممنوع ترك الحقل فارغاً عند الحفظ.")
     solution_or_summary: str = Field(description="الحل أو الخلاصة بالعربية الفصحى حصراً. ممنوع nan وممنوع الجمل الإنجليزية.")
     part_numbers_or_specs: Optional[str] = Field(
-        default="",
-        description="أرقام القطع والمواصفات كما هي، مع شرح عربي مختصر حولها.",
+        default="غير محدد",
+        description="اسم القطعة والمواصفات داخل جملة عربية، أو القيمة غير محدد. ممنوع nan.",
     )
     is_verified_solution: bool = Field(
         description="True إذا تضمن النقاش حلاً مجرباً ومؤكداً"
@@ -79,13 +80,14 @@ class KnowledgeCardSchema(BaseModel):
 
 
 SYSTEM_PROMPT = """
-أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J8, J8 SHS, J5, J7) ومحلل بيانات قروب التيليجرام.
-مهمتك استخراج بطاقة معرفة فنية فقط عندما تحتوي الرسالة على عطل أو حل أو قطعة أو إجراء واضح.
-اللغة إلزامية: اكتب title و problem_or_topic و solution_or_summary و keywords بالعربية الفصحى حصراً.
-ممنوع الإنجليزية في هذه الحقول، وممنوع القيم nan أو None أو null أو النصوص الفارغة.
-تجاهل ولا تؤرشف: الرسائل العامة، التحيات، الدردشة، الأسئلة المكتوبة بالإنجليزية، والنصوص غير الواضحة أو الناقصة.
-في هذه الحالات اجعل is_worth_archiving = false ولا تخترع عنواناً أو حلاً.
-إذا كانت المعلومة الفنية واضحة فصح بالعربية الفصحى، ويُسمح بإبقاء اسم الطراز أو رقم القطعة داخل الجملة العربية.
+أنت مهندس صيانة سيارات خبير في طرازات جايكو (Jaecoo).
+مهمتك تحليل رسائل قروب الملاك واستخراج البطاقات المعرفية المفيدة فقط.
+شروط صارمة:
+1. ممنوع كتابة أي جملة إنجليزية في title أو problem_or_topic أو solution_or_summary أو part_numbers_or_specs أو keywords. ترجم المعنى إلى العربية الفصحى.
+2. يُسمح فقط بإبقاء اسم الطراز أو رقم القطعة داخل جملة عربية، مثل Jaecoo J5 أو 5W-30.
+3. إذا كانت الرسالة سؤالاً بلا إجابة، أو دردشة عامة، أو نصاً غير واضح، اجعل is_worth_archiving = false ولا تخترع بطاقة.
+4. صنّف car_model إلى أحد هذه الخيارات فقط: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
+5. إذا لم تُذكر قطع غيار فاكتب في part_numbers_or_specs القيمة: غير محدد. ممنوع nan أو None أو null.
 """
 
 # ==========================================
@@ -150,7 +152,7 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
 # ==========================================
 # 4. محرك Groq الذكي والسريع
 # ==========================================
-GROQ_MODELS = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
+GROQ_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False):
@@ -197,14 +199,21 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     completion = _groq_complete(
         api_key,
         [
-            {"role": "system", "content": "أنت مساعد يستخرج JSON فقط. الحقول النصية بالعربية الفصحى حصراً. تجاهل الرسائل العامة والأسئلة الإنجليزية والنصوص غير الواضحة بجعل is_worth_archiving قيمة false. ممنوع إخراج nan."},
+            {"role": "system", "content": "استخرج JSON فقط. الحقول النصية بالعربية الفصحى حصراً. السؤال بلا إجابة والدردشة العامة والنص غير الواضح تعني is_worth_archiving = false. القطع غير المذكورة تُكتب غير محدد، وممنوع إخراج nan."},
             {"role": "user", "content": prompt},
         ],
         json_mode=True,
     )
     
     result_text = completion.choices[0].message.content
-    return json.loads(result_text)
+    data = json.loads(result_text)
+    parts = str(data.get("part_numbers_or_specs") or "").strip()
+    if parts.lower() in {"", "nan", "none", "null"}:
+        data["part_numbers_or_specs"] = "غير محدد"
+    problem_text = str(data.get("problem_or_topic") or "")
+    if data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
+        data["is_worth_archiving"] = False
+    return data
 
 
 def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:

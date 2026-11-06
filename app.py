@@ -41,6 +41,40 @@ _SYNC_STATE = {
 }
 
 
+def clean_database() -> None:
+    """يزيل nan والبطاقات الإنجليزية العشوائية عند فتح التطبيق."""
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE knowledge_cards
+            SET part_numbers_or_specs = 'غير محدد'
+            WHERE part_numbers_or_specs IS NULL
+               OR LOWER(TRIM(part_numbers_or_specs)) IN ('nan', 'none', '', 'null')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE knowledge_cards
+            SET title = 'الاعتمادية وتكلفة قطع الغيار والعزل لسيارة Jaecoo J5',
+                problem_or_topic = 'استفسار حول مستوى الاعتمادية، أسعار قطع الغيار، وجودة العزل في طراز Jaecoo J5 مع ملاحظة حول توفر الوكيل والصيانة الذاتية.',
+                solution_or_summary = 'يُنصح بمراجعة جدول الصيانة الدورية ومقارنة أسعار القطع الاستهلاكية لدى الوكيل المعتمد ومتاجر القطع البديلة.',
+                part_numbers_or_specs = 'غير محدد'
+            WHERE title LIKE '%Reliability and parts cost for Jaecoo J5%'
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM knowledge_cards
+            WHERE title LIKE '%جزء جميلة%'
+               OR problem_or_topic LIKE '%User asks about%'
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def delete_knowledge_card(card_id: int) -> None:
     conn = get_db_connection()
     try:
@@ -280,6 +314,7 @@ def viewer_is_admin(cfg: dict) -> bool:
 
 
 init_db()
+clean_database()
 cfg = apply_cloud_string_session(ensure_admin_token(hydrate_config(load_config())))
 is_admin = viewer_is_admin(cfg)
 start_auto_sync(cfg)
@@ -1011,12 +1046,17 @@ else:
         title_safe = html.escape(_card_text(row.get("title")))
         prob_safe = html.escape(_card_text(row.get("problem_or_topic")))
         sol_safe = html.escape(_card_text(row.get("solution_or_summary")))
-        parts_safe = html.escape(_card_text(row.get("part_numbers_or_specs")))
+        parts_raw = _card_text(row.get("part_numbers_or_specs"))
+        parts_safe = html.escape(parts_raw)
         car_safe = html.escape(_card_text(row.get("car_model")))
         sub_safe = html.escape(_card_text(row.get("sub_system")))
         cat_safe = html.escape(_card_text(row.get("category")))
 
-        parts_html = f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>' if parts_safe else ""
+        parts_html = (
+            f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>'
+            if parts_raw and parts_raw != "غير محدد"
+            else ""
+        )
 
         st.markdown(f"""
         <div class="k-card">
@@ -1031,6 +1071,6 @@ else:
             {parts_html}
         </div>
         """, unsafe_allow_html=True)
-        if st.button("حذف البطاقة", key=f"delete_card_{card_id}"):
+        if st.button(f"🗑️ حذف البطاقة #{card_id}", key=f"delete_card_{card_id}"):
             delete_knowledge_card(card_id)
             st.rerun()
