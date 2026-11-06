@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from database_and_ai import (
+    analyze_image_bytes,
     analyze_thread_with_ai,
     find_matching_solution_in_db,
     generate_daily_pulse_summary,
@@ -19,6 +20,7 @@ from database_and_ai import (
     load_config,
     save_card,
     save_config,
+    transcribe_media_bytes,
 )
 from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
 
@@ -30,6 +32,12 @@ JAECOO_MODELS = [
     "Jaecoo J5",
     "جميع الطرازات / عام",
 ]
+MEDIA_BADGES = {
+    "text": {"icon": "📝", "label": "رسالة نصية", "color": "#38bdf8"},
+    "image": {"icon": "🖼️", "label": "تحليل صورة", "color": "#a855f7"},
+    "audio": {"icon": "🎙️", "label": "مقطع صوتي", "color": "#10b981"},
+    "video": {"icon": "🎥", "label": "تحليل فيديو", "color": "#f59e0b"},
+}
 _SYNC_GUARD = threading.Lock()
 _SYNC_STATE = {
     "running": False,
@@ -82,6 +90,26 @@ def delete_knowledge_card(card_id: int) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _prepare_lab_source(lab_text: str, lab_file, api_key: str) -> tuple[str, str]:
+    """يحوّل مرفق المختبر إلى نص عربي مع نوع الوسيط قبل تحليل البطاقة."""
+    caption = (lab_text or "").strip()
+    if lab_file is None:
+        return caption, "text"
+    media_bytes = lab_file.read()
+    mime_type = lab_file.type or ""
+    extension = os.path.splitext(lab_file.name or "")[1].lower() or ".bin"
+    if mime_type.startswith("image"):
+        vision_text = analyze_image_bytes(api_key, media_bytes, caption, mime_type or "image/jpeg")
+        return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image"
+    if mime_type.startswith("audio"):
+        spoken_text = transcribe_media_bytes(api_key, media_bytes, extension)
+        return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio"
+    if mime_type.startswith("video"):
+        spoken_text = transcribe_media_bytes(api_key, media_bytes, extension or ".mp4")
+        return f"الكلام المسموع في الفيديو: {spoken_text}\nتعليق الفيديو: {caption}".strip(), "video"
+    return caption or "حلل المرفق", "text"
 
 
 def _card_text(value) -> str:
@@ -818,7 +846,7 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
     lab_text = st.text_area("النص المراد تحليله", key="public_lab_text", height=120)
     lab_file = st.file_uploader(
         "مرفق اختياري",
-        type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"],
+        type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a", "mp4"],
         key="public_lab_file",
     )
 
@@ -906,11 +934,10 @@ with analyze_col:
         else:
             with st.spinner("جاري التحليل..."):
                 try:
-                    media_bytes = lab_file.read() if lab_file else None
-                    mime_type = lab_file.type if lab_file else None
-                    card = analyze_thread_with_ai(lab_text or "حلل المرفق", groq_key, media_bytes, mime_type)
+                    source_text, media_type = _prepare_lab_source(lab_text, lab_file, groq_key)
+                    card = analyze_thread_with_ai(source_text or "حلل المرفق", groq_key)
                     msg_id = int(pd.Timestamp.now().timestamp())
-                    save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
+                    save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type)
                     st.session_state["sync_notice"] = f"تم حفظ البطاقة: {card.get('title')}"
                     st.rerun()
                 except Exception as e:
@@ -1038,6 +1065,28 @@ selected_cat = st.radio("الأقسام:", categories, horizontal=True)
 if selected_cat != "الكل" and not filtered_df.empty:
     filtered_df = filtered_df[filtered_df["category"] == selected_cat]
 
+media_counts = {}
+if not filtered_df.empty and "media_type" in filtered_df.columns:
+    media_counts = filtered_df["media_type"].fillna("text").value_counts().to_dict()
+media_options = {
+    "all": f"🌐 الكل ({len(filtered_df)})",
+    "text": f"📝 نصوص ({int(media_counts.get('text', 0))})",
+    "image": f"🖼️ صور ({int(media_counts.get('image', 0))})",
+    "audio": f"🎙️ صوتيات ({int(media_counts.get('audio', 0))})",
+    "video": f"🎥 فيديوهات ({int(media_counts.get('video', 0))})",
+}
+st.markdown("##### 🎯 تصفية حسب نوع الوسائط")
+selected_media = st.radio(
+    "نوع الوسائط",
+    options=list(media_options.keys()),
+    format_func=lambda key: media_options[key],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="media_type_filter",
+)
+if selected_media != "all" and not filtered_df.empty and "media_type" in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df["media_type"].fillna("text") == selected_media]
+
 if filtered_df.empty:
     st.info("لا توجد بطاقات مطابقة حالياً. استخدم زر سحب رسائل القروب أو بدء التحليل في أعلى الصفحة.")
 else:
@@ -1051,6 +1100,12 @@ else:
         car_safe = html.escape(_card_text(row.get("car_model")))
         sub_safe = html.escape(_card_text(row.get("sub_system")))
         cat_safe = html.escape(_card_text(row.get("category")))
+        media_key = str(row.get("media_type") or "text").strip().lower()
+        badge = MEDIA_BADGES.get(media_key, MEDIA_BADGES["text"])
+        media_html = (
+            f'<span class="k-tag" style="color:{badge["color"]};border-color:{badge["color"]}">'
+            f'{badge["icon"]} {html.escape(badge["label"])}</span>'
+        )
 
         parts_html = (
             f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>'
@@ -1064,6 +1119,7 @@ else:
                 <span class="k-tag">🚙 {car_safe}</span>
                 <span class="k-tag">⚙️ {sub_safe}</span>
                 <span class="k-tag">📂 {cat_safe}</span>
+                {media_html}
             </div>
             <div class="k-title">{title_safe}</div>
             <div class="k-section">🔹 <b>الوصف / المشكلة:</b> {prob_safe}</div>

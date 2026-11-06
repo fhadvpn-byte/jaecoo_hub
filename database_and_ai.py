@@ -1,7 +1,9 @@
+import base64
 import json
 import os
 import re
 import sqlite3
+import tempfile
 from datetime import datetime
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
@@ -119,17 +121,21 @@ def init_db():
             created_at TEXT
         )
     """)
+    try:
+        conn.execute("ALTER TABLE knowledge_cards ADD COLUMN media_type TEXT DEFAULT 'text'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
-def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_name: str, raw_text: str):
+def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_name: str, raw_text: str, media_type: str = "text"):
     conn = get_db_connection()
     conn.execute("""
         INSERT OR REPLACE INTO knowledge_cards (
             telegram_msg_id, thread_url, category, car_model, sub_system,
             title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
-            is_verified_solution, keywords, author_name, raw_thread_text, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_verified_solution, keywords, author_name, raw_thread_text, created_at, media_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         telegram_msg_id,
         thread_url,
@@ -145,6 +151,7 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
         author_name,
         raw_text,
         datetime.now().strftime("%Y-%m-%d %H:%M"),
+        media_type if media_type in {"text", "image", "audio", "video"} else "text",
     ))
     conn.commit()
     conn.close()
@@ -214,6 +221,73 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     if data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
         data["is_worth_archiving"] = False
     return data
+
+
+VISION_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct"]
+WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
+
+
+def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mime_type: str = "image/jpeg") -> str:
+    """يحلل صورة الطبلون أو القطعة أو الفاتورة ويعيد وصفاً عربياً."""
+    payload = base64.b64encode(image_bytes).decode("utf-8")
+    prompt = (
+        "حلل هذه الصورة الخاصة بسيارة جايكو (Jaecoo) بدقة باللغة العربية الفصحى فقط. "
+        "إذا كانت صورة شاشة أو طبلون، اذكر التنبيه أو العطل الظاهر. "
+        "إذا كانت صورة قطعة غيار أو فاتورة، استخرج اسم القطعة ورقمها أو سعرها. "
+        f"النص المرفق مع الصورة: {caption}"
+    )
+    client = Groq(api_key=api_key)
+    last_error = None
+    for model_name in VISION_MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{payload}"}},
+                    ],
+                }],
+                temperature=0.2,
+            )
+            return str(response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_error = exc
+            if "404" in str(exc) or "model_not_found" in str(exc):
+                continue
+            raise
+    raise last_error
+
+
+def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") -> str:
+    """يفرّغ المقطع الصوتي أو صوت الفيديو إلى نص عربي."""
+    suffix = ext if ext.startswith(".") else f".{ext}"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(media_bytes)
+        tmp_path = tmp.name
+    try:
+        client = Groq(api_key=api_key)
+        last_error = None
+        for model_name in WHISPER_MODELS:
+            try:
+                with open(tmp_path, "rb") as handle:
+                    transcription = client.audio.transcriptions.create(
+                        file=(f"media{suffix}", handle.read()),
+                        model=model_name,
+                        language="ar",
+                        response_format="text",
+                    )
+                return str(transcription).strip()
+            except Exception as exc:
+                last_error = exc
+                if "404" in str(exc) or "model_not_found" in str(exc):
+                    continue
+                raise
+        raise last_error
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:

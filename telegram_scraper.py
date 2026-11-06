@@ -9,7 +9,16 @@ import sqlite3
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from database_and_ai import analyze_thread_with_ai, get_db_connection, init_db, load_config, save_card, save_config
+from database_and_ai import (
+    analyze_image_bytes,
+    analyze_thread_with_ai,
+    get_db_connection,
+    init_db,
+    load_config,
+    save_card,
+    save_config,
+    transcribe_media_bytes,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -124,6 +133,55 @@ def _clean_text(value) -> str:
 
 def _has_arabic(text: str) -> bool:
     return bool(re.search(r"[\u0600-\u06FF]", text))
+
+
+def _message_is_pending(message) -> bool:
+    if len((message.text or "").strip()) > 15:
+        return True
+    return any(getattr(message, name, None) for name in ("photo", "voice", "audio", "video", "video_note"))
+
+
+def _media_label(media_type: str) -> str:
+    return {"image": "الصورة", "audio": "المقطع الصوتي", "video": "الفيديو"}.get(media_type, "الرسالة")
+
+
+async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str]:
+    """يعيد النص النهائي ونوع الوسيط: text أو image أو audio أو video."""
+    caption = (message.message or message.text or "").strip()
+    if getattr(message, "photo", None):
+        image_bytes = await tg_client.download_media(message, file=bytes)
+        if image_bytes:
+            vision_text = analyze_image_bytes(groq_key, image_bytes, caption)
+            return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image"
+        return caption, "image"
+
+    if getattr(message, "voice", None) or getattr(message, "audio", None):
+        audio_bytes = await tg_client.download_media(message, file=bytes)
+        if audio_bytes:
+            audio_ext = getattr(getattr(message, "file", None), "ext", None) or ".ogg"
+            spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=audio_ext)
+            return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio"
+        return caption, "audio"
+
+    if getattr(message, "video", None) or getattr(message, "video_note", None):
+        parts = [f"تعليق الفيديو: {caption}"]
+        file_size = getattr(getattr(message, "file", None), "size", 0) or 0
+        video_ext = getattr(getattr(message, "file", None), "ext", None) or ".mp4"
+        if 0 < file_size <= 20 * 1024 * 1024:
+            video_bytes = await tg_client.download_media(message, file=bytes)
+            if video_bytes:
+                spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=video_ext)
+                parts.append(f"الكلام المسموع في الفيديو: {spoken_video}")
+        try:
+            thumb_bytes = await tg_client.download_media(message, file=bytes, thumb=-1)
+        except Exception:
+            thumb_bytes = None
+        if thumb_bytes:
+            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption)
+            parts.append(f"المشهد المرئي في الفيديو: {thumb_desc}")
+        return "\n".join(part for part in parts if part.strip()), "video"
+
+    return caption, "text"
 
 
 def _ignore_source(text: str) -> bool:
@@ -257,7 +315,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         messages = await client.get_messages(target, limit=limit)
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
-        pending = [message for message in reversed(list(messages)) if len((message.text or "").strip()) > 15]
+        pending = [message for message in reversed(list(messages)) if _message_is_pending(message)]
         total = max(len(pending), 1)
         _report(
             on_progress,
@@ -266,7 +324,6 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         )
 
         for index, message in enumerate(pending, start=1):
-            text = (message.text or "").strip()
             step = 0.4 + 0.55 * ((index - 1) / total)
             result["scanned"] += 1
             try:
@@ -275,17 +332,27 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             except Exception:
                 author_name = "عضو"
 
-            if _ignore_source(text):
+            try:
+                text, media_type = await _extract_message_content(client, groq_key, message)
+            except Exception as exc:
+                _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
+                _report(on_progress, f"الرسالة {index} من {len(pending)}: تعذر قراءة وسائطها.", step + (0.2 / total))
+                continue
+
+            if media_type == "text" and _ignore_source(text):
                 _report(
                     on_progress,
                     f"الرسالة {index} من {len(pending)}: تم تجاهلها لأنها عامة أو غير واضحة.",
                     step + (0.2 / total),
                 )
                 continue
+            if len(text.strip()) < 15:
+                _report(on_progress, f"الرسالة {index} من {len(pending)}: لا تحتوي محتوى كافياً للحفظ.", step + (0.2 / total))
+                continue
 
             _report(
                 on_progress,
-                f"جاري تحليل الرسالة {index} من {len(pending)} عبر Groq...",
+                f"جاري تحليل {_media_label(media_type)} {index} من {len(pending)} عبر Groq...",
                 min(0.97, step + (0.2 / total)),
             )
             try:
@@ -300,7 +367,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 continue
 
             thread_url = f"https://t.me/c/{public_id}/{message.id}"
-            save_card(card, message.id, thread_url, author_name, text)
+            save_card(card, message.id, thread_url, author_name, text, media_type)
             result["saved"] += 1
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
             _report(
