@@ -199,50 +199,113 @@ start_auto_sync(cfg)
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Tajawal', sans-serif !important;
+
+    .stApp {
         direction: rtl;
         text-align: right;
+        font-family: 'Tajawal', sans-serif !important;
+        background:
+            radial-gradient(circle at 12% 18%, rgba(0, 210, 255, 0.14) 0%, transparent 35%),
+            radial-gradient(circle at 88% 82%, rgba(14, 165, 233, 0.12) 0%, transparent 40%),
+            radial-gradient(circle at 50% 5%, rgba(56, 189, 248, 0.10) 0%, transparent 45%),
+            linear-gradient(160deg, #040914 0%, #091526 50%, #050c18 100%) !important;
+        color: #e2e8f0;
     }
-    .stApp {
-        background: radial-gradient(circle at top right, #0f2942 0%, #071324 60%, #040b16 100%);
-        color: #e2f1ff;
+    .stApp :is(h1, h2, h3, h4, h5, h6, p, label, button, input, textarea) {
+        font-family: 'Tajawal', sans-serif;
+    }
+    [data-testid="stIconMaterial"],
+    .material-symbols-rounded {
+        font-family: "Material Symbols Rounded" !important;
     }
     section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0b1e36 0%, #071426 100%) !important;
-        border-left: 1px solid rgba(0, 210, 255, 0.2);
+        direction: rtl;
+        text-align: right;
+        background: rgba(7, 16, 30, 0.85) !important;
+        backdrop-filter: blur(20px) !important;
+        border-left: 1px solid rgba(56, 189, 248, 0.3) !important;
+        box-shadow: -5px 0 25px rgba(0, 195, 255, 0.08) !important;
     }
     .hero-box {
-        background: linear-gradient(135deg, rgba(14, 42, 71, 0.85) 0%, rgba(7, 22, 41, 0.9) 100%);
-        border: 1px solid rgba(0, 212, 255, 0.3);
-        border-radius: 18px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        direction: rtl !important;
+        text-align: right !important;
+        background: rgba(13, 27, 48, 0.65);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(56, 189, 248, 0.4);
+        border-radius: 16px;
+        padding: 24px 28px;
+        margin-bottom: 22px;
+        position: relative;
+        overflow: hidden;
+        box-shadow:
+            0 10px 35px rgba(0, 0, 0, 0.5),
+            0 0 25px rgba(14, 165, 233, 0.2),
+            inset 0 0 20px rgba(56, 189, 248, 0.08);
+    }
+    .hero-box::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        right: 0;
+        left: 0;
+        height: 3px;
+        background: linear-gradient(90deg, transparent, #00f2fe, #38bdf8, transparent);
+        box-shadow: 0 0 15px #00f2fe;
+    }
+    .hero-box h1,
+    .hero-box p {
+        direction: rtl !important;
+        text-align: right !important;
+        margin-right: 0;
+        margin-left: 0;
+    }
+    .hero-box h1 {
+        margin: 8px 0 0;
+        font-size: 1.9rem;
+        font-weight: 800;
+        color: #ffffff;
+        text-shadow: 0 0 18px rgba(56, 189, 248, 0.6);
+    }
+    .hero-box p {
+        color: #9ec5e8;
+        margin-top: 8px;
     }
     .hub-badge {
         display: inline-block;
-        background: rgba(0, 212, 255, 0.12);
-        color: #00e1ff;
-        border: 1px solid rgba(0, 212, 255, 0.35);
-        padding: 4px 14px;
+        direction: ltr;
+        background: rgba(14, 165, 233, 0.12);
+        color: #38bdf8;
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        padding: 3px 12px;
         border-radius: 20px;
-        font-size: 0.8rem;
-        letter-spacing: 1px;
-        margin-bottom: 10px;
+        font-size: 0.88rem;
+        letter-spacing: 1.5px;
+        box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);
     }
     .metric-card {
-        background: rgba(13, 35, 61, 0.75);
-        border: 1px solid rgba(0, 212, 255, 0.25);
+        background: rgba(13, 27, 48, 0.65);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(56, 189, 248, 0.28);
         border-radius: 14px;
-        padding: 16px;
+        padding: 16px 20px;
         text-align: center;
+        box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.37),
+            inset 0 0 15px rgba(56, 189, 248, 0.06);
+        transition: all 0.3s ease;
+    }
+    .metric-card:hover {
+        border-color: rgba(0, 242, 254, 0.7);
+        box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.5),
+            0 0 20px rgba(56, 189, 248, 0.3);
+        transform: translateY(-2px);
     }
     .metric-val {
         font-size: 2.2rem;
         font-weight: 800;
-        color: #00e1ff;
+        color: #38bdf8;
+        text-shadow: 0 0 14px rgba(56, 189, 248, 0.5);
     }
     .k-card,
     .k-card * {
@@ -250,12 +313,23 @@ st.markdown("""
         text-align: right !important;
     }
     .k-card {
-        background: linear-gradient(145deg, rgba(16, 40, 69, 0.85), rgba(9, 24, 44, 0.92));
-        border: 1px solid rgba(0, 212, 255, 0.25);
-        border-radius: 16px;
-        padding: 20px;
-        margin-bottom: 16px;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        background: rgba(13, 27, 48, 0.65);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(56, 189, 248, 0.28);
+        border-right: 4px solid #00f2fe;
+        border-radius: 14px;
+        padding: 20px 22px;
+        margin-bottom: 12px;
+        box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.4),
+            inset 0 0 15px rgba(56, 189, 248, 0.05);
+        transition: all 0.3s ease;
+    }
+    .k-card:hover {
+        border-color: rgba(56, 189, 248, 0.65);
+        box-shadow:
+            0 10px 35px rgba(0, 0, 0, 0.55),
+            0 0 22px rgba(0, 242, 254, 0.22);
     }
     .k-tags {
         display: flex;
@@ -265,21 +339,24 @@ st.markdown("""
         text-align: right !important;
     }
     .k-title {
-        color: #00e1ff;
+        color: #ffffff;
         font-size: 1.25rem;
         font-weight: 700;
         margin: 10px 0;
+        text-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
         direction: rtl !important;
         text-align: right !important;
     }
     .k-tag {
         display: inline-block;
-        background: rgba(0, 212, 255, 0.15);
-        color: #7ce8ff;
-        border: 1px solid rgba(0, 212, 255, 0.3);
-        border-radius: 8px;
-        padding: 3px 10px;
-        font-size: 0.82rem;
+        background: rgba(0, 242, 254, 0.12);
+        color: #67e8f9;
+        border: 1px solid rgba(0, 242, 254, 0.45);
+        box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);
+        border-radius: 20px;
+        padding: 4px 12px;
+        font-size: 0.8rem;
+        font-weight: 700;
         margin: 0;
         max-width: 100%;
         white-space: normal;
@@ -288,15 +365,84 @@ st.markdown("""
         text-align: right !important;
     }
     .k-section {
-        background: rgba(6, 17, 33, 0.65);
-        border-right: 3px solid #00d4ff;
+        background: rgba(7, 17, 34, 0.75);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        border-right: 3px solid #38bdf8;
         padding: 10px 14px;
-        border-radius: 8px;
+        border-radius: 10px;
         margin-top: 10px;
         font-size: 0.95rem;
+        color: #e2e8f0;
         overflow-wrap: anywhere;
+        box-shadow: inset 0 0 12px rgba(56, 189, 248, 0.08);
         direction: rtl !important;
         text-align: right !important;
+    }
+    .stTextInput > div > div,
+    .stSelectbox > div > div,
+    .stTextArea > div > div,
+    [data-testid="stFileUploader"] section {
+        background: rgba(10, 22, 40, 0.75) !important;
+        border: 1px solid rgba(56, 189, 248, 0.3) !important;
+        border-radius: 10px !important;
+        color: #f8fafc !important;
+        box-shadow: inset 0 0 10px rgba(56, 189, 248, 0.05) !important;
+    }
+    .stTextInput > div > div:focus-within,
+    .stSelectbox > div > div:focus-within,
+    .stTextArea > div > div:focus-within {
+        border-color: #00f2fe !important;
+        box-shadow: 0 0 15px rgba(0, 242, 254, 0.35) !important;
+    }
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stRadio"] label,
+    [data-testid="stExpander"] summary {
+        text-align: right;
+    }
+    [data-testid="stRadio"] [role="radiogroup"] {
+        direction: rtl;
+        justify-content: flex-start;
+        gap: 8px;
+    }
+    div[data-testid="stExpander"] {
+        background: rgba(13, 27, 48, 0.6) !important;
+        backdrop-filter: blur(14px) !important;
+        border: 1px solid rgba(56, 189, 248, 0.28) !important;
+        border-radius: 12px !important;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
+    }
+    [data-testid="stMain"] .stButton > button,
+    [data-testid="stSidebar"] .stButton > button,
+    [data-testid="stMain"] .stFormSubmitButton > button,
+    [data-testid="stMain"] [data-testid="stFileUploader"] button,
+    [data-testid="stSidebar"] button[data-testid^="stBaseButton"] {
+        background: linear-gradient(135deg, rgba(14, 165, 233, 0.22) 0%, rgba(3, 105, 161, 0.35) 100%) !important;
+        color: #e0f2fe !important;
+        border: 1px solid rgba(56, 189, 248, 0.45) !important;
+        border-radius: 10px !important;
+        font-weight: 700 !important;
+        box-shadow: 0 0 14px rgba(14, 165, 233, 0.18) !important;
+        transition: all 0.25s ease !important;
+    }
+    [data-testid="stMain"] .stButton > button:hover,
+    [data-testid="stSidebar"] .stButton > button:hover,
+    [data-testid="stMain"] .stFormSubmitButton > button:hover,
+    [data-testid="stMain"] [data-testid="stFileUploader"] button:hover,
+    [data-testid="stSidebar"] button[data-testid^="stBaseButton"]:hover {
+        background: linear-gradient(135deg, rgba(0, 242, 254, 0.35) 0%, rgba(14, 165, 233, 0.5) 100%) !important;
+        border-color: #00f2fe !important;
+        color: #ffffff !important;
+        box-shadow: 0 0 22px rgba(0, 242, 254, 0.45) !important;
+        transform: translateY(-1px);
+    }
+    [data-testid="stAlert"] {
+        direction: rtl;
+        text-align: right;
+        border-radius: 12px;
+    }
+    [data-testid="stSlider"] [role="group"] > div > div:nth-child(2) {
+        background: #38bdf8 !important;
+        box-shadow: 0 0 12px rgba(56, 189, 248, 0.75) !important;
     }
     img, video, canvas, iframe {
         max-width: 100% !important;
@@ -497,8 +643,8 @@ if is_admin:
 st.markdown("""
 <div class="hero-box">
     <div class="hub-badge">JAECOO AI DIAGNOSTICS HUB</div>
-    <h1 style="margin: 0; color: #ffffff;">💠 منصة جايكو الذكية</h1>
-    <p style="color: #9ec5e8; margin-top: 8px;">منظومة ذكاء اصطناعي لتحليل وأرشفة الخبرات الفنية والأعطال والحلول لقروب ملاك جايكو</p>
+    <h1>💠 منصة جايكو الذكية</h1>
+    <p>منظومة ذكاء اصطناعي لتحليل وأرشفة الخبرات الفنية والأعطال والحلول لقروب ملاك جايكو</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -527,15 +673,27 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Tr
         key="public_lab_file",
     )
 
+limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
+sync_feedback = st.empty()
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
-    limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
         if _SYNC_STATE["running"]:
             st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
         else:
-            with st.spinner("جاري سحب رسائل القروب..."):
-                result = run_sync(int(limit_val))
+            with sync_feedback.container():
+                phase = st.empty()
+                phase.info("جاري الاتصال ب تيليجرام...")
+                bar = st.progress(0.08, text="جاري الاتصال ب تيليجرام...")
+
+                def _show_sync_progress(message: str, fraction: float) -> None:
+                    bar.progress(fraction, text=message)
+                    phase.info(message)
+
+                with st.spinner("جاري الاتصال ب تيليجرام..."):
+                    result = run_sync(int(limit_val), on_progress=_show_sync_progress)
+                if result.get("ok"):
+                    bar.progress(1.0, text="اكتمل السحب والتحليل.")
             if result.get("logs"):
                 st.code("\n".join(result["logs"][-25:]))
             if result.get("ok"):
@@ -550,8 +708,6 @@ with pull_col:
             else:
                 st.error(result.get("error") or "تعذر إكمال السحب.")
 with analyze_col:
-    st.write("")
-    st.write("")
     if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
         groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")
         if not lab_text and not lab_file:
@@ -571,8 +727,6 @@ with analyze_col:
                 except Exception as e:
                     st.error(f"خطأ أثناء التحليل: {e}")
 with sample_col:
-    st.write("")
-    st.write("")
     if st.button("استعادة البيانات النموذجية", use_container_width=True, key="public_seed"):
         seed_sample_data()
         st.session_state["sync_notice"] = "تمت استعادة البيانات النموذجية!"

@@ -117,6 +117,15 @@ def _note(logs: list, message: str, level: str = "info") -> None:
     getattr(logger, level)(message)
 
 
+def _report(on_progress, message: str, fraction: float) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress(message, max(0.0, min(1.0, float(fraction))))
+    except Exception:
+        pass
+
+
 async def _connect_saved_client(client: TelegramClient, logs: list, message: str) -> bool:
     await client.connect()
     if not await client.is_user_authorized():
@@ -162,7 +171,7 @@ async def _open_client(cfg: dict, logs: list):
     return None, "أدخل Telegram API ID و API Hash. Bot Token غير مطلوب."
 
 
-async def sync_and_analyze(limit: int = 50) -> dict:
+async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
     logs = []
     result = {"ok": False, "saved": 0, "scanned": 0, "group": "", "error": None, "logs": logs}
     init_db()
@@ -173,6 +182,7 @@ async def sync_and_analyze(limit: int = 50) -> dict:
         _note(logs, result["error"], "error")
         return result
 
+    _report(on_progress, "جاري الاتصال ب تيليجرام...", 0.08)
     try:
         client, error = await _open_client(cfg, logs)
     except Exception as exc:
@@ -209,15 +219,17 @@ async def sync_and_analyze(limit: int = 50) -> dict:
             return result
 
         result["group"] = target.name or str(target.id)
+        _report(on_progress, "جاري سحب الرسائل...", 0.32)
         _note(logs, f"سحب آخر {limit} رسالة من: {result['group']}")
         messages = await client.get_messages(target, limit=limit)
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
+        pending = [message for message in reversed(list(messages)) if len((message.text or "").strip()) > 15]
+        total = max(len(pending), 1)
 
-        for message in reversed(list(messages)):
+        for index, message in enumerate(pending, start=1):
             text = (message.text or "").strip()
-            if len(text) <= 15:
-                continue
+            _report(on_progress, f"جاري التحليل ب Groq... ({index}/{len(pending) or 1})", 0.4 + 0.55 * ((index - 1) / total))
             result["scanned"] += 1
             try:
                 sender = await message.get_sender()
@@ -240,6 +252,7 @@ async def sync_and_analyze(limit: int = 50) -> dict:
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
 
         result["ok"] = True
+        _report(on_progress, "اكتمل السحب والتحليل.", 1.0)
         _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:
@@ -257,17 +270,17 @@ async def sync_and_analyze(limit: int = 50) -> dict:
             pass
 
 
-def run_sync(limit: int = 50) -> dict:
+def run_sync(limit: int = 50, on_progress=None) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(sync_and_analyze(limit=limit))
+        return asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))
 
     import concurrent.futures
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit))).result()
+        return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))).result()
 
 
 if __name__ == "__main__":
