@@ -423,7 +423,7 @@ def seed_demo_data():
 
 
 def config_ready(cfg: dict) -> bool:
-    return bool(cfg.get("tg_api_id") and cfg.get("tg_api_hash") and cfg.get("tg_group") and cfg.get("gemini_api_key"))
+    return bool(cfg.get("gemini_api_key") and cfg.get("bot_token"))
 
 
 def radar_systems_html(frame: pd.DataFrame) -> str:
@@ -500,14 +500,16 @@ with st.sidebar:
 
     with st.expander("🔐 إعدادات المفاتيح والربط بالتلجرام (حفظ دائم)", expanded=not bool(cfg.get("gemini_api_key"))):
         new_gemini = st.text_input("مفتاح Gemini API:", value=cfg.get("gemini_api_key", ""), type="password")
+        new_bot_token = st.text_input("توكن بوت التلجرام:", value=cfg.get("bot_token", ""), type="password")
         new_api_id = st.text_input("Telegram API ID:", value=cfg.get("tg_api_id", ""))
         new_api_hash = st.text_input("Telegram API Hash:", value=cfg.get("tg_api_hash", ""), type="password")
-        new_group = st.text_input("معرف أو رابط قروب الجايكو:", value=cfg.get("tg_group", ""), placeholder="jaecoo_ksa_group")
+        new_group = st.text_input("معرف أو رابط قروب الجايكو:", value=cfg.get("tg_group", ""), placeholder="يُستخدم إذا لم يجد البوت قروباً تلقائياً")
         new_auto_reply = st.checkbox("تفعيل الرد الآلي على الأسئلة المتكررة 🤖", value=bool(cfg.get("auto_reply_enabled", False)))
 
         if st.button("حفظ الإعدادات بشكل دائم 💾", width="stretch"):
             cfg.update({
                 "gemini_api_key": new_gemini.strip(),
+                "bot_token": new_bot_token.strip(),
                 "tg_api_id": new_api_id.strip(),
                 "tg_api_hash": new_api_hash.strip(),
                 "tg_group": new_group.strip(),
@@ -523,7 +525,7 @@ with st.sidebar:
         pull_count = st.slider("عدد الرسائل المراد سحبها وتحليلها:", 20, 500, 100, step=20)
         if st.button("بدء سحب وتصنيف رسائل القروب ⚡", width="stretch"):
             if not config_ready(cfg):
-                st.warning("أكمل بيانات التلجرام ومفتاح Gemini في الأعلى أولاً.")
+                st.warning("أدخل مفتاح Gemini وتوكن البوت في الأعلى ثم احفظهما أولاً.")
             else:
                 with st.spinner("جاري الاتصال بتلجرام ودمج الردود وتحليلها..."):
                     env = os.environ.copy()
@@ -540,7 +542,7 @@ with st.sidebar:
                             timeout=180,
                         )
                     except subprocess.TimeoutExpired:
-                        st.error("انتهت مهلة الاتصال. أول تسجيل دخول يحتاج رقم الجوال والرمز في الطرفية.")
+                        st.error("انتهت مهلة الاتصال. يمكن تشغيل السحب من الطرفية لمتابعة التفاصيل.")
                         st.code("python telegram_scraper.py --mode history --limit 100")
                     else:
                         output = ((res.stdout or "") + ("\n" + res.stderr if res.stderr else "")).strip()
@@ -550,7 +552,7 @@ with st.sidebar:
                                 st.code(output[-400:])
                             st.rerun()
                         else:
-                            st.error("حدثت ملاحظة أثناء الاتصال. أول تسجيل دخول يتم من الطرفية.")
+                            st.error("تعذر إكمال السحب. راجع رسالة البوت أدناه، أو شغّل الأمر من الطرفية.")
                             st.code(output or "لا توجد تفاصيل")
 
     with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)"):

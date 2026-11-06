@@ -19,6 +19,7 @@ def load_config() -> dict:
         "tg_api_id": "",
         "tg_api_hash": "",
         "tg_group": "",
+        "bot_token": "",
         "auto_reply_enabled": False,
     }
     if os.path.exists(CONFIG_FILE):
