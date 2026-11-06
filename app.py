@@ -1,4 +1,11 @@
+import hmac
 import html
+import os
+import secrets
+import threading
+import time
+from datetime import timedelta
+
 import pandas as pd
 import streamlit as st
 
@@ -12,7 +19,55 @@ from database_and_ai import (
     save_card,
     save_config,
 )
-from telegram_scraper import run_sync
+from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
+
+AUTO_SYNC_LIMIT = 30
+_SYNC_GUARD = threading.Lock()
+_SYNC_STATE = {"running": False, "done_at": 0.0, "result": None}
+
+
+def _auto_sync_worker():
+    try:
+        result = run_sync(AUTO_SYNC_LIMIT)
+    except Exception as exc:
+        result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
+    with _SYNC_GUARD:
+        _SYNC_STATE["result"] = result
+        _SYNC_STATE["done_at"] = time.time()
+        _SYNC_STATE["running"] = False
+
+
+def start_auto_sync(config: dict):
+    has_api = bool(str(config.get("tg_api_id") or "").strip() and str(config.get("tg_api_hash") or "").strip())
+    has_login = bool(str(config.get("tg_session") or "").strip() or os.path.exists(PERSONAL_SESSION_FILE))
+    if not (config.get("groq_api_key") or config.get("gemini_api_key")) or not (has_api or has_login):
+        return
+    with _SYNC_GUARD:
+        if _SYNC_STATE["running"]:
+            return
+        if time.time() - _SYNC_STATE["done_at"] < 180:
+            return
+        _SYNC_STATE["running"] = True
+        _SYNC_STATE["result"] = None
+    threading.Thread(target=_auto_sync_worker, daemon=True).start()
+
+
+@st.fragment(run_every=timedelta(seconds=6))
+def auto_sync_status():
+    with _SYNC_GUARD:
+        running = _SYNC_STATE["running"]
+        result = _SYNC_STATE["result"]
+        done_at = _SYNC_STATE["done_at"]
+    if running:
+        st.info("جاري سحب رسائل القروب وتحليلها بمفتاح Groq. البطاقات الحالية ظاهرة أثناء التحديث.")
+        return
+    seen = st.session_state.get("seen_sync_done_at", 0)
+    if not result or done_at == seen:
+        return
+    st.session_state.seen_sync_done_at = done_at
+    st.session_state.auto_sync_result = result
+    if result.get("saved"):
+        st.rerun()
 
 # ==========================================
 # 1. إعدادات الصفحة والتصميم (هوية حسم الذكية)
@@ -21,14 +76,125 @@ st.set_page_config(
     page_title="منصة جايكو الذكية | هوية حسم",
     page_icon="💠",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
+_SETTING_SOURCES = {
+    "groq_api_key": ("groq_api_key", "GROQ_API_KEY", "gemini_api_key"),
+    "tg_api_id": ("tg_api_id", "telegram_api_id", "TG_API_ID"),
+    "tg_api_hash": ("tg_api_hash", "telegram_api_hash", "TG_API_HASH"),
+    "tg_group": ("tg_group", "TG_GROUP"),
+    "bot_token": ("bot_token", "telegram_bot_token", "BOT_TOKEN"),
+    "tg_session": ("tg_session", "telegram_session", "TG_SESSION", "TELEGRAM_SESSION"),
+}
+
+
+def _read_secret(names: tuple[str, ...]) -> str:
+    try:
+        secrets = st.secrets
+    except Exception:
+        return ""
+    bags = [secrets]
+    for section in ("telegram", "groq"):
+        try:
+            if section in secrets:
+                bags.append(secrets[section])
+        except Exception:
+            continue
+    for bag in bags:
+        for name in names:
+            try:
+                value = bag.get(name, "")
+            except Exception:
+                value = ""
+            text = str(value or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _read_saved(cfg: dict, names: tuple[str, ...]) -> str:
+    for name in names:
+        text = str(cfg.get(name) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def hydrate_config(cfg: dict) -> dict:
+    """يعيد قراءة config.json و st.secrets في كل تحميل ويحفظ المفاتيح الناقصة."""
+    changed = False
+    for key, names in _SETTING_SOURCES.items():
+        current = str(cfg.get(key) or "").strip()
+        saved = _read_saved(cfg, names)
+        secret = _read_secret(names)
+        chosen = secret or saved or current
+        if chosen and chosen != current:
+            cfg[key] = chosen
+            changed = True
+    if "auto_reply_enabled" not in cfg:
+        flag = _read_secret(("auto_reply_enabled", "AUTO_REPLY_ENABLED"))
+        cfg["auto_reply_enabled"] = flag.lower() in {"1", "true", "yes", "on"} if flag else False
+        changed = True
+    if changed:
+        save_config(cfg)
+    return cfg
+
+
+def _settings_fingerprint(cfg: dict) -> tuple:
+    return tuple(str(cfg.get(key) or "") for key in (*_SETTING_SOURCES, "auto_reply_enabled"))
+
+
+def _load_settings_into_session(cfg: dict) -> None:
+    fingerprint = _settings_fingerprint(cfg)
+    if st.session_state.get("_settings_fp") == fingerprint:
+        return
+    st.session_state["settings_groq"] = str(cfg.get("groq_api_key") or "")
+    st.session_state["settings_tg_id"] = str(cfg.get("tg_api_id") or "")
+    st.session_state["settings_tg_hash"] = str(cfg.get("tg_api_hash") or "")
+    st.session_state["settings_tg_group"] = str(cfg.get("tg_group") or "")
+    st.session_state["settings_bot_token"] = str(cfg.get("bot_token") or "")
+    st.session_state["settings_tg_session"] = str(cfg.get("tg_session") or "")
+    st.session_state["settings_auto_reply"] = bool(cfg.get("auto_reply_enabled", False))
+    st.session_state["_settings_fp"] = fingerprint
+
+
+def ensure_admin_token(cfg: dict) -> dict:
+    secret = _read_secret(("admin_token", "ADMIN_TOKEN"))
+    current = str(cfg.get("admin_token") or "").strip()
+    if secret and secret != current:
+        cfg["admin_token"] = secret
+        save_config(cfg)
+    elif not current:
+        cfg["admin_token"] = secrets.token_urlsafe(24)
+        save_config(cfg)
+    return cfg
+
+
+def viewer_is_admin(cfg: dict) -> bool:
+    if st.session_state.get("is_admin"):
+        return True
+    expected = str(cfg.get("admin_token") or "")
+    provided = st.query_params.get("admin", "")
+    if isinstance(provided, (list, tuple)):
+        provided = provided[0] if provided else ""
+    provided = str(provided or "")
+    if not expected or not provided or len(expected) != len(provided):
+        return False
+    if not hmac.compare_digest(provided, expected):
+        return False
+    st.session_state.is_admin = True
+    try:
+        del st.query_params["admin"]
+    except Exception:
+        pass
+    return True
+
+
 init_db()
-cfg = load_config()
-if not (cfg.get("groq_api_key") or "").strip() and (cfg.get("gemini_api_key") or "").strip():
-    cfg["groq_api_key"] = cfg["gemini_api_key"].strip()
-    save_config(cfg)
+cfg = ensure_admin_token(hydrate_config(load_config()))
+is_admin = viewer_is_admin(cfg)
+start_auto_sync(cfg)
 
 st.markdown("""
 <style>
@@ -206,6 +372,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+if not is_admin:
+    st.markdown("""
+<style>
+    [data-testid="stSidebar"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"],
+    [data-testid="stExpandSidebarButton"] {
+        display: none !important;
+    }
+    [data-testid="stAppViewContainer"],
+    section[data-testid="stMain"] {
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # ==========================================
 # 2. دالة مساعدة لاستدعاء Groq داخل الواجهة
 # ==========================================
@@ -253,133 +436,169 @@ def seed_sample_data():
 # ==========================================
 # 4. القائمة الجانبية (مركز التحكم والربط)
 # ==========================================
-with st.sidebar:
-    st.markdown("### 💠 مركز التحكم والربط")
+if is_admin:
+    with st.sidebar:
+        st.markdown("### 💠 مركز التحكم والربط")
 
-    with st.expander("🔐 إعدادات المفاتيح والربط بالتلجرام (حفظ دائم)", expanded=False):
-        groq_key_input = st.text_input(
-            "مفتاح Groq API",
-            value=cfg.get("groq_api_key") or cfg.get("gemini_api_key", ""),
-            type="password",
-            help="أدخل مفتاح Groq الخاص بك (يبدأ بـ gsk_)",
-        )
-        tg_id_input = st.text_input("Telegram API ID", value=str(cfg.get("tg_api_id", "2040")))
-        tg_hash_input = st.text_input("Telegram API Hash", value=cfg.get("tg_api_hash", "b18441a1ff607e10a989891a5462e627"))
-        tg_group_input = st.text_input("رابط أو معرف القروب (اختياري)", value=cfg.get("tg_group", ""))
-        bot_token_input = st.text_input("Bot Token", value=cfg.get("bot_token", ""), type="password")
-        auto_reply_input = st.checkbox("تفعيل الرد الآلي في التلجرام", value=bool(cfg.get("auto_reply_enabled", False)))
+        keys_ready = bool(str(cfg.get("groq_api_key") or "").strip() and str(cfg.get("tg_api_id") or "").strip())
+        if keys_ready:
+            st.caption("مفاتيح Groq وTelegram محمّلة من الإعدادات المحفوظة.")
+        _load_settings_into_session(cfg)
+        with st.expander("🔐 إعدادات المفاتيح والربط بالتلجرام (حفظ دائم)", expanded=not keys_ready):
+            groq_key_input = st.text_input(
+                "مفتاح Groq API",
+                key="settings_groq",
+                type="password",
+                help="أدخل مفتاح Groq الخاص بك (يبدأ بـ gsk_)",
+            )
+            tg_id_input = st.text_input("Telegram API ID", key="settings_tg_id")
+            tg_hash_input = st.text_input("Telegram API Hash", key="settings_tg_hash", type="password")
+            tg_group_input = st.text_input("رابط أو معرف القروب (اختياري)", key="settings_tg_group")
+            tg_session_input = st.text_input(
+                "جلسة السحابة النصية tg_session (اختياري)",
+                key="settings_tg_session",
+                type="password",
+                help="تُستخدم على Streamlit Cloud مع API ID و Hash بدون Bot Token. يمكن وضعها أيضاً في st.secrets.",
+            )
+            bot_token_input = st.text_input(
+                "Bot Token (اختياري)",
+                key="settings_bot_token",
+                type="password",
+                help="غير مطلوب إذا كان API ID و Hash محفوظين مع جلسة نصية أو ملف جلسة.",
+            )
+            auto_reply_input = st.checkbox("تفعيل الرد الآلي في التلجرام", key="settings_auto_reply")
 
-        if st.button("حفظ الإعدادات", use_container_width=True):
-            cfg["groq_api_key"] = groq_key_input.strip()
-            cfg["tg_api_id"] = tg_id_input.strip()
-            cfg["tg_api_hash"] = tg_hash_input.strip()
-            cfg["tg_group"] = tg_group_input.strip()
-            cfg["bot_token"] = bot_token_input.strip()
-            cfg["auto_reply_enabled"] = auto_reply_input
-            save_config(cfg)
-            st.success("✨ تم حفظ إعدادات Groq والتيليجرام بنجاح!")
+            if st.button("حفظ الإعدادات", use_container_width=True):
+                cfg["groq_api_key"] = groq_key_input.strip()
+                cfg["tg_api_id"] = tg_id_input.strip()
+                cfg["tg_api_hash"] = tg_hash_input.strip()
+                cfg["tg_group"] = tg_group_input.strip()
+                cfg["tg_session"] = tg_session_input.strip()
+                cfg["bot_token"] = bot_token_input.strip()
+                cfg["auto_reply_enabled"] = auto_reply_input
+                save_config(cfg)
+                st.session_state["_settings_fp"] = _settings_fingerprint(cfg)
+                st.success("✨ تم حفظ إعدادات Groq والتيليجرام بنجاح!")
 
-    if st.session_state.get("sync_notice"):
-        st.success(st.session_state.pop("sync_notice"))
+        if st.session_state.get("sync_notice"):
+            st.success(st.session_state.pop("sync_notice"))
 
-    with st.expander("🔄 سحب ومزامنة قروب التلجرام", expanded=True):
-        st.caption("زر واحد يسحب رسائل القروب، يحلّلها بمفتاح Groq، ويحفظ البطاقات في قاعدة البيانات.")
-        limit_val = st.slider("عدد الرسائل المراد سحبها وتحليلها:", min_value=10, max_value=300, value=100, step=10)
-        if st.button("بدء سحب وتصنيف رسائل القروب ⚡", use_container_width=True):
-            if not (cfg.get("groq_api_key") or cfg.get("gemini_api_key")):
-                st.warning("أدخل مفتاح Groq API واحفظ الإعدادات أولاً.")
+        with st.expander("🔄 سحب ومزامنة قروب التلجرام", expanded=True):
+            if str(cfg.get("tg_api_id") or "").strip() and str(cfg.get("tg_api_hash") or "").strip():
+                st.caption("API ID و Hash كافيان لتجاوز البوت. السحابة تقرأ الرسائل عبر tg_session في st.secrets أو الإعدادات.")
+            elif os.path.exists(PERSONAL_SESSION_FILE):
+                st.caption("السحب يستخدم ملف الجلسة المحلي user_session.session بدون Bot Token.")
             else:
-                with st.spinner("جاري سحب الرسائل وتحليلها بمفتاح Groq..."):
-                    result = run_sync(int(limit_val))
-                if result.get("logs"):
-                    st.code("\n".join(result["logs"][-25:]))
-                if result.get("ok"):
-                    notice = (
-                        f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                        f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
-                    )
-                    if result.get("saved"):
-                        st.session_state["sync_notice"] = notice
-                        st.rerun()
-                    st.success(notice)
+                st.info("أدخل API ID و Hash. Bot Token غير مطلوب.")
+            limit_val = st.slider("عدد الرسائل المراد سحبها وتحليلها:", min_value=10, max_value=300, value=100, step=10)
+            if st.button("بدء سحب وتصنيف رسائل القروب ⚡", use_container_width=True):
+                if _SYNC_STATE["running"]:
+                    st.info("التحديث التلقائي يعمل الآن، والنتائج ستظهر وحدها.")
+                elif not (cfg.get("groq_api_key") or cfg.get("gemini_api_key")):
+                    st.warning("أدخل مفتاح Groq API واحفظ الإعدادات أولاً.")
                 else:
-                    st.error(result.get("error") or "تعذر إكمال السحب.")
+                    with st.spinner("جاري سحب الرسائل وتحليلها بمفتاح Groq..."):
+                        result = run_sync(int(limit_val))
+                    if result.get("logs"):
+                        st.code("\n".join(result["logs"][-25:]))
+                    if result.get("ok"):
+                        notice = (
+                            f"تم سحب قروب {result.get('group') or 'التلجرام'} "
+                            f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
+                        )
+                        if result.get("saved"):
+                            st.session_state["sync_notice"] = notice
+                            st.rerun()
+                        st.success(notice)
+                    else:
+                        st.error(result.get("error") or "تعذر إكمال السحب.")
 
-    with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)", expanded=False):
-        lab_text = st.text_area("أدخل نص النقاش أو وصف المشكلة:")
-        lab_file = st.file_uploader("أرفق صورة أو ملفاً صوتياً (اختياري)", type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"])
-        if st.button("تحليل وإضافة للقاعدة 🧠", use_container_width=True):
-            if not cfg.get("groq_api_key"):
-                st.warning("يرجى إدخال مفتاح Groq API أولاً.")
-            elif not lab_text and not lab_file:
-                st.warning("أدخل نصاً أو أرفق ملفاً للتحليل.")
-            else:
-                with st.spinner("جاري التحليل الفني..."):
-                    try:
-                        media_bytes = lab_file.read() if lab_file else None
-                        mime_type = lab_file.type if lab_file else None
-                        card = analyze_thread_with_ai(lab_text or "حلل المرفق", cfg["groq_api_key"], media_bytes, mime_type)
-                        msg_id = int(pd.Timestamp.now().timestamp())
-                        save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
-                        st.success(f"تم حفظ البطاقة: {card.get('title')}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"خطأ أثناء التحليل: {e}")
+        with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)", expanded=False):
+            lab_text = st.text_area("أدخل نص النقاش أو وصف المشكلة:")
+            lab_file = st.file_uploader("أرفق صورة أو ملفاً صوتياً (اختياري)", type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"])
+            if st.button("تحليل وإضافة للقاعدة 🧠", use_container_width=True):
+                if not cfg.get("groq_api_key"):
+                    st.warning("يرجى إدخال مفتاح Groq API أولاً.")
+                elif not lab_text and not lab_file:
+                    st.warning("أدخل نصاً أو أرفق ملفاً للتحليل.")
+                else:
+                    with st.spinner("جاري التحليل الفني..."):
+                        try:
+                            media_bytes = lab_file.read() if lab_file else None
+                            mime_type = lab_file.type if lab_file else None
+                            card = analyze_thread_with_ai(lab_text or "حلل المرفق", cfg["groq_api_key"], media_bytes, mime_type)
+                            msg_id = int(pd.Timestamp.now().timestamp())
+                            save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
+                            st.success(f"تم حفظ البطاقة: {card.get('title')}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"خطأ أثناء التحليل: {e}")
 
-    with st.expander("➕ إضافة بطاقة معرفة يدوياً", expanded=False):
-        m_title = st.text_input("عنوان البطاقة")
-        m_model = st.selectbox("الطراز", ["Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"])
-        m_cat = st.selectbox("القسم", [
-            "الأعطال والتشخيص",
-            "الإصلاحات والحلول المؤكدة",
-            "بنك القطع البديلة والمطابقات",
-            "الأنظمة الذكية والشاشات",
-            "الصيانة الدورية والوكالات",
-            "الإكسسوارات والتجهيزات",
-            "تجارب القيادة والأداء الفعلي",
-            "نبض القروب والدردشة العامة",
-        ])
-        m_sub = st.selectbox("النظام الفرعي", [
-            "المحرك والتيربو",
-            "القير والدفع الرباعي AWD",
-            "الكهرباء والبطارية والحساسات",
-            "الشاشة والنظام الصوتي والربط",
-            "التكييف والتبريد",
-            "العضلات والفرامل والتعليق",
-            "الهيكل الخارجي والمقصورة",
-            "عام",
-        ])
-        m_prob = st.text_area("الوصف / المشكلة")
-        m_sol = st.text_area("الخلاصة / الحل")
-        m_parts = st.text_input("القطع والمواصفات الفنية")
-        m_ver = st.checkbox("حل مؤكد ومجرب", value=True)
+        with st.expander("➕ إضافة بطاقة معرفة يدوياً", expanded=False):
+            m_title = st.text_input("عنوان البطاقة")
+            m_model = st.selectbox("الطراز", ["Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"])
+            m_cat = st.selectbox("القسم", [
+                "الأعطال والتشخيص",
+                "الإصلاحات والحلول المؤكدة",
+                "بنك القطع البديلة والمطابقات",
+                "الأنظمة الذكية والشاشات",
+                "الصيانة الدورية والوكالات",
+                "الإكسسوارات والتجهيزات",
+                "تجارب القيادة والأداء الفعلي",
+                "نبض القروب والدردشة العامة",
+            ])
+            m_sub = st.selectbox("النظام الفرعي", [
+                "المحرك والتيربو",
+                "القير والدفع الرباعي AWD",
+                "الكهرباء والبطارية والحساسات",
+                "الشاشة والنظام الصوتي والربط",
+                "التكييف والتبريد",
+                "العضلات والفرامل والتعليق",
+                "الهيكل الخارجي والمقصورة",
+                "عام",
+            ])
+            m_prob = st.text_area("الوصف / المشكلة")
+            m_sol = st.text_area("الخلاصة / الحل")
+            m_parts = st.text_input("القطع والمواصفات الفنية")
+            m_ver = st.checkbox("حل مؤكد ومجرب", value=True)
 
-        if st.button("حفظ البطاقة اليدوية", use_container_width=True):
-            if m_title and m_sol:
-                card_manual = {
-                    "category": m_cat,
-                    "car_model": m_model,
-                    "sub_system": m_sub,
-                    "title": m_title,
-                    "problem_or_topic": m_prob,
-                    "solution_or_summary": m_sol,
-                    "part_numbers_or_specs": m_parts,
-                    "is_verified_solution": m_ver,
-                    "keywords": m_title,
-                }
-                msg_id = int(pd.Timestamp.now().timestamp())
-                save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob)
-                st.success("تمت إضافة البطاقة!")
-                st.rerun()
+            if st.button("حفظ البطاقة اليدوية", use_container_width=True):
+                if m_title and m_sol:
+                    card_manual = {
+                        "category": m_cat,
+                        "car_model": m_model,
+                        "sub_system": m_sub,
+                        "title": m_title,
+                        "problem_or_topic": m_prob,
+                        "solution_or_summary": m_sol,
+                        "part_numbers_or_specs": m_parts,
+                        "is_verified_solution": m_ver,
+                        "keywords": m_title,
+                    }
+                    msg_id = int(pd.Timestamp.now().timestamp())
+                    save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob)
+                    st.success("تمت إضافة البطاقة!")
+                    st.rerun()
 
-    if st.button("📦 استعادة البيانات النموذجية", use_container_width=True):
-        seed_sample_data()
-        st.success("تمت استعادة البيانات النموذجية!")
-        st.rerun()
+        if st.button("📦 استعادة البيانات النموذجية", use_container_width=True):
+            seed_sample_data()
+            st.success("تمت استعادة البيانات النموذجية!")
+            st.rerun()
 
 # ==========================================
 # 5. الواجهة الرئيسية وعرض البطاقات
 # ==========================================
+if is_admin:
+    auto_sync_status()
+    auto_result = st.session_state.get("auto_sync_result")
+    if auto_result and not auto_result.get("ok"):
+        st.warning(auto_result.get("error") or "تعذر تحديث رسائل القروب تلقائياً.")
+    elif auto_result and auto_result.get("ok"):
+        st.caption(
+            f"آخر تحديث تلقائي من {auto_result.get('group') or 'القروب'}: "
+            f"حُفظت {auto_result.get('saved', 0)} بطاقة."
+        )
+
 st.markdown("""
 <div class="hero-box">
     <div class="hub-badge">JAECOO AI DIAGNOSTICS HUB</div>
@@ -409,7 +628,8 @@ with col_s1:
 with col_s2:
     model_filter = st.selectbox("🚙 تصفية حسب الطراز:", ["الكل", "Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"])
 
-with st.expander("🤖 استشارة المهندس الذكي والموجز اليومي", expanded=False):
+if is_admin:
+  with st.expander("🤖 استشارة المهندس الذكي والموجز اليومي", expanded=False):
     user_q = st.text_input("اسأل المهندس الذكي عن أي عطل أو قطعة غيار:")
     c_btn1, c_btn2 = st.columns(2)
     with c_btn1:
