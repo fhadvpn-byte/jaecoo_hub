@@ -480,111 +480,6 @@ if is_admin:
                 st.session_state["_settings_fp"] = _settings_fingerprint(cfg)
                 st.success("✨ تم حفظ إعدادات Groq والتيليجرام بنجاح!")
 
-        if st.session_state.get("sync_notice"):
-            st.success(st.session_state.pop("sync_notice"))
-
-        with st.expander("🔄 سحب ومزامنة قروب التلجرام", expanded=True):
-            if str(cfg.get("tg_api_id") or "").strip() and str(cfg.get("tg_api_hash") or "").strip():
-                st.caption("API ID و Hash كافيان لتجاوز البوت. السحابة تقرأ الرسائل عبر tg_session في st.secrets أو الإعدادات.")
-            elif os.path.exists(PERSONAL_SESSION_FILE):
-                st.caption("السحب يستخدم ملف الجلسة المحلي user_session.session بدون Bot Token.")
-            else:
-                st.info("أدخل API ID و Hash. Bot Token غير مطلوب.")
-            limit_val = st.slider("عدد الرسائل المراد سحبها وتحليلها:", min_value=10, max_value=300, value=100, step=10)
-            if st.button("بدء سحب وتصنيف رسائل القروب ⚡", use_container_width=True):
-                if _SYNC_STATE["running"]:
-                    st.info("التحديث التلقائي يعمل الآن، والنتائج ستظهر وحدها.")
-                elif not (cfg.get("groq_api_key") or cfg.get("gemini_api_key")):
-                    st.warning("أدخل مفتاح Groq API واحفظ الإعدادات أولاً.")
-                else:
-                    with st.spinner("جاري سحب الرسائل وتحليلها بمفتاح Groq..."):
-                        result = run_sync(int(limit_val))
-                    if result.get("logs"):
-                        st.code("\n".join(result["logs"][-25:]))
-                    if result.get("ok"):
-                        notice = (
-                            f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                            f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
-                        )
-                        if result.get("saved"):
-                            st.session_state["sync_notice"] = notice
-                            st.rerun()
-                        st.success(notice)
-                    else:
-                        st.error(result.get("error") or "تعذر إكمال السحب.")
-
-        with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)", expanded=False):
-            lab_text = st.text_area("أدخل نص النقاش أو وصف المشكلة:")
-            lab_file = st.file_uploader("أرفق صورة أو ملفاً صوتياً (اختياري)", type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"])
-            if st.button("تحليل وإضافة للقاعدة 🧠", use_container_width=True):
-                if not cfg.get("groq_api_key"):
-                    st.warning("يرجى إدخال مفتاح Groq API أولاً.")
-                elif not lab_text and not lab_file:
-                    st.warning("أدخل نصاً أو أرفق ملفاً للتحليل.")
-                else:
-                    with st.spinner("جاري التحليل الفني..."):
-                        try:
-                            media_bytes = lab_file.read() if lab_file else None
-                            mime_type = lab_file.type if lab_file else None
-                            card = analyze_thread_with_ai(lab_text or "حلل المرفق", cfg["groq_api_key"], media_bytes, mime_type)
-                            msg_id = int(pd.Timestamp.now().timestamp())
-                            save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
-                            st.success(f"تم حفظ البطاقة: {card.get('title')}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"خطأ أثناء التحليل: {e}")
-
-        with st.expander("➕ إضافة بطاقة معرفة يدوياً", expanded=False):
-            m_title = st.text_input("عنوان البطاقة")
-            m_model = st.selectbox("الطراز", ["Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"])
-            m_cat = st.selectbox("القسم", [
-                "الأعطال والتشخيص",
-                "الإصلاحات والحلول المؤكدة",
-                "بنك القطع البديلة والمطابقات",
-                "الأنظمة الذكية والشاشات",
-                "الصيانة الدورية والوكالات",
-                "الإكسسوارات والتجهيزات",
-                "تجارب القيادة والأداء الفعلي",
-                "نبض القروب والدردشة العامة",
-            ])
-            m_sub = st.selectbox("النظام الفرعي", [
-                "المحرك والتيربو",
-                "القير والدفع الرباعي AWD",
-                "الكهرباء والبطارية والحساسات",
-                "الشاشة والنظام الصوتي والربط",
-                "التكييف والتبريد",
-                "العضلات والفرامل والتعليق",
-                "الهيكل الخارجي والمقصورة",
-                "عام",
-            ])
-            m_prob = st.text_area("الوصف / المشكلة")
-            m_sol = st.text_area("الخلاصة / الحل")
-            m_parts = st.text_input("القطع والمواصفات الفنية")
-            m_ver = st.checkbox("حل مؤكد ومجرب", value=True)
-
-            if st.button("حفظ البطاقة اليدوية", use_container_width=True):
-                if m_title and m_sol:
-                    card_manual = {
-                        "category": m_cat,
-                        "car_model": m_model,
-                        "sub_system": m_sub,
-                        "title": m_title,
-                        "problem_or_topic": m_prob,
-                        "solution_or_summary": m_sol,
-                        "part_numbers_or_specs": m_parts,
-                        "is_verified_solution": m_ver,
-                        "keywords": m_title,
-                    }
-                    msg_id = int(pd.Timestamp.now().timestamp())
-                    save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob)
-                    st.success("تمت إضافة البطاقة!")
-                    st.rerun()
-
-        if st.button("📦 استعادة البيانات النموذجية", use_container_width=True):
-            seed_sample_data()
-            st.success("تمت استعادة البيانات النموذجية!")
-            st.rerun()
-
 # ==========================================
 # 5. الواجهة الرئيسية وعرض البطاقات
 # ==========================================
@@ -621,12 +516,128 @@ with col_m3:
     j8_count = int((df["car_model"] == "Jaecoo J8").sum()) if not df.empty else 0
     st.markdown(f'<div class="metric-card"><div>🚙 بطاقات Jaecoo J8</div><div class="metric-val">{j8_count}</div></div>', unsafe_allow_html=True)
 
+if st.session_state.get("sync_notice"):
+    st.success(st.session_state.pop("sync_notice"))
+
+with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=True):
+    lab_text = st.text_area("النص المراد تحليله", key="public_lab_text", height=120)
+    lab_file = st.file_uploader(
+        "مرفق اختياري",
+        type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"],
+        key="public_lab_file",
+    )
+
+pull_col, analyze_col, sample_col = st.columns(3)
+with pull_col:
+    limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
+    if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
+        if _SYNC_STATE["running"]:
+            st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
+        else:
+            with st.spinner("جاري سحب رسائل القروب..."):
+                result = run_sync(int(limit_val))
+            if result.get("logs"):
+                st.code("\n".join(result["logs"][-25:]))
+            if result.get("ok"):
+                notice = (
+                    f"تم سحب قروب {result.get('group') or 'التلجرام'} "
+                    f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
+                )
+                if result.get("saved"):
+                    st.session_state["sync_notice"] = notice
+                    st.rerun()
+                st.success(notice)
+            else:
+                st.error(result.get("error") or "تعذر إكمال السحب.")
+with analyze_col:
+    st.write("")
+    st.write("")
+    if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
+        groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")
+        if not lab_text and not lab_file:
+            st.warning("أدخل النص في مختبر التحليل الذكي.")
+        elif not groq_key:
+            st.warning("مفتاح التحليل غير محفوظ في إعدادات التطبيق.")
+        else:
+            with st.spinner("جاري التحليل..."):
+                try:
+                    media_bytes = lab_file.read() if lab_file else None
+                    mime_type = lab_file.type if lab_file else None
+                    card = analyze_thread_with_ai(lab_text or "حلل المرفق", groq_key, media_bytes, mime_type)
+                    msg_id = int(pd.Timestamp.now().timestamp())
+                    save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
+                    st.session_state["sync_notice"] = f"تم حفظ البطاقة: {card.get('title')}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"خطأ أثناء التحليل: {e}")
+with sample_col:
+    st.write("")
+    st.write("")
+    if st.button("استعادة البيانات النموذجية", use_container_width=True, key="public_seed"):
+        seed_sample_data()
+        st.session_state["sync_notice"] = "تمت استعادة البيانات النموذجية!"
+        st.rerun()
+
+with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded=True):
+    m_title = st.text_input("عنوان البطاقة", key="manual_title")
+    m_model = st.selectbox(
+        "الطراز",
+        ["Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"],
+        key="manual_model",
+    )
+    m_cat = st.selectbox("القسم", [
+        "الأعطال والتشخيص",
+        "الإصلاحات والحلول المؤكدة",
+        "بنك القطع البديلة والمطابقات",
+        "الأنظمة الذكية والشاشات",
+        "الصيانة الدورية والوكالات",
+        "الإكسسوارات والتجهيزات",
+        "تجارب القيادة والأداء الفعلي",
+        "نبض القروب والدردشة العامة",
+    ], key="manual_cat")
+    m_sub = st.selectbox("النظام الفرعي", [
+        "المحرك والتيربو",
+        "القير والدفع الرباعي AWD",
+        "الكهرباء والبطارية والحساسات",
+        "الشاشة والنظام الصوتي والربط",
+        "التكييف والتبريد",
+        "العضلات والفرامل والتعليق",
+        "الهيكل الخارجي والمقصورة",
+        "عام",
+    ], key="manual_sub")
+    m_prob = st.text_area("الوصف / المشكلة", key="manual_prob")
+    m_sol = st.text_area("الخلاصة / الحل", key="manual_sol")
+    m_parts = st.text_input("القطع والمواصفات الفنية", key="manual_parts")
+    m_ver = st.checkbox("حل مؤكد ومجرب", value=True, key="manual_verified")
+    if st.button("حفظ البطاقة اليدوية", use_container_width=True, key="manual_save"):
+        if m_title and m_sol:
+            card_manual = {
+                "category": m_cat,
+                "car_model": m_model,
+                "sub_system": m_sub,
+                "title": m_title,
+                "problem_or_topic": m_prob,
+                "solution_or_summary": m_sol,
+                "part_numbers_or_specs": m_parts,
+                "is_verified_solution": m_ver,
+                "keywords": m_title,
+            }
+            msg_id = int(pd.Timestamp.now().timestamp())
+            save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob)
+            st.session_state["sync_notice"] = "تمت إضافة البطاقة!"
+            st.rerun()
+        else:
+            st.warning("أدخل عنوان البطاقة والخلاصة.")
+
 st.write("")
 col_s1, col_s2 = st.columns([2, 1])
 with col_s1:
     search_q = st.text_input("🔍 البحث الفوري في قاعدة المعرفة", placeholder="ابحث عن: بطارية AGM، شاشة، تكييف، طقطقة...")
 with col_s2:
-    model_filter = st.selectbox("🚙 تصفية حسب الطراز:", ["الكل", "Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"])
+    model_filter = st.selectbox(
+        "🚙 تصفية حسب الطراز:",
+        ["الكل", "Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"],
+    )
 
 if is_admin:
   with st.expander("🤖 استشارة المهندس الذكي والموجز اليومي", expanded=False):
@@ -685,7 +696,7 @@ if selected_cat != "الكل" and not filtered_df.empty:
     filtered_df = filtered_df[filtered_df["category"] == selected_cat]
 
 if filtered_df.empty:
-    st.info("لا توجد بطاقات مطابقة حالياً. يمكنك الضغط على 'استعادة البيانات النموذجية' أو بدء سحب رسائل القروب من القائمة الجانبية.")
+    st.info("لا توجد بطاقات مطابقة حالياً. استخدم زر سحب رسائل القروب أو بدء التحليل في أعلى الصفحة.")
 else:
     for _, row in filtered_df.iterrows():
         title_safe = html.escape(str(row.get("title", "")))

@@ -51,7 +51,7 @@ class KnowledgeCardSchema(BaseModel):
         "نبض القروب والدردشة العامة",
     ] = Field(description="القسم الأنسب من الأقسام الثمانية")
 
-    car_model: Literal["Jaecoo J8", "Jaecoo J7", "Jaecoo J5", "Jaecoo SHS (سوبر هايبرد)", "جميع الطرازات / عام"] = Field(
+    car_model: Literal["Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"] = Field(
         description="طراز السيارة"
     )
     sub_system: Literal[
@@ -79,7 +79,7 @@ class KnowledgeCardSchema(BaseModel):
 
 
 SYSTEM_PROMPT = """
-أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7, J8, J5, SHS) ومحلل بيانات قروب التيليجرام.
+أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J8, J8 SHS, J5, J7) ومحلل بيانات قروب التيليجرام.
 مهمتك قراءة نقاشات الأعضاء واستخراج بطاقة معرفة فنية دقيقة ومنظمة بصيغة JSON متوافقة تماماً مع المعايير المطلوبة.
 """
 
