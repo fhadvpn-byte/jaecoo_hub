@@ -8,7 +8,7 @@ import sqlite3
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-from database_and_ai import analyze_thread_with_ai, init_db, load_config, save_card, save_config
+from database_and_ai import analyze_thread_with_ai, get_db_connection, init_db, load_config, save_card, save_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -135,40 +135,24 @@ async def _connect_saved_client(client: TelegramClient, logs: list, message: str
     return True
 
 
+def _stored_card_count() -> int:
+    conn = get_db_connection()
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM knowledge_cards").fetchone()[0])
+    finally:
+        conn.close()
+
+
 async def _open_client(cfg: dict, logs: list):
+    """يتصل بجلسة الحساب user_session.session مباشرة، دون بوت."""
     api_id, api_hash = _api_credentials(cfg)
-    has_api = bool(str(cfg.get("tg_api_id") or cfg.get("telegram_api_id") or "").strip() and str(cfg.get("tg_api_hash") or cfg.get("telegram_api_hash") or "").strip())
-    session_string = _session_string(cfg)
-
-    if session_string:
-        client = TelegramClient(StringSession(session_string), api_id, api_hash, timeout=30)
-        if await _connect_saved_client(client, logs, "تم الاتصال عبر الجلسة النصية المحفوظة بدون Bot Token."):
-            return client, None
-
-    if os.path.exists(PERSONAL_SESSION_FILE):
-        session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
-        client = TelegramClient(session_name, api_id, api_hash, timeout=30)
-        if await _connect_saved_client(client, logs, "تم الاتصال عبر ملف الجلسة الشخصية بدون Bot Token."):
-            _remember_session_string(client, cfg)
-            return client, None
-
-    token = (cfg.get("bot_token") or cfg.get("telegram_bot_token") or "").strip()
-    if token:
-        client = TelegramClient(StringSession(), api_id, api_hash, timeout=30)
-        try:
-            await client.start(bot_token=token)
-            _note(logs, "تم الاتصال عبر Bot Token الاختياري.")
-            return client, None
-        except Exception as exc:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            _note(logs, f"تم تجاوز Bot Token: {exc}", "error")
-
-    if has_api or session_string or os.path.exists(PERSONAL_SESSION_FILE):
-        return None, "API ID و Hash كافيان لتجاوز البوت. أضف المفتاح tg_session في st.secrets على السحابة، أو ملف user_session.session محلياً."
-    return None, "أدخل Telegram API ID و API Hash. Bot Token غير مطلوب."
+    if not os.path.exists(PERSONAL_SESSION_FILE):
+        return None, "ملف الجلسة user_session.session غير موجود. السحب يستخدم جلسة الحساب مباشرة دون بوت."
+    session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
+    client = TelegramClient(session_name, api_id, api_hash, timeout=30)
+    if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب user_session.session."):
+        return client, None
+    return None, "جلسة user_session.session غير موثقة. لا يُستخدم بوت."
 
 
 async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
@@ -226,12 +210,15 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
         pending = [message for message in reversed(list(messages)) if len((message.text or "").strip()) > 15]
         total = max(len(pending), 1)
-        _report(on_progress, f"تم جلب {len(pending)} رسالة من تيليجرام.", 0.36)
+        _report(
+            on_progress,
+            f"تم سحب {len(messages)} رسالة من تيليجرام، ومنها {len(pending)} رسالة جاهزة للتحليل.",
+            0.36,
+        )
 
         for index, message in enumerate(pending, start=1):
             text = (message.text or "").strip()
             step = 0.4 + 0.55 * ((index - 1) / total)
-            _report(on_progress, f"جاري جلب الرسالة {index} من {len(pending)}...", step)
             result["scanned"] += 1
             try:
                 sender = await message.get_sender()
@@ -239,7 +226,11 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             except Exception:
                 author_name = "عضو"
 
-            _report(on_progress, "جاري تحليل الرسالة عبر Groq...", min(0.97, step + (0.2 / total)))
+            _report(
+                on_progress,
+                f"جاري تحليل الرسالة {index} من {len(pending)} عبر Groq...",
+                min(0.97, step + (0.2 / total)),
+            )
             try:
                 card = analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key)
             except Exception as exc:
@@ -255,7 +246,11 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             save_card(card, message.id, thread_url, author_name, text)
             result["saved"] += 1
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-            _report(on_progress, "تم حفظ البطاقة بنجاح", min(0.99, step + (0.45 / total)))
+            _report(
+                on_progress,
+                f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
+                min(0.99, step + (0.45 / total)),
+            )
 
         result["ok"] = True
         _report(on_progress, "اكتمل السحب والتحليل.", 1.0)

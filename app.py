@@ -24,12 +24,26 @@ from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
 
 AUTO_SYNC_LIMIT = 30
 _SYNC_GUARD = threading.Lock()
-_SYNC_STATE = {"running": False, "done_at": 0.0, "result": None}
+_SYNC_STATE = {
+    "running": False,
+    "done_at": 0.0,
+    "result": None,
+    "lines": [],
+    "fraction": 0.0,
+    "message": "",
+}
+
+
+def _record_sync_progress(message: str, fraction: float) -> None:
+    with _SYNC_GUARD:
+        _SYNC_STATE["lines"].append(message)
+        _SYNC_STATE["fraction"] = fraction
+        _SYNC_STATE["message"] = message
 
 
 def _auto_sync_worker():
     try:
-        result = run_sync(AUTO_SYNC_LIMIT)
+        result = run_sync(AUTO_SYNC_LIMIT, on_progress=_record_sync_progress)
     except Exception as exc:
         result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
     with _SYNC_GUARD:
@@ -50,6 +64,9 @@ def start_auto_sync(config: dict):
             return
         _SYNC_STATE["running"] = True
         _SYNC_STATE["result"] = None
+        _SYNC_STATE["lines"] = ["جاري الاتصال بجلسة الحساب..."]
+        _SYNC_STATE["fraction"] = 0.08
+        _SYNC_STATE["message"] = "جاري الاتصال بجلسة الحساب..."
     threading.Thread(target=_auto_sync_worker, daemon=True).start()
 
 
@@ -712,71 +729,66 @@ if st.session_state.get("sync_logs"):
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
-        if _SYNC_STATE["running"]:
-            st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
-        else:
-            live = {
-                "lines": ["جاري الاتصال ب تيليجرام..."],
-                "fraction": 0.08,
-                "message": "جاري الاتصال ب تيليجرام...",
-                "done": False,
-                "result": None,
-            }
-            live_lock = threading.Lock()
+        if not _SYNC_STATE["running"]:
+            with _SYNC_GUARD:
+                _SYNC_STATE["running"] = True
+                _SYNC_STATE["result"] = None
+                _SYNC_STATE["lines"] = ["جاري الاتصال بجلسة الحساب..."]
+                _SYNC_STATE["fraction"] = 0.08
+                _SYNC_STATE["message"] = "جاري الاتصال بجلسة الحساب..."
 
             def _pull_worker() -> None:
-                def _on_progress(message: str, fraction: float) -> None:
-                    with live_lock:
-                        live["lines"].append(message)
-                        live["fraction"] = fraction
-                        live["message"] = message
-
                 try:
-                    live["result"] = run_sync(int(limit_val), on_progress=_on_progress)
+                    result = run_sync(int(limit_val), on_progress=_record_sync_progress)
                 except Exception as exc:
-                    live["result"] = {"ok": False, "error": str(exc), "saved": 0, "scanned": 0}
-                finally:
-                    with live_lock:
-                        live["done"] = True
+                    result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
+                with _SYNC_GUARD:
+                    _SYNC_STATE["result"] = result
+                    _SYNC_STATE["done_at"] = time.time()
+                    _SYNC_STATE["running"] = False
 
             threading.Thread(target=_pull_worker, daemon=True).start()
-            with sync_feedback.container():
-                bar = st.progress(0.08, text="جاري الاتصال ب تيليجرام...")
-                log_slot = st.empty()
-                with st.spinner("جاري السحب والتحليل..."):
-                    while True:
-                        with live_lock:
-                            done = live["done"]
-                            lines = list(live["lines"])
-                            fraction = float(live["fraction"])
-                            message = str(live["message"])
-                        log_slot.write("\n\n".join(lines))
-                        bar.progress(min(1.0, max(0.0, fraction)), text=message)
-                        if done:
-                            break
-                        time.sleep(0.4)
-                result = live["result"] or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
-                if result.get("ok"):
-                    lines.append(
-                        f"انتهى السحب. المفحوص: {result.get('scanned', 0)}، المحفوظ: {result.get('saved', 0)}."
-                    )
-                    log_slot.write("\n\n".join(lines))
-                    bar.progress(1.0, text="اكتمل السحب والتحليل.")
-            live_lines = lines
-            st.session_state["sync_logs"] = live_lines
+
+        with sync_feedback.container():
+            bar = st.progress(0.08, text="جاري الاتصال بجلسة الحساب...")
+            log_slot = st.empty()
+            with st.spinner("جاري السحب عبر جلسة الحساب والتحليل عبر Groq..."):
+                while True:
+                    with _SYNC_GUARD:
+                        running = _SYNC_STATE["running"]
+                        lines = list(_SYNC_STATE["lines"])
+                        fraction = float(_SYNC_STATE["fraction"] or 0.0)
+                        message = str(_SYNC_STATE["message"] or "جاري السحب...")
+                        result = _SYNC_STATE["result"]
+                    log_slot.code("\n".join(lines) or message, language="text")
+                    bar.progress(min(1.0, max(0.0, fraction)), text=message)
+                    if not running:
+                        break
+                    time.sleep(0.4)
+            result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
+            fresh = get_db_connection()
+            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+            fresh.close()
+            total_cards = len(fresh_df)
             if result.get("ok"):
-                fresh = get_db_connection()
-                fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-                fresh.close()
-                with metrics_box.container():
-                    _render_metrics(fresh_df)
-                st.session_state["sync_notice"] = (
-                    f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                    f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {len(fresh_df)}."
+                lines.append(
+                    f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
+                    f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
+                    f"إجمالي القاعدة: {total_cards}."
                 )
-                st.rerun()
-            else:
-                st.error(result.get("error") or "تعذر إكمال السحب.")
+                log_slot.code("\n".join(lines), language="text")
+                bar.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
+        st.session_state["sync_logs"] = lines
+        if result.get("ok"):
+            with metrics_box.container():
+                _render_metrics(fresh_df)
+            st.session_state["sync_notice"] = (
+                f"تم سحب قروب {result.get('group') or 'التلجرام'} "
+                f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}."
+            )
+            st.rerun()
+        else:
+            st.error(result.get("error") or "تعذر إكمال السحب.")
 with analyze_col:
     if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
         groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")
