@@ -58,13 +58,6 @@ def _api_credentials(cfg: dict) -> tuple[int, str]:
     return int(api_id), api_hash
 
 
-# يُعرض في الواجهة عندما لا توجد String Session ولا ملف جلسة محلي.
-SESSION_UNDEFINED_ERROR = (
-    "جلسة تيليجرام غير مُعرّفة. أضف المفتاح TELEGRAM_SESSION في Secrets على Streamlit Cloud "
-    "بقيمة String Session لحسابك الشخصي. ملف user_session.session غير موجود على السحابة."
-)
-
-
 def _session_string(cfg: dict) -> str:
     for value in (
         cfg.get("tg_session"),
@@ -178,7 +171,10 @@ async def _open_client(cfg: dict, logs: list):
             return client, None
         return None, "ملف user_session.session المحلي غير موثق."
 
-    return None, SESSION_UNDEFINED_ERROR
+    return None, (
+        "جلسة تيليجرام غير مُعرّفة. أضف المفتاح TELEGRAM_SESSION في Secrets على Streamlit Cloud "
+        "بقيمة String Session لحسابك الشخصي. ملف user_session.session غير موجود على السحابة."
+    )
 
 
 async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:

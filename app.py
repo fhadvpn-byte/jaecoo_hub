@@ -20,7 +20,7 @@ from database_and_ai import (
     save_card,
     save_config,
 )
-from telegram_scraper import PERSONAL_SESSION_FILE, SESSION_UNDEFINED_ERROR, run_sync
+from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
 
 AUTO_SYNC_LIMIT = 30
 _SYNC_GUARD = threading.Lock()
@@ -182,6 +182,12 @@ def apply_cloud_string_session(cfg: dict) -> dict:
         if saved:
             os.environ["TELEGRAM_SESSION"] = saved
     return cfg
+
+
+SESSION_MISSING_WARNING = (
+    "جلسة تيليجرام غير مُعرّفة. أضف المفتاح TELEGRAM_SESSION في Secrets على Streamlit Cloud "
+    "بقيمة String Session لحسابك الشخصي. ملف user_session.session غير موجود على السحابة."
+)
 
 
 def telegram_session_ready(cfg: dict) -> bool:
@@ -750,7 +756,7 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
 limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
 sync_feedback = st.empty()
 if not telegram_session_ready(cfg):
-    st.warning(SESSION_UNDEFINED_ERROR)
+    st.warning(SESSION_MISSING_WARNING)
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):
         st.code("\n".join(st.session_state["sync_logs"]), language="text")
@@ -758,7 +764,7 @@ pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
         if not telegram_session_ready(cfg):
-            st.warning(SESSION_UNDEFINED_ERROR)
+            st.warning(SESSION_MISSING_WARNING)
         else:
             if not _SYNC_STATE["running"]:
                 with _SYNC_GUARD:
