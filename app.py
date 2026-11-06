@@ -23,6 +23,13 @@ from database_and_ai import (
 from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
 
 AUTO_SYNC_LIMIT = 30
+JAECOO_MODELS = [
+    "Jaecoo J8",
+    "Jaecoo J8 SHS",
+    "Jaecoo J7",
+    "Jaecoo J5",
+    "جميع الطرازات / عام",
+]
 _SYNC_GUARD = threading.Lock()
 _SYNC_STATE = {
     "running": False,
@@ -731,16 +738,39 @@ conn = get_db_connection()
 df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", conn)
 conn.close()
 
+def _model_count(frame: pd.DataFrame, model: str) -> int:
+    if frame.empty or "car_model" not in frame.columns:
+        return 0
+    return int(frame["car_model"].fillna("").str.strip().str.upper().eq(model.upper()).sum())
+
+
+def _render_stat_card(title: str, count: int, icon: str) -> None:
+    st.markdown(
+        f'<div class="metric-card"><div>{icon} {html.escape(title)}</div><div class="metric-val">{int(count)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_metrics(frame: pd.DataFrame) -> None:
-    col_m1, col_m2, col_m3 = st.columns(3)
-    verified_count = int(frame["is_verified_solution"].sum()) if not frame.empty else 0
-    j8_count = int((frame["car_model"] == "Jaecoo J8").sum()) if not frame.empty else 0
-    with col_m1:
-        st.markdown(f'<div class="metric-card"><div>💠 إجمالي البطاقات</div><div class="metric-val">{len(frame)}</div></div>', unsafe_allow_html=True)
-    with col_m2:
-        st.markdown(f'<div class="metric-card"><div>✅ الحلول المؤكدة</div><div class="metric-val">{verified_count}</div></div>', unsafe_allow_html=True)
-    with col_m3:
-        st.markdown(f'<div class="metric-card"><div>🚙 بطاقات Jaecoo J8</div><div class="metric-val">{j8_count}</div></div>', unsafe_allow_html=True)
+    total_cards = 0 if frame.empty else len(frame)
+    if frame.empty or "is_verified_solution" not in frame.columns:
+        verified_cards = 0
+    else:
+        verified_cards = int(frame["is_verified_solution"].fillna(0).astype(int).eq(1).sum())
+    col_total, col_verified = st.columns(2)
+    with col_total:
+        _render_stat_card("إجمالي البطاقات", total_cards, "🔹")
+    with col_verified:
+        _render_stat_card("الحلول المؤكدة", verified_cards, "✅")
+    col_j8, col_j8_shs, col_j7, col_j5 = st.columns(4)
+    with col_j8:
+        _render_stat_card("بطاقات Jaecoo J8", _model_count(frame, "Jaecoo J8"), "🚙")
+    with col_j8_shs:
+        _render_stat_card("بطاقات Jaecoo J8 SHS", _model_count(frame, "Jaecoo J8 SHS"), "⚡")
+    with col_j7:
+        _render_stat_card("بطاقات Jaecoo J7", _model_count(frame, "Jaecoo J7"), "🚘")
+    with col_j5:
+        _render_stat_card("بطاقات Jaecoo J5", _model_count(frame, "Jaecoo J5"), "🚗")
 
 metrics_box = st.empty()
 with metrics_box.container():
@@ -860,7 +890,7 @@ with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded
     m_title = st.text_input("عنوان البطاقة", key="manual_title")
     m_model = st.selectbox(
         "الطراز",
-        ["Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"],
+        JAECOO_MODELS,
         key="manual_model",
     )
     m_cat = st.selectbox("القسم", [
@@ -914,7 +944,7 @@ with col_s1:
 with col_s2:
     model_filter = st.selectbox(
         "🚙 تصفية حسب الطراز:",
-        ["الكل", "Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"],
+        ["الكل", *JAECOO_MODELS],
     )
 
 if is_admin:
