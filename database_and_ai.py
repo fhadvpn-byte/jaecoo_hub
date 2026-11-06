@@ -9,6 +9,7 @@ from google.genai import types
 
 DB_NAME = "jaecoo_knowledge.db"
 CONFIG_FILE = "config.json"
+_WORKING_MODEL = None
 
 # ==========================================
 # 1. إدارة الإعدادات الدائمة (Config Manager)
@@ -43,7 +44,7 @@ def save_config(cfg: dict):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 # ==========================================
-# 2. القالب المهيكل للبطاقة الفنية (Schema)
+# 2. القالب المهيكل للبطاقة الفنية (محدث ليشمل طرازات جايكو الكاملة)
 # ==========================================
 class KnowledgeCardSchema(BaseModel):
     is_worth_archiving: bool = Field(
@@ -60,11 +61,11 @@ class KnowledgeCardSchema(BaseModel):
         "نبض القروب والدردشة العامة",
     ] = Field(description="القسم الأنسب من الأقسام الثمانية")
 
-    car_model: Literal["Jaecoo J8", "Jaecoo J7", "جميع الطرازات / عام"] = Field(
+    car_model: Literal["Jaecoo J8", "Jaecoo J7", "Jaecoo J5", "Jaecoo SHS (سوبر هايبرد)", "جميع الطرازات / عام"] = Field(
         description="طراز السيارة"
     )
     sub_system: Literal[
-        "المحرك والتيربو",
+        "المحرك والتيربو والمنظومة الهجين SHS",
         "القير والدفع الرباعي AWD",
         "الكهرباء والبطارية والحساسات",
         "الشاشة والنظام الصوتي والربط",
@@ -88,21 +89,15 @@ class KnowledgeCardSchema(BaseModel):
 
 
 SYSTEM_PROMPT = """
-أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7 و Jaecoo J8) ومحلل بيانات القروب.
-مهمتك قراءة نقاشات الأعضاء (نصوص، سلاسل ردود، صور قطع غيار/فواتير/شاشات أعطال، أو بصمات صوتية) وتحويلها إلى بطاقة معرفة فنية.
-
-قواعد العمل:
-1. ادمج السؤال مع جميع الردود التابعة له لاستخلاص المشكلة من جهة والحل النهائي من جهة أخرى.
-2. إذا أُرفقت صورة (كرتون قطعة غيار، فاتورة صيانة، شاشة طبلون، إكسسوار)، استخرج رقم القطعة أو الكود أو السعر بدقة وضعها في حقل المواصفات.
-3. إذا أُرفق ملف صوتي، فرّغ محتواه الفني واستخلص منه التشخيص أو الحل مباشرة.
-4. صنّف البطاقة بدقة في أحد الأقسام الثمانية المعتمدة.
+أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7, J8, J5, والمنظومة الهجين SHS) ومحلل بيانات القروب.
+مهمتك قراءة نقاشات الأعضاء وتحويلها إلى بطاقة معرفة فنية دقيقة ومنظمة.
 """
 
 # ==========================================
 # 3. إدارة قاعدة البيانات (SQLite + WAL)
 # ==========================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=20, check_same_thread=False)
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -160,8 +155,35 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
     conn.close()
 
 # ==========================================
-# 4. دوال الذكاء الاصطناعي (تحليل + وسائط + بحث + ملخص)
+# 4. محرك الذكاء الاصطناعي الذكي
 # ==========================================
+def _generate_with_auto_model(client: genai.Client, contents, config=None):
+    global _WORKING_MODEL
+    candidates = []
+    if _WORKING_MODEL:
+        candidates.append(_WORKING_MODEL)
+    for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.0-flash", "gemini-flash-latest"]:
+        if m not in candidates:
+            candidates.append(m)
+
+    last_err = None
+    for model_name in candidates:
+        try:
+            res = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+            _WORKING_MODEL = model_name
+            return res
+        except Exception as e:
+            last_err = e
+            if "404" in str(e) or "NOT_FOUND" in str(e):
+                continue
+            raise e
+    raise last_err
+
+
 def analyze_thread_with_ai(
     thread_text: str,
     api_key: str,
@@ -169,14 +191,14 @@ def analyze_thread_with_ai(
     mime_type: str = None,
 ) -> dict:
     client = genai.Client(api_key=api_key)
-    prompt = f"حلل المحتوى التالي من قروب ملاك جايكو واستخرج البطاقة الفنية المهيكلة:\n\n{thread_text}"
+    prompt = f"حلل المحتوى التالي من قروب ملاك جايكو (J7, J8, J5, SHS) واستخرج البطاقة الفنية المهيكلة:\n\n{thread_text}"
     contents = [prompt]
 
     if media_bytes and mime_type:
         contents.append(types.Part.from_bytes(data=media_bytes, mime_type=mime_type))
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
+    response = _generate_with_auto_model(
+        client=client,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
@@ -189,7 +211,6 @@ def analyze_thread_with_ai(
 
 
 def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:
-    """تُستخدم للرد التلقائي في التلجرام أو من داخل المنصة إذا تكرر سؤال له حل معتمد"""
     conn = get_db_connection()
     rows = conn.execute(
         "SELECT title, car_model, problem_or_topic, solution_or_summary, part_numbers_or_specs, author_name "
@@ -206,8 +227,8 @@ def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[s
     ])
 
     client = genai.Client(api_key=api_key)
-    res = client.models.generate_content(
-        model="gemini-2.5-flash",
+    res = _generate_with_auto_model(
+        client=client,
         contents=(
             f"الأرشيف المعتمد لقروب جايكو:\n{archive_context}\n\n"
             f"سؤال العضو الحالي:\n{question_text}\n\n"
@@ -222,7 +243,6 @@ def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[s
 
 
 def generate_daily_pulse_summary(api_key: str) -> str:
-    """توليد نشرة ملخص نبض القروب من آخر البطاقات المسجلة"""
     conn = get_db_connection()
     rows = conn.execute(
         "SELECT category, car_model, title, solution_or_summary, author_name FROM knowledge_cards ORDER BY id DESC LIMIT 20"
@@ -234,12 +254,11 @@ def generate_daily_pulse_summary(api_key: str) -> str:
 
     items = "\n".join([f"- ({r[0]} | {r[1]}) {r[2]}: {r[3]} [بواسطة: {r[4]}]" for r in rows])
     client = genai.Client(api_key=api_key)
-    res = client.models.generate_content(
-        model="gemini-2.5-flash",
+    res = _generate_with_auto_model(
+        client=client,
         contents=(
             f"بناءً على أحدث المواضيع الموثقة في قروب جايكو:\n{items}\n\n"
-            "صِغ نشرة موجزة ومنظمة بعنوان '⚡ الموجز الذكي لنبض قروب جايكو' تصلح للنشر في القروب أو القراءة السريعة، "
-            "تبرز أهم الحلول المكتشفة، القطع البديلة، وأبرز النقاشات في نقاط أنيقة."
+            "صِغ نشرة موجزة ومنظمة بعنوان '⚡ الموجز الذكي لنبض قروب جايكو' تصلح للنشر في القروب أو القراءة السريعة."
         ),
     )
     return res.text
