@@ -58,8 +58,23 @@ def _api_credentials(cfg: dict) -> tuple[int, str]:
     return int(api_id), api_hash
 
 
+# يُعرض في الواجهة عندما لا توجد String Session ولا ملف جلسة محلي.
+SESSION_UNDEFINED_ERROR = (
+    "جلسة تيليجرام غير مُعرّفة. أضف المفتاح TELEGRAM_SESSION في Secrets على Streamlit Cloud "
+    "بقيمة String Session لحسابك الشخصي. ملف user_session.session غير موجود على السحابة."
+)
+
+
 def _session_string(cfg: dict) -> str:
-    return (cfg.get("tg_session") or cfg.get("telegram_session") or "").strip()
+    for value in (
+        cfg.get("tg_session"),
+        cfg.get("telegram_session"),
+        os.environ.get("TELEGRAM_SESSION"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _remember_session_string(client: TelegramClient, cfg: dict) -> None:
@@ -144,15 +159,26 @@ def _stored_card_count() -> int:
 
 
 async def _open_client(cfg: dict, logs: list):
-    """يتصل بجلسة الحساب user_session.session مباشرة، دون بوت."""
+    """يتصل بجلسة الحساب عبر String Session، ثم بملف الجلسة المحلي إن وُجد."""
     api_id, api_hash = _api_credentials(cfg)
-    if not os.path.exists(PERSONAL_SESSION_FILE):
-        return None, "ملف الجلسة user_session.session غير موجود. السحب يستخدم جلسة الحساب مباشرة دون بوت."
-    session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
-    client = TelegramClient(session_name, api_id, api_hash, timeout=30)
-    if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب user_session.session."):
-        return client, None
-    return None, "جلسة user_session.session غير موثقة. لا يُستخدم بوت."
+    session_text = _session_string(cfg)
+    if session_text:
+        try:
+            client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30)
+        except Exception as exc:
+            return None, f"تعذر قراءة TELEGRAM_SESSION. تأكد أنها String Session صالحة. التفاصيل: {exc}"
+        if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية (String Session)."):
+            return client, None
+        return None, "جلسة TELEGRAM_SESSION غير موثقة. ضع String Session الحالية لحسابك الشخصي في أسرار Streamlit."
+
+    if os.path.exists(PERSONAL_SESSION_FILE):
+        session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
+        client = TelegramClient(session_name, api_id, api_hash, timeout=30)
+        if await _connect_saved_client(client, logs, "تم الاتصال بملف الجلسة المحلي user_session.session."):
+            return client, None
+        return None, "ملف user_session.session المحلي غير موثق."
+
+    return None, SESSION_UNDEFINED_ERROR
 
 
 async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:

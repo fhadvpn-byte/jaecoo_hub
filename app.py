@@ -20,7 +20,7 @@ from database_and_ai import (
     save_card,
     save_config,
 )
-from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
+from telegram_scraper import PERSONAL_SESSION_FILE, SESSION_UNDEFINED_ERROR, run_sync
 
 AUTO_SYNC_LIMIT = 30
 _SYNC_GUARD = threading.Lock()
@@ -164,6 +164,32 @@ def _read_saved(cfg: dict, names: tuple[str, ...]) -> str:
     return ""
 
 
+def read_cloud_string_session() -> str:
+    """يقرأ String Session من st.secrets['TELEGRAM_SESSION'] لسحب السحابة."""
+    try:
+        return str(st.secrets["TELEGRAM_SESSION"] or "").strip()
+    except Exception:
+        return ""
+
+
+def apply_cloud_string_session(cfg: dict) -> dict:
+    secret = read_cloud_string_session() or _read_secret(("TELEGRAM_SESSION", "tg_session", "telegram_session"))
+    if secret:
+        cfg["tg_session"] = secret
+        os.environ["TELEGRAM_SESSION"] = secret
+    else:
+        saved = str(cfg.get("tg_session") or "").strip()
+        if saved:
+            os.environ["TELEGRAM_SESSION"] = saved
+    return cfg
+
+
+def telegram_session_ready(cfg: dict) -> bool:
+    if str(cfg.get("tg_session") or os.environ.get("TELEGRAM_SESSION") or "").strip():
+        return True
+    return os.path.exists(PERSONAL_SESSION_FILE)
+
+
 def hydrate_config(cfg: dict) -> dict:
     """يعيد قراءة config.json و st.secrets في كل تحميل ويحفظ المفاتيح الناقصة."""
     changed = False
@@ -235,7 +261,7 @@ def viewer_is_admin(cfg: dict) -> bool:
 
 
 init_db()
-cfg = ensure_admin_token(hydrate_config(load_config()))
+cfg = apply_cloud_string_session(ensure_admin_token(hydrate_config(load_config())))
 is_admin = viewer_is_admin(cfg)
 start_auto_sync(cfg)
 
@@ -647,7 +673,7 @@ if is_admin:
                 "جلسة السحابة النصية tg_session (اختياري)",
                 key="settings_tg_session",
                 type="password",
-                help="تُستخدم على Streamlit Cloud مع API ID و Hash بدون Bot Token. يمكن وضعها أيضاً في st.secrets.",
+                help="على Streamlit Cloud تُقرأ تلقائياً من st.secrets باسم TELEGRAM_SESSION.",
             )
             bot_token_input = st.text_input(
                 "Bot Token (اختياري)",
@@ -723,72 +749,81 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
 
 limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
 sync_feedback = st.empty()
+if not telegram_session_ready(cfg):
+    st.warning(SESSION_UNDEFINED_ERROR)
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):
         st.code("\n".join(st.session_state["sync_logs"]), language="text")
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
-        if not _SYNC_STATE["running"]:
-            with _SYNC_GUARD:
-                _SYNC_STATE["running"] = True
-                _SYNC_STATE["result"] = None
-                _SYNC_STATE["lines"] = ["جاري الاتصال بجلسة الحساب..."]
-                _SYNC_STATE["fraction"] = 0.08
-                _SYNC_STATE["message"] = "جاري الاتصال بجلسة الحساب..."
-
-            def _pull_worker() -> None:
-                try:
-                    result = run_sync(int(limit_val), on_progress=_record_sync_progress)
-                except Exception as exc:
-                    result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
-                with _SYNC_GUARD:
-                    _SYNC_STATE["result"] = result
-                    _SYNC_STATE["done_at"] = time.time()
-                    _SYNC_STATE["running"] = False
-
-            threading.Thread(target=_pull_worker, daemon=True).start()
-
-        with sync_feedback.container():
-            bar = st.progress(0.08, text="جاري الاتصال بجلسة الحساب...")
-            log_slot = st.empty()
-            with st.spinner("جاري السحب عبر جلسة الحساب والتحليل عبر Groq..."):
-                while True:
-                    with _SYNC_GUARD:
-                        running = _SYNC_STATE["running"]
-                        lines = list(_SYNC_STATE["lines"])
-                        fraction = float(_SYNC_STATE["fraction"] or 0.0)
-                        message = str(_SYNC_STATE["message"] or "جاري السحب...")
-                        result = _SYNC_STATE["result"]
-                    log_slot.code("\n".join(lines) or message, language="text")
-                    bar.progress(min(1.0, max(0.0, fraction)), text=message)
-                    if not running:
-                        break
-                    time.sleep(0.4)
-            result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
-            fresh = get_db_connection()
-            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-            fresh.close()
-            total_cards = len(fresh_df)
-            if result.get("ok"):
-                lines.append(
-                    f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
-                    f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
-                    f"إجمالي القاعدة: {total_cards}."
-                )
-                log_slot.code("\n".join(lines), language="text")
-                bar.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
-        st.session_state["sync_logs"] = lines
-        if result.get("ok"):
-            with metrics_box.container():
-                _render_metrics(fresh_df)
-            st.session_state["sync_notice"] = (
-                f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}."
-            )
-            st.rerun()
+        if not telegram_session_ready(cfg):
+            st.warning(SESSION_UNDEFINED_ERROR)
         else:
-            st.error(result.get("error") or "تعذر إكمال السحب.")
+            if not _SYNC_STATE["running"]:
+                with _SYNC_GUARD:
+                    _SYNC_STATE["running"] = True
+                    _SYNC_STATE["result"] = None
+                    _SYNC_STATE["lines"] = ["جاري الاتصال بجلسة الحساب النصية..."]
+                    _SYNC_STATE["fraction"] = 0.08
+                    _SYNC_STATE["message"] = "جاري الاتصال بجلسة الحساب النصية..."
+
+                def _pull_worker() -> None:
+                    try:
+                        result = run_sync(int(limit_val), on_progress=_record_sync_progress)
+                    except Exception as exc:
+                        result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
+                    with _SYNC_GUARD:
+                        _SYNC_STATE["result"] = result
+                        _SYNC_STATE["done_at"] = time.time()
+                        _SYNC_STATE["running"] = False
+
+                threading.Thread(target=_pull_worker, daemon=True).start()
+
+            with sync_feedback.container():
+                bar = st.progress(0.08, text="جاري الاتصال بجلسة الحساب النصية...")
+                log_slot = st.empty()
+                with st.spinner("جاري السحب عبر جلسة الحساب والتحليل عبر Groq..."):
+                    while True:
+                        with _SYNC_GUARD:
+                            running = _SYNC_STATE["running"]
+                            lines = list(_SYNC_STATE["lines"])
+                            fraction = float(_SYNC_STATE["fraction"] or 0.0)
+                            message = str(_SYNC_STATE["message"] or "جاري السحب...")
+                            result = _SYNC_STATE["result"]
+                        log_slot.code("\n".join(lines) or message, language="text")
+                        bar.progress(min(1.0, max(0.0, fraction)), text=message)
+                        if not running:
+                            break
+                        time.sleep(0.4)
+                result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
+                fresh = get_db_connection()
+                fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+                fresh.close()
+                total_cards = len(fresh_df)
+                if result.get("ok"):
+                    lines.append(
+                        f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
+                        f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
+                        f"إجمالي القاعدة: {total_cards}."
+                    )
+                    log_slot.code("\n".join(lines), language="text")
+                    bar.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
+            st.session_state["sync_logs"] = lines
+            if result.get("ok"):
+                with metrics_box.container():
+                    _render_metrics(fresh_df)
+                st.session_state["sync_notice"] = (
+                    f"تم سحب قروب {result.get('group') or 'التلجرام'} "
+                    f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}."
+                )
+                st.rerun()
+            else:
+                message = result.get("error") or "تعذر إكمال السحب."
+                if "غير مُعرّفة" in message or "TELEGRAM_SESSION" in message:
+                    st.warning(message)
+                else:
+                    st.error(message)
 with analyze_col:
     if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
         groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")
