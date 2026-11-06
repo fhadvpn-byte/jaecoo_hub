@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import re
@@ -125,17 +126,49 @@ def init_db():
         conn.execute("ALTER TABLE knowledge_cards ADD COLUMN media_type TEXT DEFAULT 'text'")
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute("ALTER TABLE knowledge_cards ADD COLUMN media_b64 TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
-def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_name: str, raw_text: str, media_type: str = "text"):
+def compress_image_to_b64(image_bytes: bytes, max_size: int = 600, quality: int = 70) -> str:
+    """يصغّر الصورة إلى 600×600 وجودة JPEG 70٪ ثم يعيدها كنص Base64."""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes))
+    if image.mode in {"RGBA", "LA", "P"}:
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.split()[-1])
+        image = background
+    else:
+        image = image.convert("RGB")
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    image.thumbnail((max_size, max_size), resample)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def save_card(
+    card_data: dict,
+    telegram_msg_id: int,
+    thread_url: str,
+    author_name: str,
+    raw_text: str,
+    media_type: str = "text",
+    media_b64: str = "",
+):
     conn = get_db_connection()
     conn.execute("""
         INSERT OR REPLACE INTO knowledge_cards (
             telegram_msg_id, thread_url, category, car_model, sub_system,
             title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
-            is_verified_solution, keywords, author_name, raw_thread_text, created_at, media_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_verified_solution, keywords, author_name, raw_thread_text, created_at,
+            media_type, media_b64
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         telegram_msg_id,
         thread_url,
@@ -152,6 +185,7 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
         raw_text,
         datetime.now().strftime("%Y-%m-%d %H:%M"),
         media_type if media_type in {"text", "image", "audio", "video"} else "text",
+        media_b64 or "",
     ))
     conn.commit()
     conn.close()

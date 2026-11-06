@@ -1,3 +1,4 @@
+import base64
 import hmac
 import html
 import os
@@ -13,6 +14,7 @@ import streamlit as st
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    compress_image_to_b64,
     find_matching_solution_in_db,
     generate_daily_pulse_summary,
     get_db_connection,
@@ -92,24 +94,34 @@ def delete_knowledge_card(card_id: int) -> None:
         conn.close()
 
 
-def _prepare_lab_source(lab_text: str, lab_file, api_key: str) -> tuple[str, str]:
-    """يحوّل مرفق المختبر إلى نص عربي مع نوع الوسيط قبل تحليل البطاقة."""
+def _image_preview(image_bytes: bytes | None) -> str:
+    if not image_bytes:
+        return ""
+    try:
+        return compress_image_to_b64(image_bytes)
+    except Exception:
+        return ""
+
+
+def _prepare_lab_source(lab_text: str, lab_file, api_key: str) -> tuple[str, str, str]:
+    """يحوّل مرفق المختبر إلى نص عربي مع نوع الوسيط ونسخة الصورة المضغوطة."""
     caption = (lab_text or "").strip()
     if lab_file is None:
-        return caption, "text"
+        return caption, "text", ""
     media_bytes = lab_file.read()
     mime_type = lab_file.type or ""
     extension = os.path.splitext(lab_file.name or "")[1].lower() or ".bin"
     if mime_type.startswith("image"):
         vision_text = analyze_image_bytes(api_key, media_bytes, caption, mime_type or "image/jpeg")
-        return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image"
+        preview = _image_preview(media_bytes)
+        return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image", preview
     if mime_type.startswith("audio"):
         spoken_text = transcribe_media_bytes(api_key, media_bytes, extension)
-        return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio"
+        return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio", ""
     if mime_type.startswith("video"):
         spoken_text = transcribe_media_bytes(api_key, media_bytes, extension or ".mp4")
-        return f"الكلام المسموع في الفيديو: {spoken_text}\nتعليق الفيديو: {caption}".strip(), "video"
-    return caption or "حلل المرفق", "text"
+        return f"الكلام المسموع في الفيديو: {spoken_text}\nتعليق الفيديو: {caption}".strip(), "video", ""
+    return caption or "حلل المرفق", "text", ""
 
 
 def _card_text(value) -> str:
@@ -934,10 +946,10 @@ with analyze_col:
         else:
             with st.spinner("جاري التحليل..."):
                 try:
-                    source_text, media_type = _prepare_lab_source(lab_text, lab_file, groq_key)
+                    source_text, media_type, media_b64 = _prepare_lab_source(lab_text, lab_file, groq_key)
                     card = analyze_thread_with_ai(source_text or "حلل المرفق", groq_key)
                     msg_id = int(pd.Timestamp.now().timestamp())
-                    save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type)
+                    save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type, media_b64)
                     st.session_state["sync_notice"] = f"تم حفظ البطاقة: {card.get('title')}"
                     st.rerun()
                 except Exception as e:
@@ -978,6 +990,7 @@ with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded
     m_prob = st.text_area("الوصف / المشكلة", key="manual_prob")
     m_sol = st.text_area("الخلاصة / الحل", key="manual_sol")
     m_parts = st.text_input("القطع والمواصفات الفنية", key="manual_parts")
+    m_image = st.file_uploader("صورة مرفقة اختيارية", type=["png", "jpg", "jpeg"], key="manual_image")
     m_ver = st.checkbox("حل مؤكد ومجرب", value=True, key="manual_verified")
     if st.button("حفظ البطاقة اليدوية", use_container_width=True, key="manual_save"):
         if m_title and m_sol:
@@ -993,7 +1006,9 @@ with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded
                 "keywords": m_title,
             }
             msg_id = int(pd.Timestamp.now().timestamp())
-            save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob)
+            manual_b64 = _image_preview(m_image.getvalue()) if m_image is not None else ""
+            manual_type = "image" if manual_b64 else "text"
+            save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob, manual_type, manual_b64)
             st.session_state["sync_notice"] = "تمت إضافة البطاقة!"
             st.rerun()
         else:
@@ -1127,6 +1142,11 @@ else:
             {parts_html}
         </div>
         """, unsafe_allow_html=True)
+        preview_b64 = _card_text(row.get("media_b64"))
+        if preview_b64:
+            with st.expander("🖼️ عرض الصورة المرفقة مع البطاقة"):
+                enlarge = st.toggle("تكبير الصورة", key=f"zoom_card_{card_id}")
+                st.image(base64.b64decode(preview_b64), use_container_width=enlarge)
         if st.button(f"🗑️ حذف البطاقة #{card_id}", key=f"delete_card_{card_id}"):
             delete_knowledge_card(card_id)
             st.rerun()

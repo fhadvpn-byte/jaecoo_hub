@@ -12,6 +12,7 @@ from telethon.sessions import StringSession
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    compress_image_to_b64,
     get_db_connection,
     init_db,
     load_config,
@@ -145,23 +146,33 @@ def _media_label(media_type: str) -> str:
     return {"image": "الصورة", "audio": "المقطع الصوتي", "video": "الفيديو"}.get(media_type, "الرسالة")
 
 
-async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str]:
-    """يعيد النص النهائي ونوع الوسيط: text أو image أو audio أو video."""
+def _preview_b64(image_bytes: bytes | None) -> str:
+    if not image_bytes:
+        return ""
+    try:
+        return compress_image_to_b64(image_bytes)
+    except Exception:
+        return ""
+
+
+async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str, str]:
+    """يعيد النص ونوع الوسيط ونسخة الصورة المضغوطة."""
     caption = (message.message or message.text or "").strip()
     if getattr(message, "photo", None):
         image_bytes = await tg_client.download_media(message, file=bytes)
+        preview = _preview_b64(image_bytes)
         if image_bytes:
             vision_text = analyze_image_bytes(groq_key, image_bytes, caption)
-            return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image"
-        return caption, "image"
+            return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image", preview
+        return caption, "image", preview
 
     if getattr(message, "voice", None) or getattr(message, "audio", None):
         audio_bytes = await tg_client.download_media(message, file=bytes)
         if audio_bytes:
             audio_ext = getattr(getattr(message, "file", None), "ext", None) or ".ogg"
             spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=audio_ext)
-            return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio"
-        return caption, "audio"
+            return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio", ""
+        return caption, "audio", ""
 
     if getattr(message, "video", None) or getattr(message, "video_note", None):
         parts = [f"تعليق الفيديو: {caption}"]
@@ -176,12 +187,13 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
             thumb_bytes = await tg_client.download_media(message, file=bytes, thumb=-1)
         except Exception:
             thumb_bytes = None
+        preview = _preview_b64(thumb_bytes)
         if thumb_bytes:
             thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption)
             parts.append(f"المشهد المرئي في الفيديو: {thumb_desc}")
-        return "\n".join(part for part in parts if part.strip()), "video"
+        return "\n".join(part for part in parts if part.strip()), "video", preview
 
-    return caption, "text"
+    return caption, "text", ""
 
 
 def _ignore_source(text: str) -> bool:
@@ -333,7 +345,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 author_name = "عضو"
 
             try:
-                text, media_type = await _extract_message_content(client, groq_key, message)
+                text, media_type, media_b64 = await _extract_message_content(client, groq_key, message)
             except Exception as exc:
                 _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
                 _report(on_progress, f"الرسالة {index} من {len(pending)}: تعذر قراءة وسائطها.", step + (0.2 / total))
@@ -367,7 +379,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 continue
 
             thread_url = f"https://t.me/c/{public_id}/{message.id}"
-            save_card(card, message.id, thread_url, author_name, text, media_type)
+            save_card(card, message.id, thread_url, author_name, text, media_type, media_b64)
             result["saved"] += 1
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
             _report(
