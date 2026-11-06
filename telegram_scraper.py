@@ -249,6 +249,82 @@ async def _connect_saved_client(client: TelegramClient, logs: list, message: str
     return True
 
 
+def get_last_synced_id(group_key: str = "main_group") -> int:
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT last_msg_id FROM sync_state WHERE group_key = ?",
+            (group_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row else 0
+
+
+def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO sync_state (group_key, last_msg_id, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(group_key) DO UPDATE SET
+                last_msg_id = excluded.last_msg_id,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (group_key, int(msg_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rate_limit_wait_seconds(error: Exception) -> int:
+    match = re.search(r"try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s", str(error))
+    if not match:
+        return 25
+    minutes = int(match.group(1) or 0)
+    seconds = float(match.group(2) or 0)
+    return min(1800, int(minutes * 60 + seconds) + 3)
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    text = str(error).lower()
+    return "429" in text or "rate_limit" in text
+
+
+def _should_analyze_message(message) -> bool:
+    if any(getattr(message, name, None) for name in ("photo", "voice", "audio", "video", "video_note")):
+        return True
+    text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
+    if is_dealer_or_maintenance_msg(text):
+        return True
+    return len(text) >= 15
+
+
+async def _run_with_backoff(factory, on_progress):
+    last_error = None
+    for attempt in range(5):
+        try:
+            value = factory()
+            if asyncio.iscoroutine(value):
+                return await value
+            return value
+        except Exception as exc:
+            last_error = exc
+            if _is_rate_limit(exc) and attempt < 4:
+                wait_sec = _rate_limit_wait_seconds(exc)
+                _report(
+                    on_progress,
+                    f"تهدئة تلقائية لمدة {wait_sec} ثانية لتجديد رصيد Groq ثم يكمل السحب.",
+                    0.45,
+                )
+                await asyncio.sleep(wait_sec)
+                continue
+            raise
+    raise last_error
+
+
 def _stored_card_count() -> int:
     conn = get_db_connection()
     try:
@@ -326,22 +402,34 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             return result
 
         result["group"] = target.name or str(target.id)
-        _report(on_progress, "جاري سحب الرسائل...", 0.32)
-        _note(logs, f"سحب آخر {limit} رسالة من: {result['group']}")
-        messages = await client.get_messages(target, limit=limit)
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
-        pending = [message for message in reversed(list(messages)) if _message_is_pending(message)]
-        total = max(len(pending), 1)
+        group_key = chat_id
+        last_id = get_last_synced_id(group_key)
+        batch_limit = int(limit) if limit else None
         _report(
             on_progress,
-            f"تم سحب {len(messages)} رسالة من تيليجرام، ومنها {len(pending)} رسالة جاهزة للتحليل.",
-            0.36,
+            f"بدأ السحب التسلسلي من الرسالة رقم {last_id + 1}، من أقدم رسائل القروب باتجاه اليوم.",
+            0.2,
         )
+        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}.")
 
-        for index, message in enumerate(pending, start=1):
-            step = 0.4 + 0.55 * ((index - 1) / total)
+        async for message in client.iter_messages(target, reverse=True, min_id=last_id, limit=batch_limit):
             result["scanned"] += 1
+            fraction = min(0.95, 0.3 + (0.6 * result["scanned"] / max(batch_limit or result["scanned"], 1)))
+            msg_date = message.date.strftime("%Y-%m-%d") if getattr(message, "date", None) else ""
+            _report(
+                on_progress,
+                (
+                    f"جاري فحص الرسالة رقم {message.id} | التاريخ {msg_date} | "
+                    f"تم فحص {result['scanned']} | بطاقات {result['saved']}"
+                ),
+                fraction,
+            )
+            if not _should_analyze_message(message):
+                update_last_synced_id(message.id, group_key)
+                continue
+
             try:
                 sender = await message.get_sender()
                 author_name = getattr(sender, "first_name", None) or "عضو"
@@ -349,51 +437,55 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 author_name = "عضو"
 
             try:
-                text, media_type, media_b64 = await _extract_message_content(client, groq_key, message)
+                text, media_type, media_b64 = await _run_with_backoff(
+                    lambda message=message: _extract_message_content(client, groq_key, message),
+                    on_progress,
+                )
             except Exception as exc:
                 _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
-                _report(on_progress, f"الرسالة {index} من {len(pending)}: تعذر قراءة وسائطها.", step + (0.2 / total))
+                _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
+                update_last_synced_id(message.id, group_key)
                 continue
 
-            if media_type == "text" and _ignore_source(text):
-                _report(
-                    on_progress,
-                    f"الرسالة {index} من {len(pending)}: تم تجاهلها لأنها عامة أو غير واضحة.",
-                    step + (0.2 / total),
-                )
-                continue
-            if len(text.strip()) < 15:
-                _report(on_progress, f"الرسالة {index} من {len(pending)}: لا تحتوي محتوى كافياً للحفظ.", step + (0.2 / total))
+            if (media_type == "text" and _ignore_source(text)) or len((text or "").strip()) < 15:
+                update_last_synced_id(message.id, group_key)
                 continue
 
             _report(
                 on_progress,
-                f"جاري تحليل {_media_label(media_type)} {index} من {len(pending)} عبر Groq...",
-                min(0.97, step + (0.2 / total)),
+                f"جاري تحليل {_media_label(media_type)} رقم {message.id} عبر Groq...",
+                fraction,
             )
             try:
-                card = analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key)
+                card = await _run_with_backoff(
+                    lambda text=text: analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key),
+                    on_progress,
+                )
             except Exception as exc:
                 _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
-                _report(on_progress, f"الرسالة {index} من {len(pending)}: تعذر تحليلها عبر Groq.", step + (0.4 / total))
+                _report(on_progress, f"الرسالة {message.id}: تعذر تحليلها عبر Groq.", fraction)
+                update_last_synced_id(message.id, group_key)
                 continue
 
-            if not _worth_archiving(card):
-                _report(on_progress, f"الرسالة {index} من {len(pending)}: اكتمل تحليل Groq ولم تُحفظ بطاقة.", step + (0.45 / total))
-                continue
-
-            thread_url = f"https://t.me/c/{public_id}/{message.id}"
-            save_card(card, message.id, thread_url, author_name, text, media_type, media_b64)
-            result["saved"] += 1
-            _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-            _report(
-                on_progress,
-                f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
-                min(0.99, step + (0.45 / total)),
-            )
+            if _worth_archiving(card):
+                thread_url = f"https://t.me/c/{public_id}/{message.id}"
+                save_card(card, message.id, thread_url, author_name, text, media_type, media_b64)
+                result["saved"] += 1
+                _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                _report(
+                    on_progress,
+                    f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
+                    fraction,
+                )
+            update_last_synced_id(message.id, group_key)
+            await asyncio.sleep(1.5)
 
         result["ok"] = True
-        _report(on_progress, "اكتمل السحب والتحليل.", 1.0)
+        _report(
+            on_progress,
+            f"اكتمل السحب. تم فحص {result['scanned']} رسالة وإضافة {result['saved']} بطاقة. آخر نقطة: {get_last_synced_id(group_key)}.",
+            1.0,
+        )
         _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:

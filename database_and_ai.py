@@ -161,6 +161,13 @@ def init_db():
         conn.execute("ALTER TABLE knowledge_cards ADD COLUMN media_b64 TEXT")
     except sqlite3.OperationalError:
         pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_state (
+            group_key TEXT PRIMARY KEY,
+            last_msg_id INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 

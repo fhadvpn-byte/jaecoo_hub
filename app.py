@@ -863,6 +863,7 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
     )
 
 limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
+st.caption("كل ضغطة تكمل من آخر رسالة توقفت عندها، بدءاً من أقدم رسائل القروب.")
 sync_feedback = st.empty()
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):
