@@ -4,24 +4,21 @@ import os
 from datetime import datetime
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
+from groq import Groq
 
 DB_NAME = "jaecoo_knowledge.db"
 CONFIG_FILE = "config.json"
-_WORKING_MODEL = None
 
 # ==========================================
 # 1. إدارة الإعدادات الدائمة (Config Manager)
 # ==========================================
 def load_config() -> dict:
     default_cfg = {
-        "gemini_api_key": "",
+        "groq_api_key": "",
         "tg_api_id": "",
         "tg_api_hash": "",
         "tg_group": "",
         "bot_token": "",
-        "auto_reply_enabled": False,
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -30,25 +27,18 @@ def load_config() -> dict:
                 default_cfg.update(data)
         except Exception:
             pass
-    if not default_cfg.get("bot_token") and default_cfg.get("telegram_bot_token"):
-        default_cfg["bot_token"] = str(default_cfg["telegram_bot_token"])
-    if not default_cfg.get("tg_api_id") and default_cfg.get("telegram_api_id") not in (None, ""):
-        default_cfg["tg_api_id"] = str(default_cfg["telegram_api_id"])
-    if not default_cfg.get("tg_api_hash") and default_cfg.get("telegram_api_hash"):
-        default_cfg["tg_api_hash"] = str(default_cfg["telegram_api_hash"])
     return default_cfg
-
 
 def save_config(cfg: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 # ==========================================
-# 2. القالب المهيكل للبطاقة الفنية (محدث ليشمل طرازات جايكو الكاملة)
+# 2. القالب المهيكل للبطاقة الفنية (لطرازات جايكو)
 # ==========================================
 class KnowledgeCardSchema(BaseModel):
     is_worth_archiving: bool = Field(
-        description="True إذا كان النقاش أو الصورة أو الصوت يحتوي على معلومة فنية أو تجربة أو سؤال مفيد. False للتحيات القصيرة والردود الفارغة."
+        description="True إذا كان النقاش يحتوي على معلومة فنية أو تجربة أو سؤال مفيد. False للتحيات القصيرة والردود الفارغة."
     )
     category: Literal[
         "الأعطال والتشخيص",
@@ -77,10 +67,10 @@ class KnowledgeCardSchema(BaseModel):
 
     title: str = Field(description="عنوان واضح ومختصر للبطاقة (5 إلى 10 كلمات)")
     problem_or_topic: str = Field(description="ملخص المشكلة أو الاستفسار أو الموضوع بدقة")
-    solution_or_summary: str = Field(description="الحل التفصيلي المستخلص من الردود أو الصوت أو الصورة")
+    solution_or_summary: str = Field(description="الحل التفصيلي المستخلص من النقاش")
     part_numbers_or_specs: Optional[str] = Field(
         default="",
-        description="أرقام قطع الغيار (Part Numbers)، المقاسات، لزوجة الزيت، التكلفة، أو أسماء الأجهزة والتطبيقات",
+        description="أرقام قطع الغيار، المقاسات، لزوجة الزيت، التكلفة، أو أسماء الأدوات والتطبيقات",
     )
     is_verified_solution: bool = Field(
         description="True إذا تضمن النقاش حلاً مجرباً ومؤكداً"
@@ -89,8 +79,8 @@ class KnowledgeCardSchema(BaseModel):
 
 
 SYSTEM_PROMPT = """
-أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7, J8, J5, والمنظومة الهجين SHS) ومحلل بيانات القروب.
-مهمتك قراءة نقاشات الأعضاء وتحويلها إلى بطاقة معرفة فنية دقيقة ومنظمة.
+أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J7, J8, J5, SHS) ومحلل بيانات قروب التيليجرام.
+مهمتك قراءة نقاشات الأعضاء واستخراج بطاقة معرفة فنية دقيقة ومنظمة بصيغة JSON متوافقة تماماً مع المعايير المطلوبة.
 """
 
 # ==========================================
@@ -100,7 +90,6 @@ def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
-
 
 def init_db():
     conn = get_db_connection()
@@ -125,7 +114,6 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-
 
 def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_name: str, raw_text: str):
     conn = get_db_connection()
@@ -155,59 +143,60 @@ def save_card(card_data: dict, telegram_msg_id: int, thread_url: str, author_nam
     conn.close()
 
 # ==========================================
-# 4. محرك الذكاء الاصطناعي الذكي
+# 4. محرك Groq الذكي والسريع
 # ==========================================
-def _generate_with_auto_model(client: genai.Client, contents, config=None):
-    global _WORKING_MODEL
-    candidates = []
-    if _WORKING_MODEL:
-        candidates.append(_WORKING_MODEL)
-    for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.0-flash", "gemini-flash-latest"]:
-        if m not in candidates:
-            candidates.append(m)
+GROQ_MODELS = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
 
-    last_err = None
-    for model_name in candidates:
+
+def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False):
+    client = Groq(api_key=api_key)
+    last_error = None
+    for model_name in GROQ_MODELS:
+        kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         try:
-            res = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            _WORKING_MODEL = model_name
-            return res
-        except Exception as e:
-            last_err = e
-            if "404" in str(e) or "NOT_FOUND" in str(e):
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_error = exc
+            message = str(exc)
+            if json_mode and "response_format" in message.lower():
+                kwargs.pop("response_format", None)
+                try:
+                    return client.chat.completions.create(**kwargs)
+                except Exception as retry_exc:
+                    last_error = retry_exc
+                    message = str(retry_exc)
+            if "404" in message or "model_not_found" in message or "does not exist" in message:
                 continue
-            raise e
-    raise last_err
+            raise
+    raise last_error
 
 
-def analyze_thread_with_ai(
-    thread_text: str,
-    api_key: str,
-    media_bytes: bytes = None,
-    mime_type: str = None,
-) -> dict:
-    client = genai.Client(api_key=api_key)
-    prompt = f"حلل المحتوى التالي من قروب ملاك جايكو (J7, J8, J5, SHS) واستخرج البطاقة الفنية المهيكلة:\n\n{thread_text}"
-    contents = [prompt]
+def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None) -> dict:
+    schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
+    
+    prompt = f"""
+{SYSTEM_PROMPT}
 
-    if media_bytes and mime_type:
-        contents.append(types.Part.from_bytes(data=media_bytes, mime_type=mime_type))
+يرجى تحليل النص التالي واستخراج النتيجة بصيغة JSON مطابقة تماماً لهذا المخطط (Schema):
+{schema_json_str}
 
-    response = _generate_with_auto_model(
-        client=client,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=KnowledgeCardSchema,
-            temperature=0.1,
-        ),
+النص المراد تحليله:
+{thread_text}
+"""
+
+    completion = _groq_complete(
+        api_key,
+        [
+            {"role": "system", "content": "أنت مساعد ذكي متخصص في استخراج بيانات JSON بدقة متناهية."},
+            {"role": "user", "content": prompt},
+        ],
+        json_mode=True,
     )
-    return json.loads(response.text)
+    
+    result_text = completion.choices[0].message.content
+    return json.loads(result_text)
 
 
 def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:
@@ -226,19 +215,14 @@ def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[s
         for r in rows
     ])
 
-    client = genai.Client(api_key=api_key)
-    res = _generate_with_auto_model(
-        client=client,
-        contents=(
-            f"الأرشيف المعتمد لقروب جايكو:\n{archive_context}\n\n"
-            f"سؤال العضو الحالي:\n{question_text}\n\n"
-            "إذا كان سؤال العضو له حل واضح في الأرشيف أعلاه، اكتب إجابة مختصرة وودودة تبدأ بـ "
-            "'💠 أهلاً بك! تمت مناقشة هذا الموضوع سابقاً في القروب وإليك الخلاصة المعتمدة:' متبوعة بالحل واسم صاحب التجربة. "
-            "أما إذا لم يكن السؤال موجوداً في الأرشيف، فاكتب كلمة NO_MATCH فقط."
-        ),
-        config=types.GenerateContentConfig(temperature=0.1),
+    completion = _groq_complete(
+        api_key,
+        [
+            {"role": "system", "content": "أنت مساعد استشاري لقروب ملاك جايكو."},
+            {"role": "user", "content": f"الأرشيف المعتمد:\n{archive_context}\n\nسؤال العضو الحالي:\n{question_text}\n\nإذا كان السؤال موجوداً في الأرشيف، اكتب إجابة مختصرة تبدأ بـ '💠 أهلاً بك! تمت مناقشة هذا الموضوع سابقاً في القروب وإليك الخلاصة المعتمدة:' مع ذكر الحل واسم صاحب التجربة. وإذا لم يوجد، اكتب NO_MATCH فقط."},
+        ],
     )
-    reply = res.text.strip()
+    reply = completion.choices[0].message.content.strip()
     return None if "NO_MATCH" in reply else reply
 
 
@@ -253,12 +237,11 @@ def generate_daily_pulse_summary(api_key: str) -> str:
         return "لا توجد بيانات كافية لتوليد الملخص."
 
     items = "\n".join([f"- ({r[0]} | {r[1]}) {r[2]}: {r[3]} [بواسطة: {r[4]}]" for r in rows])
-    client = genai.Client(api_key=api_key)
-    res = _generate_with_auto_model(
-        client=client,
-        contents=(
-            f"بناءً على أحدث المواضيع الموثقة في قروب جايكو:\n{items}\n\n"
-            "صِغ نشرة موجزة ومنظمة بعنوان '⚡ الموجز الذكي لنبض قروب جايكو' تصلح للنشر في القروب أو القراءة السريعة."
-        ),
+    completion = _groq_complete(
+        api_key,
+        [
+            {"role": "system", "content": "أنت محرر تقني لنشرة القروب."},
+            {"role": "user", "content": f"بناءً على أحدث المواضيع الموثقة:\n{items}\n\nصِغ نشرة موجزة بعنوان '⚡ الموجز الذكي لنبض قروب جايكو'."},
+        ],
     )
-    return res.text
+    return completion.choices[0].message.content

@@ -1,10 +1,6 @@
 import html
-import os
-import subprocess
-import sys
 import pandas as pd
 import streamlit as st
-from google import genai
 
 from database_and_ai import (
     analyze_thread_with_ai,
@@ -16,6 +12,7 @@ from database_and_ai import (
     save_card,
     save_config,
 )
+from telegram_scraper import run_sync
 
 # ==========================================
 # 1. إعدادات الصفحة والتصميم (هوية حسم الذكية)
@@ -29,6 +26,9 @@ st.set_page_config(
 
 init_db()
 cfg = load_config()
+if not (cfg.get("groq_api_key") or "").strip() and (cfg.get("gemini_api_key") or "").strip():
+    cfg["groq_api_key"] = cfg["gemini_api_key"].strip()
+    save_config(cfg)
 
 st.markdown("""
 <style>
@@ -92,6 +92,9 @@ st.markdown("""
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     }
     .k-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
         direction: rtl !important;
         text-align: right !important;
     }
@@ -111,7 +114,10 @@ st.markdown("""
         border-radius: 8px;
         padding: 3px 10px;
         font-size: 0.82rem;
-        margin-left: 6px;
+        margin: 0;
+        max-width: 100%;
+        white-space: normal;
+        overflow-wrap: anywhere;
         direction: rtl !important;
         text-align: right !important;
     }
@@ -122,34 +128,92 @@ st.markdown("""
         border-radius: 8px;
         margin-top: 10px;
         font-size: 0.95rem;
+        overflow-wrap: anywhere;
         direction: rtl !important;
         text-align: right !important;
+    }
+    img, video, canvas, iframe {
+        max-width: 100% !important;
+        height: auto !important;
+    }
+    pre, code, [data-testid="stCode"] {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+    }
+    @media (max-width: 820px) {
+        .block-container {
+            max-width: 100% !important;
+            padding-left: 0.85rem !important;
+            padding-right: 0.85rem !important;
+            padding-top: 1rem !important;
+        }
+        section[data-testid="stSidebar"] {
+            min-width: min(100vw, 320px) !important;
+            width: min(100vw, 360px) !important;
+        }
+        section[data-testid="stSidebar"] input,
+        section[data-testid="stSidebar"] textarea,
+        [data-testid="stMain"] input,
+        [data-testid="stMain"] textarea {
+            font-size: 16px !important;
+        }
+        [data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            flex-wrap: nowrap !important;
+            gap: 0.75rem !important;
+        }
+        [data-testid="stHorizontalBlock"] > div,
+        [data-testid="stColumn"],
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 0 !important;
+        }
+        [data-testid="stRadio"] [role="radiogroup"] {
+            flex-direction: column !important;
+            align-items: flex-start !important;
+            gap: 0.35rem !important;
+        }
+        .hero-box {
+            padding: 16px;
+            border-radius: 14px;
+        }
+        .hero-box h1 {
+            font-size: 1.45rem !important;
+            line-height: 1.35 !important;
+        }
+        .hub-badge {
+            letter-spacing: 0;
+            white-space: normal;
+        }
+        .metric-card {
+            margin-bottom: 0;
+            padding: 12px;
+        }
+        .metric-val {
+            font-size: 1.7rem;
+        }
+        .k-card {
+            padding: 14px;
+        }
+        .k-title {
+            font-size: 1.05rem;
+        }
+        .stButton > button {
+            width: 100% !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. دالة مساعدة لاستدعاء Gemini بأمان داخل الواجهة
+# 2. دالة مساعدة لاستدعاء Groq داخل الواجهة
 # ==========================================
-def ask_gemini_safe(prompt_text: str, api_key: str) -> str:
-    client = genai.Client(api_key=api_key)
-    for model_name in ["gemini-3.0-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
-        try:
-            res = client.models.generate_content(model=model_name, contents=prompt_text)
-            return res.text
-        except Exception as e:
-            if "404" in str(e) or "NOT_FOUND" in str(e):
-                continue
-            raise e
-    for m in client.models.list():
-        name = getattr(m, "name", "")
-        if "gemini" in name:
-            try:
-                res = client.models.generate_content(model=name, contents=prompt_text)
-                return res.text
-            except Exception:
-                continue
-    raise RuntimeError("تعذر العثور على نموذج Gemini متاح في هذا الحساب.")
+def ask_groq_safe(prompt_text: str, api_key: str) -> str:
+    from database_and_ai import _groq_complete
+
+    completion = _groq_complete(api_key, [{"role": "user", "content": prompt_text}], temperature=0.2)
+    return completion.choices[0].message.content
 
 # ==========================================
 # 3. البيانات النموذجية
@@ -193,44 +257,60 @@ with st.sidebar:
     st.markdown("### 💠 مركز التحكم والربط")
 
     with st.expander("🔐 إعدادات المفاتيح والربط بالتلجرام (حفظ دائم)", expanded=False):
-        gemini_key_input = st.text_input("مفتاح Gemini API", value=cfg.get("gemini_api_key", ""), type="password")
+        groq_key_input = st.text_input(
+            "مفتاح Groq API",
+            value=cfg.get("groq_api_key") or cfg.get("gemini_api_key", ""),
+            type="password",
+            help="أدخل مفتاح Groq الخاص بك (يبدأ بـ gsk_)",
+        )
         tg_id_input = st.text_input("Telegram API ID", value=str(cfg.get("tg_api_id", "2040")))
         tg_hash_input = st.text_input("Telegram API Hash", value=cfg.get("tg_api_hash", "b18441a1ff607e10a989891a5462e627"))
         tg_group_input = st.text_input("رابط أو معرف القروب (اختياري)", value=cfg.get("tg_group", ""))
         bot_token_input = st.text_input("Bot Token", value=cfg.get("bot_token", ""), type="password")
         auto_reply_input = st.checkbox("تفعيل الرد الآلي في التلجرام", value=bool(cfg.get("auto_reply_enabled", False)))
 
-        if st.button("💾 حفظ الإعدادات", use_container_width=True):
-            cfg.update({
-                "gemini_api_key": gemini_key_input.strip(),
-                "tg_api_id": tg_id_input.strip(),
-                "tg_api_hash": tg_hash_input.strip(),
-                "tg_group": tg_group_input.strip(),
-                "bot_token": bot_token_input.strip(),
-                "auto_reply_enabled": auto_reply_input,
-            })
+        if st.button("حفظ الإعدادات", use_container_width=True):
+            cfg["groq_api_key"] = groq_key_input.strip()
+            cfg["tg_api_id"] = tg_id_input.strip()
+            cfg["tg_api_hash"] = tg_hash_input.strip()
+            cfg["tg_group"] = tg_group_input.strip()
+            cfg["bot_token"] = bot_token_input.strip()
+            cfg["auto_reply_enabled"] = auto_reply_input
             save_config(cfg)
-            st.success("تم حفظ الإعدادات بنجاح!")
+            st.success("✨ تم حفظ إعدادات Groq والتيليجرام بنجاح!")
+
+    if st.session_state.get("sync_notice"):
+        st.success(st.session_state.pop("sync_notice"))
 
     with st.expander("🔄 سحب ومزامنة قروب التلجرام", expanded=True):
+        st.caption("زر واحد يسحب رسائل القروب، يحلّلها بمفتاح Groq، ويحفظ البطاقات في قاعدة البيانات.")
         limit_val = st.slider("عدد الرسائل المراد سحبها وتحليلها:", min_value=10, max_value=300, value=100, step=10)
         if st.button("بدء سحب وتصنيف رسائل القروب ⚡", use_container_width=True):
-            with st.spinner("جاري سحب الرسائل وتحليلها بالذكاء الاصطناعي..."):
-                cmd = [sys.executable, "telegram_scraper.py", "--limit", str(limit_val)]
-                proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-                if proc.returncode == 0:
-                    st.success("✅ اكتمل السحب والتحليل بنجاح!")
-                    st.rerun()
+            if not (cfg.get("groq_api_key") or cfg.get("gemini_api_key")):
+                st.warning("أدخل مفتاح Groq API واحفظ الإعدادات أولاً.")
+            else:
+                with st.spinner("جاري سحب الرسائل وتحليلها بمفتاح Groq..."):
+                    result = run_sync(int(limit_val))
+                if result.get("logs"):
+                    st.code("\n".join(result["logs"][-25:]))
+                if result.get("ok"):
+                    notice = (
+                        f"تم سحب قروب {result.get('group') or 'التلجرام'} "
+                        f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
+                    )
+                    if result.get("saved"):
+                        st.session_state["sync_notice"] = notice
+                        st.rerun()
+                    st.success(notice)
                 else:
-                    st.error("تعذر إكمال السحب. راجع التفاصيل أدناه:")
-                    st.code(proc.stderr or proc.stdout)
+                    st.error(result.get("error") or "تعذر إكمال السحب.")
 
     with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)", expanded=False):
         lab_text = st.text_area("أدخل نص النقاش أو وصف المشكلة:")
         lab_file = st.file_uploader("أرفق صورة أو ملفاً صوتياً (اختياري)", type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a"])
         if st.button("تحليل وإضافة للقاعدة 🧠", use_container_width=True):
-            if not cfg.get("gemini_api_key"):
-                st.warning("يرجى إدخال مفتاح Gemini API أولاً.")
+            if not cfg.get("groq_api_key"):
+                st.warning("يرجى إدخال مفتاح Groq API أولاً.")
             elif not lab_text and not lab_file:
                 st.warning("أدخل نصاً أو أرفق ملفاً للتحليل.")
             else:
@@ -238,7 +318,7 @@ with st.sidebar:
                     try:
                         media_bytes = lab_file.read() if lab_file else None
                         mime_type = lab_file.type if lab_file else None
-                        card = analyze_thread_with_ai(lab_text or "حلل المرفق", cfg["gemini_api_key"], media_bytes, mime_type)
+                        card = analyze_thread_with_ai(lab_text or "حلل المرفق", cfg["groq_api_key"], media_bytes, mime_type)
                         msg_id = int(pd.Timestamp.now().timestamp())
                         save_card(card, msg_id, "", "مختبر التحليل", lab_text or "مرفق وسائط")
                         st.success(f"تم حفظ البطاقة: {card.get('title')}")
@@ -334,30 +414,30 @@ with st.expander("🤖 استشارة المهندس الذكي والموجز �
     c_btn1, c_btn2 = st.columns(2)
     with c_btn1:
         if st.button("بحث واستشارة فورية 💡", use_container_width=True):
-            if not cfg.get("gemini_api_key"):
-                st.warning("أدخل مفتاح Gemini API في الإعدادات أولاً.")
+            if not cfg.get("groq_api_key"):
+                st.warning("أدخل مفتاح Groq API في الإعدادات أولاً.")
             elif user_q:
                 with st.spinner("جاري فحص الأرشيف وتوليد الإجابة..."):
                     try:
-                        db_ans = find_matching_solution_in_db(user_q, cfg["gemini_api_key"])
+                        db_ans = find_matching_solution_in_db(user_q, cfg["groq_api_key"])
                         if db_ans:
                             st.info(db_ans)
                         else:
-                            ai_ans = ask_gemini_safe(
+                            ai_ans = ask_groq_safe(
                                 f"أنت كبير مهندسي صيانة سيارات جايكو J7 و J8. أجب بدقة عن هذا الاستفسار:\n{user_q}",
-                                cfg["gemini_api_key"],
+                                cfg["groq_api_key"],
                             )
                             st.info(ai_ans)
                     except Exception as e:
                         st.error(f"حدث خطأ: {e}")
     with c_btn2:
         if st.button("⚡ توليد الموجز الذكي لنبض القروب", use_container_width=True):
-            if not cfg.get("gemini_api_key"):
-                st.warning("أدخل مفتاح Gemini API في الإعدادات أولاً.")
+            if not cfg.get("groq_api_key"):
+                st.warning("أدخل مفتاح Groq API في الإعدادات أولاً.")
             else:
                 with st.spinner("جاري صياغة الموجز..."):
                     try:
-                        pulse = generate_daily_pulse_summary(cfg["gemini_api_key"])
+                        pulse = generate_daily_pulse_summary(cfg["groq_api_key"])
                         st.success(pulse)
                     except Exception as e:
                         st.error(f"حدث خطأ: {e}")
