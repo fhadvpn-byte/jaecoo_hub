@@ -162,39 +162,44 @@ def _preview_b64(image_bytes: bytes | None) -> str:
 async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str, str]:
     """يعيد النص ونوع الوسيط ونسخة الصورة المضغوطة."""
     caption = (message.message or message.text or "").strip()
-    if getattr(message, "photo", None):
+    kind = detect_msg_media_kind(message)
+    file_ext = getattr(getattr(message, "file", None), "ext", None) or ""
+    if kind == "image":
         image_bytes = await tg_client.download_media(message, file=bytes)
         preview = _preview_b64(image_bytes)
         if image_bytes:
-            vision_text = analyze_image_bytes(groq_key, image_bytes, caption)
-            return f"محتوى الصورة: {vision_text}\nتعليق العضو: {caption}".strip(), "image", preview
+            mime = "image/jpeg"
+            document = getattr(message, "document", None)
+            if document and getattr(document, "mime_type", None):
+                mime = document.mime_type
+            vision_text = analyze_image_bytes(groq_key, image_bytes, caption, mime)
+            return f"{vision_text}\nالنص المرفق: {caption}".strip(), "image", preview
         return caption, "image", preview
 
-    if getattr(message, "voice", None) or getattr(message, "audio", None):
+    if kind == "audio":
         audio_bytes = await tg_client.download_media(message, file=bytes)
         if audio_bytes:
-            audio_ext = getattr(getattr(message, "file", None), "ext", None) or ".ogg"
-            spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=audio_ext)
-            return f"تفريغ المقطع الصوتي: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio", ""
+            spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=file_ext or ".ogg")
+            return f"[مقطع صوتي مفرغ نصياً]: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio", ""
         return caption, "audio", ""
 
-    if getattr(message, "video", None) or getattr(message, "video_note", None):
-        parts = [f"تعليق الفيديو: {caption}"]
-        file_size = getattr(getattr(message, "file", None), "size", 0) or 0
-        video_ext = getattr(getattr(message, "file", None), "ext", None) or ".mp4"
-        if 0 < file_size <= 20 * 1024 * 1024:
-            video_bytes = await tg_client.download_media(message, file=bytes)
-            if video_bytes:
-                spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=video_ext)
-                parts.append(f"الكلام المسموع في الفيديو: {spoken_video}")
+    if kind == "video":
+        parts = [f"تعليق الفيديو: {caption}"] if caption else []
         try:
             thumb_bytes = await tg_client.download_media(message, file=bytes, thumb=-1)
         except Exception:
             thumb_bytes = None
         preview = _preview_b64(thumb_bytes)
         if thumb_bytes:
-            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption)
-            parts.append(f"المشهد المرئي في الفيديو: {thumb_desc}")
+            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption, "video/thumb")
+            parts.append(f"[المشهد المرئي في الفيديو]: {thumb_desc}")
+        file_size = getattr(getattr(message, "file", None), "size", 0) or 0
+        if 0 < file_size <= 20 * 1024 * 1024:
+            video_bytes = await tg_client.download_media(message, file=bytes)
+            if video_bytes:
+                spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=file_ext or ".mp4")
+                if spoken_video:
+                    parts.append(f"[الكلام المنطوق داخل الفيديو]: {spoken_video}")
         return "\n".join(part for part in parts if part.strip()), "video", preview
 
     return caption, "text", ""
@@ -293,8 +298,50 @@ def _is_rate_limit(error: Exception) -> bool:
     return "429" in text or "rate_limit" in text
 
 
+def detect_msg_media_kind(message) -> str:
+    """يتعرف على الصور والفيديو والصوت حتى لو أُرسلت كملف."""
+    if getattr(message, "photo", None):
+        return "image"
+    if getattr(message, "voice", None) or getattr(message, "audio", None):
+        return "audio"
+    if getattr(message, "video", None) or getattr(message, "video_note", None):
+        return "video"
+    document = getattr(message, "document", None)
+    mime = str(getattr(document, "mime_type", "") or "").lower()
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    return "text"
+
+
+def _reply_to_id(message) -> int | None:
+    reply_id = getattr(message, "reply_to_msg_id", None)
+    if not reply_id and getattr(message, "reply_to", None):
+        reply_id = getattr(message.reply_to, "reply_to_msg_id", None)
+    return int(reply_id) if reply_id else None
+
+
+def _group_reply_threads(messages: list) -> dict:
+    """يربط كل رسالة بالردود التي جاءت عليها داخل الدفعة."""
+    threads = {}
+    message_to_root = {}
+    for message in sorted(messages, key=lambda item: item.id):
+        reply_id = _reply_to_id(message)
+        if reply_id and reply_id in message_to_root:
+            root_id = message_to_root[reply_id]
+            threads[root_id].append(message)
+            message_to_root[message.id] = root_id
+        else:
+            threads[message.id] = [message]
+            message_to_root[message.id] = message.id
+    return threads
+
+
 def _should_analyze_message(message) -> bool:
-    if any(getattr(message, name, None) for name in ("photo", "voice", "audio", "video", "video_note")):
+    if detect_msg_media_kind(message) != "text":
         return True
     text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
     if is_dealer_or_maintenance_msg(text):
@@ -414,9 +461,12 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         )
         _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}.")
 
+        raw_messages = []
+        highest_id = last_id
         async for message in client.iter_messages(target, reverse=True, min_id=last_id, limit=batch_limit):
             result["scanned"] += 1
-            fraction = min(0.95, 0.3 + (0.6 * result["scanned"] / max(batch_limit or result["scanned"], 1)))
+            highest_id = message.id
+            fraction = min(0.55, 0.25 + (0.3 * result["scanned"] / max(batch_limit or result["scanned"], 1)))
             msg_date = message.date.strftime("%Y-%m-%d") if getattr(message, "date", None) else ""
             _report(
                 on_progress,
@@ -426,59 +476,82 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 ),
                 fraction,
             )
-            if not _should_analyze_message(message):
-                update_last_synced_id(message.id, group_key)
+            raw_messages.append(message)
+        referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
+        batch = [
+            message for message in raw_messages
+            if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
+        ]
+
+        threads = _group_reply_threads(batch)
+        thread_total = max(len(threads), 1)
+        for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
+            fraction = min(0.95, 0.55 + (0.4 * thread_index / thread_total))
+            blocks = []
+            raw_parts = []
+            dominant_media = "text"
+            best_thumb = ""
+            author_name = "عضو"
+            for index, message in enumerate(thread_messages):
+                role = "الرسالة الأساسية (طرح المشكلة أو الموضوع)" if index == 0 else f"الرد رقم {index} (الإجابة أو الحل)"
+                if index == 0:
+                    try:
+                        sender = await message.get_sender()
+                        author_name = getattr(sender, "first_name", None) or "عضو"
+                    except Exception:
+                        author_name = "عضو"
+                try:
+                    parsed_text, media_kind, media_b64 = await _run_with_backoff(
+                        lambda message=message: _extract_message_content(client, groq_key, message),
+                        on_progress,
+                    )
+                except Exception as exc:
+                    _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
+                    _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
+                    continue
+                if media_kind != "text":
+                    await asyncio.sleep(1.5)
+                if (parsed_text or "").strip():
+                    raw_parts.append(parsed_text.strip())
+                    blocks.append(f"--- {role} (نوعها: {media_kind}) ---\n{parsed_text}")
+                if {"text": 0, "image": 1, "audio": 2, "video": 3}[media_kind] > {"text": 0, "image": 1, "audio": 2, "video": 3}[dominant_media]:
+                    dominant_media = media_kind
+                if media_b64 and not best_thumb:
+                    best_thumb = media_b64
+
+            thread_text = "\n\n".join(blocks).strip()
+            if len(thread_text) < 20 or _ignore_source("\n".join(raw_parts)):
                 continue
-
-            try:
-                sender = await message.get_sender()
-                author_name = getattr(sender, "first_name", None) or "عضو"
-            except Exception:
-                author_name = "عضو"
-
-            try:
-                text, media_type, media_b64 = await _run_with_backoff(
-                    lambda message=message: _extract_message_content(client, groq_key, message),
-                    on_progress,
-                )
-            except Exception as exc:
-                _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
-                _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
-                update_last_synced_id(message.id, group_key)
-                continue
-
-            if (media_type == "text" and _ignore_source(text)) or len((text or "").strip()) < 15:
-                update_last_synced_id(message.id, group_key)
-                continue
-
             _report(
                 on_progress,
-                f"جاري تحليل {_media_label(media_type)} رقم {message.id} عبر Groq...",
+                f"جاري تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
                 fraction,
             )
             try:
                 card = await _run_with_backoff(
-                    lambda text=text: analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key),
+                    lambda thread_text=thread_text: analyze_thread_with_ai(thread_text, groq_key),
                     on_progress,
                 )
             except Exception as exc:
-                _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
-                _report(on_progress, f"الرسالة {message.id}: تعذر تحليلها عبر Groq.", fraction)
-                update_last_synced_id(message.id, group_key)
+                _note(logs, f"تخطي النقاش {root_id}: {exc}", "error")
+                _report(on_progress, f"النقاش {root_id}: تعذر تحليله عبر Groq.", fraction)
                 continue
-
-            if _worth_archiving(card):
-                thread_url = f"https://t.me/c/{public_id}/{message.id}"
-                save_card(card, message.id, thread_url, author_name, text, media_type, media_b64)
-                result["saved"] += 1
-                _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-                _report(
-                    on_progress,
-                    f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
-                    fraction,
-                )
-            update_last_synced_id(message.id, group_key)
             await asyncio.sleep(1.5)
+            if not _worth_archiving(card):
+                _report(on_progress, f"النقاش {root_id}: لا يحتوي حلاً كافياً لحفظ بطاقة.", fraction)
+                continue
+            thread_url = f"https://t.me/c/{public_id}/{root_id}"
+            save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb)
+            result["saved"] += 1
+            _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+            _report(
+                on_progress,
+                f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
+                fraction,
+            )
+
+        if highest_id > last_id:
+            update_last_synced_id(highest_id, group_key)
 
         result["ok"] = True
         _report(

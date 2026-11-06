@@ -120,7 +120,8 @@ SYSTEM_PROMPT = """
 شروط صارمة:
 1. الحقول النصية بالعربية الفصحى فقط. ممنوع الجمل الإنجليزية وممنوع nan.
 2. يُسمح باسم الطراز أو رقم القطعة داخل جملة عربية.
-3. السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. لا تتجاهل رسالة الوكيل أو الصيانة إذا كانت فيها معلومة.
+3. السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. لا تصنع بطاقة تكرر السؤال في خانة الحل. لا تتجاهل معلومة الوكيل أو الصيانة إذا وُجدت إجابة أو تفاصيل.
+5. إذا كانت الصورة أو الصوت أو الفيديو يشرح العطل فضعه في problem_or_topic، وإذا كان يشرح الحل أو رقم القطعة أو جدول الصيانة فضعه في solution_or_summary.
 4. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
 """
 
@@ -304,7 +305,9 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                 "content": (
                     "استخرج JSON فقط وبالعربية الفصحى. "
                     "رسائل الوكيل والصيانة الدورية والضمان تُحفظ ولا تُتجاهل. "
-                    "السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. "
+                    "إذا كانت الصورة أو الصوت أو الفيديو يشرح المشكلة فضعه في problem_or_topic، "
+                    "وإذا كان يشرح الحل أو رقم القطعة أو جدول الصيانة فضعه في solution_or_summary. "
+                    "السؤال بلا أي رد أو حل يعني is_worth_archiving = false، ولا تكرر السؤال في خانة الحل. "
                     "ممنوع إخراج nan."
                 ),
             },
@@ -319,13 +322,30 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         data["part_numbers_or_specs"] = "غير محدد"
     problem_text = str(data.get("problem_or_topic") or "")
     solution_text = str(data.get("solution_or_summary") or "")
+    question_only = any(
+        phrase in solution_text
+        for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل", "سؤال حول")
+    ) or (solution_text.strip() and solution_text.strip() == problem_text.strip())
+    if question_only:
+        data["is_worth_archiving"] = False
+        return data
     if is_dealer_or_maintenance_msg(thread_text) and re.search(r"[\u0600-\u06FF]", problem_text + solution_text):
         data["is_worth_archiving"] = True
         if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
             data["category"] = "الصيانة الدورية والوكالات"
     elif data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
         data["is_worth_archiving"] = False
+    if _solution_repeats_question(problem_text, solution_text):
+        data["is_worth_archiving"] = False
     return data
+
+
+def _solution_repeats_question(problem_text: str, solution_text: str) -> bool:
+    solution = solution_text.strip()
+    problem = problem_text.strip()
+    if any(phrase in solution for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل", "سؤال حول")):
+        return True
+    return bool(solution) and solution == problem
 
 
 VISION_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct"]
@@ -335,12 +355,18 @@ WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
 def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mime_type: str = "image/jpeg") -> str:
     """يحلل صورة الطبلون أو القطعة أو الفاتورة ويعيد وصفاً عربياً."""
     payload = base64.b64encode(image_bytes).decode("utf-8")
-    prompt = (
-        "حلل هذه الصورة الخاصة بسيارة جايكو (Jaecoo) بدقة باللغة العربية الفصحى فقط. "
-        "إذا كانت صورة شاشة أو طبلون، اذكر التنبيه أو العطل الظاهر. "
-        "إذا كانت صورة قطعة غيار أو فاتورة، استخرج اسم القطعة ورقمها أو سعرها. "
-        f"النص المرفق مع الصورة: {caption}"
-    )
+    data_mime = "image/jpeg" if mime_type == "video/thumb" else (mime_type or "image/jpeg")
+    if mime_type == "video/thumb":
+        prompt = "صف بالعربية ما يظهر في لقطة الفيديو هذه لسيارة جايكو: هل يظهر عطل في الشاشة أو المحرك أم شرح لقطعة وإصلاح؟"
+    else:
+        prompt = (
+            "افحص هذه الصورة المرسلة في قروب سيارات جايكو (Jaecoo) بدقة وبالعربية. "
+            "إذا كانت توضح مشكلة أو عطلاً، مثل لمبة تحذير أو رسالة خطأ أو كسر أو تهريب، "
+            "فابدأ بـ [صورة توضح مشكلة]: واشرح العطل. "
+            "إذا كانت توضح حلاً أو معلومة، مثل قطعة مع رقمها أو فاتورة أو جدول صيانة أو مكان فيوز، "
+            "فابدأ بـ [صورة توضح حلاً/معلومة]: واستخرج البيانات والأرقام. "
+            f"تعليق العضو المرفق مع الصورة: {caption}"
+        )
     client = Groq(api_key=api_key)
     last_error = None
     for model_name in VISION_MODELS:
@@ -351,7 +377,7 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{payload}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:{data_mime};base64,{payload}"}},
                     ],
                 }],
                 temperature=0.2,
