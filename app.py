@@ -670,7 +670,7 @@ with metrics_box.container():
 if st.session_state.get("sync_notice"):
     st.success(st.session_state.pop("sync_notice"))
 
-with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=True):
+with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=False):
     lab_text = st.text_area("النص المراد تحليله", key="public_lab_text", height=120)
     lab_file = st.file_uploader(
         "مرفق اختياري",
@@ -681,30 +681,32 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Tr
 limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
 sync_feedback = st.empty()
 if st.session_state.get("sync_logs"):
-    with st.expander("سجل السحب المباشر", expanded=False):
-        for line in st.session_state["sync_logs"][-40:]:
-            st.write(line)
+    with st.expander("سجل السحب الحي", expanded=True):
+        st.code("\n".join(st.session_state["sync_logs"]), language="text")
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
         if _SYNC_STATE["running"]:
             st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
         else:
-            live_lines: list[str] = []
+            live_lines: list[str] = ["جاري الاتصال ب تيليجرام..."]
             with sync_feedback.container():
+                with st.expander("سجل السحب الحي", expanded=True):
+                    log_slot = st.empty()
+                    log_slot.code("\n".join(live_lines), language="text")
                 with st.status("جاري الاتصال ب تيليجرام...", expanded=True) as status:
-                    bar = st.progress(0.08)
-                    st.write("جاري الاتصال ب تيليجرام...")
-
                     def _show_sync_progress(message: str, fraction: float) -> None:
                         live_lines.append(message)
-                        bar.progress(fraction)
-                        st.write(message)
-                        status.update(label=message)
+                        log_slot.code("\n".join(live_lines), language="text")
+                        status.update(label=message, state="running")
 
                     result = run_sync(int(limit_val), on_progress=_show_sync_progress)
                     if result.get("ok"):
-                        bar.progress(1.0)
+                        live_lines.append(
+                            f"انتهى السحب. المفحوص: {result.get('scanned', 0)}، "
+                            f"المحفوظ: {result.get('saved', 0)}."
+                        )
+                        log_slot.code("\n".join(live_lines), language="text")
                         status.update(label="اكتمل السحب والتحليل.", state="complete")
                     else:
                         status.update(label=result.get("error") or "تعذر إكمال السحب.", state="error")
@@ -747,7 +749,7 @@ with sample_col:
         st.session_state["sync_notice"] = "تمت استعادة البيانات النموذجية!"
         st.rerun()
 
-with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded=True):
+with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded=False):
     m_title = st.text_input("عنوان البطاقة", key="manual_title")
     m_model = st.selectbox(
         "الطراز",
