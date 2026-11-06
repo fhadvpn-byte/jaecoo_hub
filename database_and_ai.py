@@ -65,22 +65,25 @@ class KnowledgeCardSchema(BaseModel):
         "عام",
     ] = Field(description="النظام الفرعي للسيارة")
 
-    title: str = Field(description="عنوان واضح ومختصر للبطاقة (5 إلى 10 كلمات)")
-    problem_or_topic: str = Field(description="ملخص المشكلة أو الاستفسار أو الموضوع بدقة")
-    solution_or_summary: str = Field(description="الحل التفصيلي المستخلص من النقاش")
+    title: str = Field(description="عنوان عربي حصراً، واضح ومختصر (5 إلى 10 كلمات). ممنوع الإنجليزية.")
+    problem_or_topic: str = Field(description="وصف المشكلة أو الموضوع بالعربية حصراً، حتى لو كان النص الأصلي إنجليزياً.")
+    solution_or_summary: str = Field(description="الحل أو الخلاصة بالعربية حصراً. ممنوع إبقاء الجمل الإنجليزية.")
     part_numbers_or_specs: Optional[str] = Field(
         default="",
-        description="أرقام قطع الغيار، المقاسات، لزوجة الزيت، التكلفة، أو أسماء الأدوات والتطبيقات",
+        description="أرقام القطع والمواصفات كما هي، مع شرح عربي مختصر حولها.",
     )
     is_verified_solution: bool = Field(
         description="True إذا تضمن النقاش حلاً مجرباً ومؤكداً"
     )
-    keywords: str = Field(description="كلمات مفتاحية مفصولة بفاصلة")
+    keywords: str = Field(description="كلمات مفتاحية عربية مفصولة بفاصلة")
 
 
 SYSTEM_PROMPT = """
 أنت كبير مهندسي صيانة وتشخيص سيارات جايكو (Jaecoo J8, J8 SHS, J5, J7) ومحلل بيانات قروب التيليجرام.
 مهمتك قراءة نقاشات الأعضاء واستخراج بطاقة معرفة فنية دقيقة ومنظمة بصيغة JSON متوافقة تماماً مع المعايير المطلوبة.
+اللغة إلزامية: اكتب title و problem_or_topic و solution_or_summary و keywords بالعربية الفصحى المبسطة حصراً.
+إذا كانت رسالة تيليجرام بالإنجليزية فترجم معناها إلى العربية ولا تنسخ الجمل الإنجليزية في هذه الحقول.
+يُسمح بإبقاء أسماء الطرازات وأرقام القطع ورموزها كما هي داخل جملة عربية، مثل Jaecoo J5 أو 5W-30.
 """
 
 # ==========================================
@@ -182,6 +185,8 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
 يرجى تحليل النص التالي واستخراج النتيجة بصيغة JSON مطابقة تماماً لهذا المخطط (Schema):
 {schema_json_str}
 
+قبل الإجابة: ترجم أي محتوى إنجليزي إلى العربية. العنوان والوصف والحل والكلمات المفتاحية تكون عربية فقط.
+
 النص المراد تحليله:
 {thread_text}
 """
@@ -189,7 +194,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     completion = _groq_complete(
         api_key,
         [
-            {"role": "system", "content": "أنت مساعد ذكي متخصص في استخراج بيانات JSON بدقة متناهية."},
+            {"role": "system", "content": "أنت مساعد يستخرج JSON فقط. حقول العنوان والوصف والحل والكلمات المفتاحية تُكتب بالعربية حصراً، حتى لو كان المصدر إنجليزياً."},
             {"role": "user", "content": prompt},
         ],
         json_mode=True,
