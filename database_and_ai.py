@@ -29,6 +29,12 @@ def load_config() -> dict:
                 default_cfg.update(data)
         except Exception:
             pass
+    if not default_cfg.get("bot_token") and default_cfg.get("telegram_bot_token"):
+        default_cfg["bot_token"] = str(default_cfg["telegram_bot_token"])
+    if not default_cfg.get("tg_api_id") and default_cfg.get("telegram_api_id") not in (None, ""):
+        default_cfg["tg_api_id"] = str(default_cfg["telegram_api_id"])
+    if not default_cfg.get("tg_api_hash") and default_cfg.get("telegram_api_hash"):
+        default_cfg["tg_api_hash"] = str(default_cfg["telegram_api_hash"])
     return default_cfg
 
 
