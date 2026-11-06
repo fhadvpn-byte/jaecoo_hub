@@ -34,6 +34,24 @@ _SYNC_STATE = {
 }
 
 
+def delete_knowledge_card(card_id: int) -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM knowledge_cards WHERE id = ?", (int(card_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _card_text(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
 def _record_sync_progress(message: str, fraction: float) -> None:
     with _SYNC_GUARD:
         _SYNC_STATE["lines"].append(message)
@@ -959,13 +977,14 @@ if filtered_df.empty:
     st.info("لا توجد بطاقات مطابقة حالياً. استخدم زر سحب رسائل القروب أو بدء التحليل في أعلى الصفحة.")
 else:
     for _, row in filtered_df.iterrows():
-        title_safe = html.escape(str(row.get("title", "")))
-        prob_safe = html.escape(str(row.get("problem_or_topic", "")))
-        sol_safe = html.escape(str(row.get("solution_or_summary", "")))
-        parts_safe = html.escape(str(row.get("part_numbers_or_specs", "")))
-        car_safe = html.escape(str(row.get("car_model", "")))
-        sub_safe = html.escape(str(row.get("sub_system", "")))
-        cat_safe = html.escape(str(row.get("category", "")))
+        card_id = int(row["id"])
+        title_safe = html.escape(_card_text(row.get("title")))
+        prob_safe = html.escape(_card_text(row.get("problem_or_topic")))
+        sol_safe = html.escape(_card_text(row.get("solution_or_summary")))
+        parts_safe = html.escape(_card_text(row.get("part_numbers_or_specs")))
+        car_safe = html.escape(_card_text(row.get("car_model")))
+        sub_safe = html.escape(_card_text(row.get("sub_system")))
+        cat_safe = html.escape(_card_text(row.get("category")))
 
         parts_html = f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>' if parts_safe else ""
 
@@ -982,3 +1001,6 @@ else:
             {parts_html}
         </div>
         """, unsafe_allow_html=True)
+        if st.button("حذف البطاقة", key=f"delete_card_{card_id}"):
+            delete_knowledge_card(card_id)
+            st.rerun()

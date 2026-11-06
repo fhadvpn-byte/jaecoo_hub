@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sqlite3
 
@@ -111,13 +112,44 @@ def _dialog_matches(dialog, wanted: str) -> bool:
     return wanted in {name, username, raw_id, public_id} or wanted in name
 
 
+_EMPTY_MARKERS = {"", "nan", "none", "null", "n/a", "na", "undefined"}
+
+
+def _clean_text(value) -> str:
+    text = "" if value is None else str(value).strip()
+    if text.lower() in _EMPTY_MARKERS:
+        return ""
+    return text
+
+
+def _has_arabic(text: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", text))
+
+
+def _ignore_source(text: str) -> bool:
+    """يتجاوز الرسائل العامة والأسئلة الإنجليزية والنصوص غير الواضحة قبل استدعاء Groq."""
+    stripped = text.strip()
+    if _has_arabic(stripped):
+        return False
+    lower_words = stripped.lower().split()
+    if "?" in stripped or (lower_words and lower_words[0] in {"what", "why", "how", "when", "where", "who", "can", "does", "do", "is", "are"}):
+        return True
+    letters = re.sub(r"[^A-Za-z]", "", stripped)
+    return len(letters) < 40
+
+
 def _worth_archiving(card: dict) -> bool:
     if not isinstance(card, dict):
         return False
     flag = card.get("is_worth_archiving")
     if flag in (False, 0, "0", "false", "False", None):
         return False
-    return all(card.get(field) for field in _REQUIRED_CARD_FIELDS)
+    if _clean_text(card.get("category")) == "نبض القروب والدردشة العامة":
+        return False
+    cleaned = {field: _clean_text(card.get(field)) for field in _REQUIRED_CARD_FIELDS}
+    if not all(cleaned.values()):
+        return False
+    return all(_has_arabic(cleaned[field]) for field in ("title", "problem_or_topic", "solution_or_summary"))
 
 
 def _note(logs: list, message: str, level: str = "info") -> None:
@@ -242,6 +274,14 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 author_name = getattr(sender, "first_name", None) or "عضو"
             except Exception:
                 author_name = "عضو"
+
+            if _ignore_source(text):
+                _report(
+                    on_progress,
+                    f"الرسالة {index} من {len(pending)}: تم تجاهلها لأنها عامة أو غير واضحة.",
+                    step + (0.2 / total),
+                )
+                continue
 
             _report(
                 on_progress,
