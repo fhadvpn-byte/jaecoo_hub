@@ -652,15 +652,20 @@ conn = get_db_connection()
 df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", conn)
 conn.close()
 
-col_m1, col_m2, col_m3 = st.columns(3)
-with col_m1:
-    st.markdown(f'<div class="metric-card"><div>💠 إجمالي البطاقات</div><div class="metric-val">{len(df)}</div></div>', unsafe_allow_html=True)
-with col_m2:
-    verified_count = int(df["is_verified_solution"].sum()) if not df.empty else 0
-    st.markdown(f'<div class="metric-card"><div>✅ الحلول المؤكدة</div><div class="metric-val">{verified_count}</div></div>', unsafe_allow_html=True)
-with col_m3:
-    j8_count = int((df["car_model"] == "Jaecoo J8").sum()) if not df.empty else 0
-    st.markdown(f'<div class="metric-card"><div>🚙 بطاقات Jaecoo J8</div><div class="metric-val">{j8_count}</div></div>', unsafe_allow_html=True)
+def _render_metrics(frame: pd.DataFrame) -> None:
+    col_m1, col_m2, col_m3 = st.columns(3)
+    verified_count = int(frame["is_verified_solution"].sum()) if not frame.empty else 0
+    j8_count = int((frame["car_model"] == "Jaecoo J8").sum()) if not frame.empty else 0
+    with col_m1:
+        st.markdown(f'<div class="metric-card"><div>💠 إجمالي البطاقات</div><div class="metric-val">{len(frame)}</div></div>', unsafe_allow_html=True)
+    with col_m2:
+        st.markdown(f'<div class="metric-card"><div>✅ الحلول المؤكدة</div><div class="metric-val">{verified_count}</div></div>', unsafe_allow_html=True)
+    with col_m3:
+        st.markdown(f'<div class="metric-card"><div>🚙 بطاقات Jaecoo J8</div><div class="metric-val">{j8_count}</div></div>', unsafe_allow_html=True)
+
+metrics_box = st.empty()
+with metrics_box.container():
+    _render_metrics(df)
 
 if st.session_state.get("sync_notice"):
     st.success(st.session_state.pop("sync_notice"))
@@ -675,36 +680,46 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Tr
 
 limit_val = st.slider("عدد الرسائل", min_value=10, max_value=300, value=100, step=10, key="public_pull_limit")
 sync_feedback = st.empty()
+if st.session_state.get("sync_logs"):
+    with st.expander("سجل السحب المباشر", expanded=False):
+        for line in st.session_state["sync_logs"][-40:]:
+            st.write(line)
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
         if _SYNC_STATE["running"]:
             st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
         else:
+            live_lines: list[str] = []
             with sync_feedback.container():
-                phase = st.empty()
-                phase.info("جاري الاتصال ب تيليجرام...")
-                bar = st.progress(0.08, text="جاري الاتصال ب تيليجرام...")
+                with st.status("جاري الاتصال ب تيليجرام...", expanded=True) as status:
+                    bar = st.progress(0.08)
+                    st.write("جاري الاتصال ب تيليجرام...")
 
-                def _show_sync_progress(message: str, fraction: float) -> None:
-                    bar.progress(fraction, text=message)
-                    phase.info(message)
+                    def _show_sync_progress(message: str, fraction: float) -> None:
+                        live_lines.append(message)
+                        bar.progress(fraction)
+                        st.write(message)
+                        status.update(label=message)
 
-                with st.spinner("جاري الاتصال ب تيليجرام..."):
                     result = run_sync(int(limit_val), on_progress=_show_sync_progress)
-                if result.get("ok"):
-                    bar.progress(1.0, text="اكتمل السحب والتحليل.")
-            if result.get("logs"):
-                st.code("\n".join(result["logs"][-25:]))
+                    if result.get("ok"):
+                        bar.progress(1.0)
+                        status.update(label="اكتمل السحب والتحليل.", state="complete")
+                    else:
+                        status.update(label=result.get("error") or "تعذر إكمال السحب.", state="error")
+            st.session_state["sync_logs"] = live_lines
             if result.get("ok"):
-                notice = (
+                fresh = get_db_connection()
+                fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+                fresh.close()
+                with metrics_box.container():
+                    _render_metrics(fresh_df)
+                st.session_state["sync_notice"] = (
                     f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                    f"وحفظ {result.get('saved', 0)} بطاقة في قاعدة البيانات."
+                    f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {len(fresh_df)}."
                 )
-                if result.get("saved"):
-                    st.session_state["sync_notice"] = notice
-                    st.rerun()
-                st.success(notice)
+                st.rerun()
             else:
                 st.error(result.get("error") or "تعذر إكمال السحب.")
 with analyze_col:

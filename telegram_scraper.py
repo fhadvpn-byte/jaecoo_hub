@@ -229,7 +229,8 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
 
         for index, message in enumerate(pending, start=1):
             text = (message.text or "").strip()
-            _report(on_progress, f"جاري التحليل ب Groq... ({index}/{len(pending) or 1})", 0.4 + 0.55 * ((index - 1) / total))
+            step = 0.4 + 0.55 * ((index - 1) / total)
+            _report(on_progress, f"تم جلب الرسالة رقم {index}...", step)
             result["scanned"] += 1
             try:
                 sender = await message.get_sender()
@@ -237,10 +238,12 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             except Exception:
                 author_name = "عضو"
 
+            _report(on_progress, "جاري تحليلها عبر Groq...", step + (0.25 / total))
             try:
                 card = analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key)
             except Exception as exc:
                 _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
+                _report(on_progress, f"تعذر تحليل الرسالة رقم {index}.", step + (0.4 / total))
                 continue
 
             if not _worth_archiving(card):
@@ -250,6 +253,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             save_card(card, message.id, thread_url, author_name, text)
             result["saved"] += 1
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+            _report(on_progress, "تم حفظ البطاقة بنجاح في قاعدة البيانات", step + (0.5 / total))
 
         result["ok"] = True
         _report(on_progress, "اكتمل السحب والتحليل.", 1.0)
