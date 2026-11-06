@@ -42,7 +42,7 @@ def save_config(cfg: dict):
 # ==========================================
 class KnowledgeCardSchema(BaseModel):
     is_worth_archiving: bool = Field(
-        description="True فقط لمعلومة فنية واضحة عن جايكو يمكن صياغتها بالعربية الفصحى. False للرسائل العامة والتحيات والأسئلة الإنجليزية والنصوص غير الواضحة."
+        description="True لمعلومة فنية أو لبيانات الوكيل والصيانة الدورية والضمان. False للرسائل العامة والتحيات والأسئلة بلا إجابة."
     )
     category: Literal[
         "الأعطال والتشخيص",
@@ -59,6 +59,8 @@ class KnowledgeCardSchema(BaseModel):
         description="طراز السيارة"
     )
     sub_system: Literal[
+        "الوكيل والمراكز المعتمدة",
+        "جدول وتكاليف الصيانة الدورية",
         "المحرك والتيربو والمنظومة الهجين SHS",
         "القير والدفع الرباعي AWD",
         "الكهرباء والبطارية والحساسات",
@@ -67,14 +69,14 @@ class KnowledgeCardSchema(BaseModel):
         "العضلات والفرامل والتعليق",
         "الهيكل الخارجي والمقصورة",
         "عام",
-    ] = Field(description="النظام الفرعي للسيارة")
+    ] = Field(description="النظام الفرعي. معلومات الوكيل والصيانة الدورية تستخدم أول خيارين.")
 
     title: str = Field(description="عنوان بالعربية الفصحى حصراً، من 5 إلى 10 كلمات. ممنوع الإنجليزية وممنوع القيمة nan.")
-    problem_or_topic: str = Field(description="وصف المشكلة بالعربية الفصحى حصراً. ممنوع nan وممنوع ترك الحقل فارغاً عند الحفظ.")
-    solution_or_summary: str = Field(description="الحل أو الخلاصة بالعربية الفصحى حصراً. ممنوع nan وممنوع الجمل الإنجليزية.")
+    problem_or_topic: str = Field(description="الموضوع أو الاستفسار أو المشكلة بالعربية الفصحى. في بطاقات الوكيل اذكر نوع الاستفسار مثل تكلفة الصيانة أو موقع الفرع.")
+    solution_or_summary: str = Field(description="التفاصيل الكاملة أو اسم الوكيل والمدينة والسعر أو الحل الفني، بالعربية الفصحى. ممنوع nan.")
     part_numbers_or_specs: Optional[str] = Field(
         default="غير محدد",
-        description="اسم القطعة والمواصفات داخل جملة عربية، أو القيمة غير محدد. ممنوع nan.",
+        description="الزيوت والفلاتر المشمولة أو اسم الفرع أو المركز، أو غير محدد. ممنوع nan.",
     )
     is_verified_solution: bool = Field(
         description="True إذا تضمن النقاش حلاً مجرباً ومؤكداً"
@@ -82,15 +84,44 @@ class KnowledgeCardSchema(BaseModel):
     keywords: str = Field(description="كلمات مفتاحية عربية مفصولة بفاصلة")
 
 
+DEALER_MAINTENANCE_KEYWORDS = [
+    "وكيل", "الوكيل", "وكالة", "الوكالة", "صيانة دورية", "الصيانة الدورية",
+    "مركز معتمد", "مراكز معتمدة", "الوكيل المعتمد", "ضمان", "الضمان",
+    "موعد صيانة", "فرع", "فروع", "جدول الصيانة", "تكلفة الصيانة",
+    "صيانة 5000", "صيانة 10000", "صيانة ١٠٠٠٠", "صيانة ٥٠٠٠", "تغيير زيت القير",
+]
+
+
+def is_dealer_or_maintenance_msg(text: str) -> bool:
+    """يفحص هل الرسالة تتحدث عن الوكيل أو الصيانة الدورية."""
+    if not text:
+        return False
+    return any(keyword in text for keyword in DEALER_MAINTENANCE_KEYWORDS)
+
+
 SYSTEM_PROMPT = """
-أنت مهندس صيانة سيارات خبير في طرازات جايكو (Jaecoo).
-مهمتك تحليل رسائل قروب الملاك واستخراج البطاقات المعرفية المفيدة فقط.
+أنت خبير فني ومستشار خدمات ما بعد البيع لسيارات جايكو (Jaecoo).
+استخرج بطاقة معرفية بالعربية الفصحى في مجالين:
+
+المجال الأول وله الأولوية: الوكيل والصيانة الدورية المعتمدة.
+- الوكيل الرسمي، الفروع، المدن، التواصل، وحجز المواعيد.
+- المراكز المعتمدة للصيانة الدورية داخل المدن وخارجها بما لا يسقط الضمان.
+- تكاليف صيانة 5000 و10000 و20000 كم، نوع الزيت، والقطع التي تُبدّل.
+- تجارب الضمان واستبدال القطع لدى الوكيل.
+- اجعل category = الصيانة الدورية والوكالات.
+- problem_or_topic هو الاستفسار، مثل تكلفة صيانة 10000 كم أو مراكز الصيانة المعتمدة.
+- solution_or_summary هو التفاصيل: اسم الوكيل أو المركز والمدينة والسعر والإجراء.
+- part_numbers_or_specs هو الزيت أو الفلتر أو اسم الفرع، وإلا فاكتب غير محدد.
+- sub_system يكون الوكيل والمراكز المعتمدة أو جدول وتكاليف الصيانة الدورية.
+
+المجال الثاني: الأعطال، القطع البديلة، الشاشات، والتجهيزات.
+- الأعطال وحلولها، أرقام القطع، برمجة الشاشات، والإكسسوارات المجربة.
+
 شروط صارمة:
-1. ممنوع كتابة أي جملة إنجليزية في title أو problem_or_topic أو solution_or_summary أو part_numbers_or_specs أو keywords. ترجم المعنى إلى العربية الفصحى.
-2. يُسمح فقط بإبقاء اسم الطراز أو رقم القطعة داخل جملة عربية، مثل Jaecoo J5 أو 5W-30.
-3. إذا كانت الرسالة سؤالاً بلا إجابة، أو دردشة عامة، أو نصاً غير واضح، اجعل is_worth_archiving = false ولا تخترع بطاقة.
-4. صنّف car_model إلى أحد هذه الخيارات فقط: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
-5. إذا لم تُذكر قطع غيار فاكتب في part_numbers_or_specs القيمة: غير محدد. ممنوع nan أو None أو null.
+1. الحقول النصية بالعربية الفصحى فقط. ممنوع الجمل الإنجليزية وممنوع nan.
+2. يُسمح باسم الطراز أو رقم القطعة داخل جملة عربية.
+3. السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. لا تتجاهل رسالة الوكيل أو الصيانة إذا كانت فيها معلومة.
+4. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
 """
 
 # ==========================================
@@ -221,17 +252,38 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
     raise last_error
 
 
+def _normalize_card_fields(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    if "is_worth_archiving" not in data and "is_useful" in data:
+        data["is_worth_archiving"] = data.get("is_useful")
+    aliases = {
+        "model": "car_model",
+        "problem": "problem_or_topic",
+        "solution": "solution_or_summary",
+        "parts": "part_numbers_or_specs",
+        "subsystem": "sub_system",
+        "verified": "is_verified_solution",
+    }
+    for source, target in aliases.items():
+        if data.get(source) not in (None, "") and not data.get(target):
+            data[target] = data[source]
+    return data
+
+
 def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None) -> dict:
     schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
-    
+    dealer_hint = ""
+    if is_dealer_or_maintenance_msg(thread_text):
+        dealer_hint = """
+تنبيه هام: هذه الرسالة تتضمن معلومات عن الوكيل أو الصيانة الدورية المعتمدة.
+اجعل is_worth_archiving = true وصنّفها في قسم الصيانة الدورية والوكالات.
+"""
     prompt = f"""
 {SYSTEM_PROMPT}
-
+{dealer_hint}
 يرجى تحليل النص التالي واستخراج النتيجة بصيغة JSON مطابقة تماماً لهذا المخطط (Schema):
 {schema_json_str}
-
-قبل الإجابة: إن كانت الرسالة عامة أو سؤالاً إنجليزياً أو نصاً غير واضح فاجعل is_worth_archiving = false.
-لا تترجم الأسئلة الإنجليزية العامة إلى بطاقة. الحقول النصية بالعربية الفصحى فقط، ومن دون كلمة nan.
 
 النص المراد تحليله:
 {thread_text}
@@ -240,19 +292,31 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     completion = _groq_complete(
         api_key,
         [
-            {"role": "system", "content": "استخرج JSON فقط. الحقول النصية بالعربية الفصحى حصراً. السؤال بلا إجابة والدردشة العامة والنص غير الواضح تعني is_worth_archiving = false. القطع غير المذكورة تُكتب غير محدد، وممنوع إخراج nan."},
+            {
+                "role": "system",
+                "content": (
+                    "استخرج JSON فقط وبالعربية الفصحى. "
+                    "رسائل الوكيل والصيانة الدورية والضمان تُحفظ ولا تُتجاهل. "
+                    "السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. "
+                    "ممنوع إخراج nan."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         json_mode=True,
     )
-    
-    result_text = completion.choices[0].message.content
-    data = json.loads(result_text)
+
+    data = _normalize_card_fields(json.loads(completion.choices[0].message.content))
     parts = str(data.get("part_numbers_or_specs") or "").strip()
     if parts.lower() in {"", "nan", "none", "null"}:
         data["part_numbers_or_specs"] = "غير محدد"
     problem_text = str(data.get("problem_or_topic") or "")
-    if data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
+    solution_text = str(data.get("solution_or_summary") or "")
+    if is_dealer_or_maintenance_msg(thread_text) and re.search(r"[\u0600-\u06FF]", problem_text + solution_text):
+        data["is_worth_archiving"] = True
+        if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
+            data["category"] = "الصيانة الدورية والوكالات"
+    elif data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
         data["is_worth_archiving"] = False
     return data
 

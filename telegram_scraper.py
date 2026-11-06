@@ -15,6 +15,7 @@ from database_and_ai import (
     compress_image_to_b64,
     get_db_connection,
     init_db,
+    is_dealer_or_maintenance_msg,
     load_config,
     save_card,
     save_config,
@@ -137,7 +138,10 @@ def _has_arabic(text: str) -> bool:
 
 
 def _message_is_pending(message) -> bool:
-    if len((message.text or "").strip()) > 15:
+    text = (message.text or "").strip()
+    if is_dealer_or_maintenance_msg(text):
+        return True
+    if len(text) > 15:
         return True
     return any(getattr(message, name, None) for name in ("photo", "voice", "audio", "video", "video_note"))
 
@@ -199,7 +203,7 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
 def _ignore_source(text: str) -> bool:
     """يتجاوز الرسائل العامة والأسئلة الإنجليزية والنصوص غير الواضحة قبل استدعاء Groq."""
     stripped = text.strip()
-    if _has_arabic(stripped):
+    if is_dealer_or_maintenance_msg(stripped) or _has_arabic(stripped):
         return False
     lower_words = stripped.lower().split()
     if "?" in stripped or (lower_words and lower_words[0] in {"what", "why", "how", "when", "where", "who", "can", "does", "do", "is", "are"}):
