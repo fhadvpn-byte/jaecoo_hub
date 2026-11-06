@@ -1,11 +1,23 @@
 import html
-import sqlite3
+import os
+import subprocess
+import sys
 
 import pandas as pd
 import streamlit as st
 from google import genai
 
-from database_and_ai import DB_NAME, analyze_thread_with_ai, init_db, save_card
+from database_and_ai import (
+    analyze_thread_with_ai,
+    generate_daily_pulse_summary,
+    get_db_connection,
+    init_db,
+    load_config,
+    save_card,
+    save_config,
+)
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 st.set_page_config(
     page_title="منصة جايكو الذكية | هوية حسم المضيئة",
@@ -43,7 +55,7 @@ st.html("""
     div[data-testid="stSidebar"] {
         direction: rtl;
         text-align: right;
-        background: rgba(7, 16, 30, 0.85) !important;
+        background: rgba(7, 16, 30, 0.88) !important;
         backdrop-filter: blur(20px) !important;
         border-left: 1px solid rgba(56, 189, 248, 0.3) !important;
         box-shadow: -5px 0 25px rgba(0, 195, 255, 0.08) !important;
@@ -188,6 +200,33 @@ st.html("""
         color: #bae6fd;
         box-shadow: inset 0 0 12px rgba(56, 189, 248, 0.08);
     }
+    .radar-bar-bg {
+        background: rgba(15, 23, 42, 0.8);
+        border-radius: 10px;
+        height: 12px;
+        width: 100%;
+        overflow: hidden;
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        margin-top: 6px;
+        margin-bottom: 14px;
+    }
+    .radar-bar-fill {
+        background: linear-gradient(90deg, #0284c7, #00f2fe);
+        height: 100%;
+        border-radius: 10px;
+        box-shadow: 0 0 12px #00f2fe;
+    }
+    .author-row {
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        background: rgba(7, 17, 34, 0.65);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 10px;
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        align-items: center;
+    }
 
     .stTextInput > div > div, .stSelectbox > div > div, .stTextArea > div > div {
         background: rgba(10, 22, 40, 0.75) !important;
@@ -208,7 +247,7 @@ st.html("""
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3) !important;
     }
 
-    .stButton > button, .stFormSubmitButton > button {
+    .stButton > button, .stFormSubmitButton > button, .stDownloadButton > button {
         background: linear-gradient(135deg, rgba(14, 165, 233, 0.22) 0%, rgba(3, 105, 161, 0.35) 100%) !important;
         color: #e0f2fe !important;
         border: 1px solid rgba(56, 189, 248, 0.45) !important;
@@ -217,7 +256,7 @@ st.html("""
         box-shadow: 0 0 14px rgba(14, 165, 233, 0.18) !important;
         transition: all 0.25s ease !important;
     }
-    .stButton > button:hover, .stFormSubmitButton > button:hover {
+    .stButton > button:hover, .stFormSubmitButton > button:hover, .stDownloadButton > button:hover {
         background: linear-gradient(135deg, rgba(0, 242, 254, 0.35) 0%, rgba(14, 165, 233, 0.5) 100%) !important;
         border-color: #00f2fe !important;
         color: #ffffff !important;
@@ -231,6 +270,7 @@ st.html("""
         padding: 8px;
         border-radius: 14px;
         border: 1px solid rgba(56, 189, 248, 0.22);
+        flex-wrap: wrap;
     }
     div.stTabs [data-baseweb="tab"] {
         background: rgba(13, 27, 48, 0.5);
@@ -253,12 +293,6 @@ st.html("""
 # ==========================================
 # 2. دوال قاعدة البيانات والبيانات الأولية
 # ==========================================
-def get_db_connection():
-    conn = sqlite3.connect(DB_NAME, timeout=20, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
 def load_cards():
     conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", conn)
@@ -354,7 +388,7 @@ def seed_demo_data():
             "raw": "تقرير مفصل عن قيادة جايكو J8 في الطرق الجبلية والعقبات.",
         },
         {
-            "id": 1005, "url": "https://t.me/jaecoo_group/1005", "author": "فهد",
+            "id": 1005, "url": "https://t.me/jaecoo_group/1005", "author": "أبو إياد",
             "card": {
                 "category": "الإكسسوارات والتجهيزات",
                 "car_model": "Jaecoo J8",
@@ -388,14 +422,57 @@ def seed_demo_data():
         save_card(item["card"], item["id"], item["url"], item["author"], item["raw"])
 
 
+def config_ready(cfg: dict) -> bool:
+    return bool(cfg.get("tg_api_id") and cfg.get("tg_api_hash") and cfg.get("tg_group") and cfg.get("gemini_api_key"))
+
+
+def radar_systems_html(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return "<div class='hasm-card'><h4>📡 رادار الأنظمة الأكثر نقاشاً</h4><p>لا توجد بطاقات بعد.</p></div>"
+    sys_counts = frame["sub_system"].value_counts()
+    max_val = int(sys_counts.max()) or 1
+    bars = []
+    for sys_name, cnt in sys_counts.items():
+        pct = int((int(cnt) / max_val) * 100)
+        bars.append(
+            f"""
+            <div style="display:flex; justify-content:space-between; font-size:0.9rem; color:#bae6fd; gap:8px;">
+                <span>⚙️ {html.escape(str(sys_name))}</span>
+                <b>{int(cnt)} بطاقة</b>
+            </div>
+            <div class="radar-bar-bg"><div class="radar-bar-fill" style="width:{pct}%;"></div></div>
+            """
+        )
+    return "<div class='hasm-card'><h4>📡 رادار الأنظمة الأكثر نقاشاً</h4>" + "".join(bars) + "</div>"
+
+
+def top_authors_html(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return "<div class='hasm-card'><h4>🏆 نخبة القروب (الأكثر إثراءً للمعرفة)</h4><p>لا توجد بطاقات بعد.</p></div>"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    rows = []
+    for rank, (author, cnt) in enumerate(frame["author_name"].value_counts().head(6).items(), 1):
+        medal = medals.get(rank, "💠")
+        rows.append(
+            f"""
+            <div class="author-row">
+                <span>{medal} <b style="color:#f8fafc;">{html.escape(str(author))}</b></span>
+                <span class="badge-neon-cyan">{int(cnt)} مساهمة موثقة</span>
+            </div>
+            """
+        )
+    return "<div class='hasm-card'><h4>🏆 نخبة القروب (الأكثر إثراءً للمعرفة)</h4>" + "".join(rows) + "</div>"
+
+
 init_db()
+cfg = load_config()
 if "initial_seeded" not in st.session_state:
     if load_cards().empty:
         seed_demo_data()
     st.session_state["initial_seeded"] = True
 
 # ==========================================
-# 3. القائمة الجانبية
+# 3. القائمة الجانبية (إعدادات دائمة + وسائط + تلجرام)
 # ==========================================
 CATEGORIES_LIST = [
     "الأعطال والتشخيص",
@@ -420,9 +497,90 @@ SYSTEMS_LIST = [
 
 with st.sidebar:
     st.html("<h3 style='color:#38bdf8; text-shadow:0 0 12px rgba(56,189,248,0.5); margin:0;'>💠 مركز التحكم والربط</h3>")
-    gemini_key = st.text_input("🔑 مفتاح Gemini API (للتحليل الذكي):", type="password")
 
-    st.divider()
+    with st.expander("🔐 إعدادات المفاتيح والربط بالتلجرام (حفظ دائم)", expanded=not bool(cfg.get("gemini_api_key"))):
+        new_gemini = st.text_input("مفتاح Gemini API:", value=cfg.get("gemini_api_key", ""), type="password")
+        new_api_id = st.text_input("Telegram API ID:", value=cfg.get("tg_api_id", ""))
+        new_api_hash = st.text_input("Telegram API Hash:", value=cfg.get("tg_api_hash", ""), type="password")
+        new_group = st.text_input("معرف أو رابط قروب الجايكو:", value=cfg.get("tg_group", ""), placeholder="jaecoo_ksa_group")
+        new_auto_reply = st.checkbox("تفعيل الرد الآلي على الأسئلة المتكررة 🤖", value=bool(cfg.get("auto_reply_enabled", False)))
+
+        if st.button("حفظ الإعدادات بشكل دائم 💾", width="stretch"):
+            cfg.update({
+                "gemini_api_key": new_gemini.strip(),
+                "tg_api_id": new_api_id.strip(),
+                "tg_api_hash": new_api_hash.strip(),
+                "tg_group": new_group.strip(),
+                "auto_reply_enabled": new_auto_reply,
+            })
+            save_config(cfg)
+            st.toast("تم حفظ الإعدادات في config.json")
+            st.rerun()
+
+    gemini_key = cfg.get("gemini_api_key", "")
+
+    with st.expander("📡 سحب ومزامنة قروب التلجرام"):
+        pull_count = st.slider("عدد الرسائل المراد سحبها وتحليلها:", 20, 500, 100, step=20)
+        if st.button("بدء سحب وتصنيف رسائل القروب ⚡", width="stretch"):
+            if not config_ready(cfg):
+                st.warning("أكمل بيانات التلجرام ومفتاح Gemini في الأعلى أولاً.")
+            else:
+                with st.spinner("جاري الاتصال بتلجرام ودمج الردود وتحليلها..."):
+                    env = os.environ.copy()
+                    env["PYTHONIOENCODING"] = "utf-8"
+                    try:
+                        res = subprocess.run(
+                            [sys.executable, os.path.join(APP_DIR, "telegram_scraper.py"), "--mode", "history", "--limit", str(pull_count)],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            cwd=APP_DIR,
+                            env=env,
+                            timeout=180,
+                        )
+                    except subprocess.TimeoutExpired:
+                        st.error("انتهت مهلة الاتصال. أول تسجيل دخول يحتاج رقم الجوال والرمز في الطرفية.")
+                        st.code("python telegram_scraper.py --mode history --limit 100")
+                    else:
+                        output = ((res.stdout or "") + ("\n" + res.stderr if res.stderr else "")).strip()
+                        if res.returncode == 0:
+                            st.toast("اكتملت المزامنة")
+                            if output:
+                                st.code(output[-400:])
+                            st.rerun()
+                        else:
+                            st.error("حدثت ملاحظة أثناء الاتصال. أول تسجيل دخول يتم من الطرفية.")
+                            st.code(output or "لا توجد تفاصيل")
+
+    with st.expander("🎙️📷 مختبر التحليل الذكي (نص / صورة / بصمة صوتية)"):
+        sample_chat = st.text_area(
+            "الصق نقاشاً أو اكتب وصفاً مرفقاً بصورة أو صوت:",
+            placeholder="مثال: صورة كرتون بواجي أو فلتر يركب على جايكو J8 مع تعليق العضو...",
+        )
+        uploaded_media = st.file_uploader(
+            "إرفاق صورة (قطعة/فاتورة/عطل) أو بصمة صوتية (اختياري):",
+            type=["png", "jpg", "jpeg", "ogg", "mp3", "wav", "m4a"],
+        )
+        if st.button("تحليل وإضافة للقسم المناسب ✨", width="stretch"):
+            if not gemini_key:
+                st.info("أدخل مفتاح Gemini API واحفظه أولاً.")
+            elif not sample_chat.strip() and not uploaded_media:
+                st.info("أدخل نصاً أو ارفع ملف صورة/صوت للتحليل.")
+            else:
+                try:
+                    with st.spinner("جاري تحليل المحتوى والوسائط بالذكاء الاصطناعي..."):
+                        m_bytes = uploaded_media.read() if uploaded_media else None
+                        m_mime = uploaded_media.type if uploaded_media else None
+                        res = analyze_thread_with_ai(sample_chat or "تحليل مرفق وسائط فني", gemini_key, m_bytes, m_mime)
+                        if not res.get("is_worth_archiving", True):
+                            st.info("المحتوى لا يحتوي معلومة تستحق الأرشفة.")
+                        else:
+                            save_card(res, next_message_id(), "#", "تحليل ذكي متعدد الوسائط", sample_chat)
+                            st.toast(f"تم التصنيف في: {res['category']}")
+                            st.rerun()
+                except Exception as exc:
+                    st.error(f"خطأ في التحليل: {exc}")
 
     with st.expander("➕ إضافة بطاقة معرفة يدوياً"):
         with st.form("manual_card_form", clear_on_submit=True):
@@ -434,9 +592,9 @@ with st.sidebar:
             m_sol = st.text_area("الحل / الخلاصة:")
             m_parts = st.text_input("أرقام القطع أو المواصفات:")
             m_author = st.text_input("اسم المشارك:", value="أبو إياد")
-            m_ver = st.checkbox("حل مجرب ومؤكد 💠", value=True)
+            m_ver = st.checkbox("حل مجرب ومعتمد 🛡️", value=True)
 
-            submitted = st.form_submit_button("حفظ البطاقة في المنصة ⚡", width="stretch")
+            submitted = st.form_submit_button("حفظ البطاقة ⚡", width="stretch")
             if submitted and m_title.strip():
                 manual_data = {
                     "category": m_cat,
@@ -450,55 +608,36 @@ with st.sidebar:
                     "keywords": f"{m_cat}، {m_sys}، {m_model}",
                 }
                 save_card(manual_data, next_message_id(), "#", m_author, m_prob)
-                st.toast("تم حفظ البطاقة بنجاح!")
+                st.toast("تم حفظ البطاقة")
                 st.rerun()
             elif submitted:
                 st.warning("اكتب عنوان البطاقة قبل الحفظ.")
 
-    with st.expander("🤖 تحويل محادثة بالذكاء الاصطناعي"):
-        sample_chat = st.text_area(
-            "الصق نقاش القروب لتحليله:",
-            placeholder="عضو 1: يا شباب كم لزوجة زيت جايكو J8؟\nعضو 2: المعتمد في الكتالوج والوكالة 5W-30 تخليقي بالكامل.",
-        )
-        if st.button("تحليل وتصنيف تلقائي ✨", width="stretch"):
-            if not gemini_key:
-                st.info("يرجى إدخال مفتاح Gemini API في الأعلى أولاً.")
-            elif sample_chat.strip():
-                try:
-                    with st.spinner("جاري تحليل السياق بالذكاء الاصطناعي..."):
-                        res = analyze_thread_with_ai(sample_chat, gemini_key)
-                        if not res.get("is_worth_archiving", True):
-                            st.info("النقاش لا يحتوي معلومة تستحق الأرشفة.")
-                        else:
-                            save_card(res, next_message_id(), "#", "محاكاة ذكية", sample_chat)
-                            st.toast(f"تم التصنيف في: {res['category']}")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"تعذر التحليل: تأكد من المفتاح ({e})")
-
     st.divider()
     if st.button("🔄 استعادة البيانات النموذجية", width="stretch"):
         seed_demo_data()
-        st.toast("تم تحديث البيانات النموذجية بنجاح!")
         st.rerun()
 
 # ==========================================
 # 4. الترويسة المضيئة والعدادات
 # ==========================================
 df = load_cards()
-st.html("""
+status_badge = (
+    '<span class="badge-neon-cyan">⚡ متصل بالذكاء الاصطناعي</span>'
+    if gemini_key
+    else '<span class="badge-soft-slate">🔒 وضع التصفح المحلي (أضف مفتاح Gemini للتوليد)</span>'
+)
+st.html(f"""
 <div class="hasm-header">
     <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
         <div>
             <h1 class="hasm-title">💠 منصة جايكو الذكية</h1>
             <div class="hasm-subtitle-en">JAECOO AI KNOWLEDGE &amp; DIAGNOSTICS HUB</div>
         </div>
-        <div>
-            <span class="badge-neon-cyan">⚡ النظام نشط ومستقر</span>
-        </div>
+        <div>{status_badge}</div>
     </div>
     <p style="margin: 12px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
-        منظومة ذكاء اصطناعي لتحليل نقاشات قروب التلجرام وتصنيف الأعطال، الحلول المؤكدة، والقطع البديلة
+        منظومة ذكاء اصطناعي لتحليل نقاشات قروب التلجرام وتصنيف الأعطال، الحلول المؤكدة، القطع البديلة، والأنظمة الذكية
     </p>
 </div>
 """)
@@ -507,7 +646,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("💠 إجمالي البطاقات", len(df))
 m2.metric("🛡️ الحلول المعتمدة", int(df["is_verified_solution"].sum()) if not df.empty else 0)
 m3.metric("🔹 بطاقات Jaecoo J8", len(df[df["car_model"] == "Jaecoo J8"]) if not df.empty else 0)
-m4.metric("🌐 الأقسام المغطاة", int(df["category"].nunique()) if not df.empty else 0)
+m4.metric("🌐 الأقسام المغطاة", df["category"].nunique() if not df.empty else 0)
 
 # ==========================================
 # 5. شريط البحث والفلاتر والمهندس الذكي
@@ -535,15 +674,15 @@ with st.expander("📡 استشارة المهندس الذكي (بحث سياق
     if st.button("استخلاص الإجابة الفورية ⚡"):
         if not gemini_key:
             st.info("أدخل مفتاح Gemini API في القائمة الجانبية لتفعيل الاستشارة الذكية.")
+        elif not ai_q.strip():
+            st.info("اكتب السؤال أولاً.")
         elif df.empty:
             st.info("لا توجد بطاقات مسجلة حالياً.")
-        elif not ai_q.strip():
-            st.warning("اكتب السؤال أولاً.")
         else:
             context_records = "\n---\n".join(
                 [
-                    f"العنوان: {r['title']} | الطراز: {r['car_model']} | المشكلة: {r['problem_or_topic']} | الحل: {r['solution_or_summary']} | المواصفات: {r['part_numbers_or_specs']} | عضو: {r['author_name']}"
-                    for _, r in df.iterrows()
+                    f"العنوان: {row['title']} | الطراز: {row['car_model']} | المشكلة: {row['problem_or_topic']} | الحل: {row['solution_or_summary']} | المواصفات: {row['part_numbers_or_specs']} | عضو: {row['author_name']}"
+                    for _, row in df.iterrows()
                 ]
             )
             try:
@@ -551,10 +690,8 @@ with st.expander("📡 استشارة المهندس الذكي (بحث سياق
                 ans = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=(
-                        "بناءً على تجارب أعضاء قروب جايكو التالية فقط:\n"
-                        f"{context_records}\n\n"
-                        "أجب بدقة ووضوح على سؤال العضو التالي:\n"
-                        f"{ai_q}"
+                        f"بناءً على تجارب أعضاء قروب جايكو التالية فقط:\n{context_records}\n\n"
+                        f"أجب بدقة ووضوح على سؤال العضو التالي مع ذكر اسم صاحب التجربة:\n{ai_q}"
                     ),
                 )
                 st.info(ans.text)
@@ -580,7 +717,7 @@ if not filtered_df.empty:
         ]
 
 # ==========================================
-# 6. الأقسام
+# 6. الأقسام الثمانية + تبويب الرادار
 # ==========================================
 TABS_CONFIG = [
     ("💠 الكل", "ALL"),
@@ -592,6 +729,7 @@ TABS_CONFIG = [
     ("✨ الإكسسوارات", "الإكسسوارات والتجهيزات"),
     ("🏔️ تجارب القيادة", "تجارب القيادة والأداء الفعلي"),
     ("💬 نبض القروب", "نبض القروب والدردشة العامة"),
+    ("📊 الرادار ونخبة القروب", "RADAR_ANALYTICS"),
 ]
 
 
@@ -607,7 +745,6 @@ def render_card(row, tab_prefix):
         if parts
         else ""
     )
-
     st.html(f"""
     <div class="hasm-card">
         <div style="margin-bottom: 12px;">
@@ -628,7 +765,7 @@ def render_card(row, tab_prefix):
         {parts_html}
         <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(56, 189, 248, 0.15); font-size: 0.82rem; color: #94a3b8; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
             <span>👤 المصدر: <b style="color: #bae6fd;">{html.escape(str(row["author_name"]))}</b> | 🕒 <span dir="ltr">{html.escape(str(row["created_at"]))}</span></span>
-            <span>🏷️ {html.escape(str(row["keywords"]))}</span>
+            <span>🏷️ {html.escape(str(row["keywords"] or ""))}</span>
         </div>
     </div>
     """)
@@ -647,15 +784,52 @@ def render_card(row, tab_prefix):
 
 tab_titles = []
 for label, cat_key in TABS_CONFIG:
-    count = len(filtered_df) if cat_key == "ALL" else len(filtered_df[filtered_df["category"] == cat_key])
-    tab_titles.append(f"{label} ({count})")
+    if cat_key == "ALL":
+        tab_titles.append(f"{label} ({len(filtered_df)})")
+    elif cat_key == "RADAR_ANALYTICS":
+        tab_titles.append(label)
+    else:
+        tab_titles.append(f"{label} ({len(filtered_df[filtered_df['category'] == cat_key])})")
 
 tabs = st.tabs(tab_titles)
 for idx, (_, cat_key) in enumerate(TABS_CONFIG):
     with tabs[idx]:
-        cat_df = filtered_df if cat_key == "ALL" else filtered_df[filtered_df["category"] == cat_key]
-        if cat_df.empty:
-            st.info("لا توجد بطاقات مطابقة للفلاتر المحددة في هذا القسم.")
+        if cat_key == "RADAR_ANALYTICS":
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.html(radar_systems_html(df))
+            with col_b:
+                st.html(top_authors_html(df))
+            col_c, col_d = st.columns(2)
+            with col_c:
+                st.subheader("📰 توليد النشرة اليومية لنبض القروب")
+                if st.button("✨ توليد موجز القروب الذكي للنشر", width="stretch"):
+                    if not gemini_key:
+                        st.info("أدخل مفتاح Gemini API في القائمة الجانبية أولاً.")
+                    else:
+                        try:
+                            with st.spinner("جاري صياغة النشرة الذكية..."):
+                                summary_text = generate_daily_pulse_summary(gemini_key)
+                            st.text_area("انسخ النشرة التالية وشاركها في قروب التلجرام:", value=summary_text, height=220)
+                        except Exception as exc:
+                            st.error(f"تعذر توليد النشرة: {exc}")
+            with col_d:
+                st.subheader("📥 النسخ الاحتياطي وتصدير البيانات")
+                if df.empty:
+                    st.info("لا توجد بطاقات للتصدير.")
+                else:
+                    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="📊 تحميل أرشيف القروب بالكامل (CSV)",
+                        data=csv_data,
+                        file_name="jaecoo_knowledge_archive.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
         else:
-            for _, row in cat_df.iterrows():
-                render_card(row, f"t{idx}")
+            cat_df = filtered_df if cat_key == "ALL" else filtered_df[filtered_df["category"] == cat_key]
+            if cat_df.empty:
+                st.info("لا توجد بطاقات مطابقة للفلاتر المحددة في هذا القسم.")
+            else:
+                for _, row in cat_df.iterrows():
+                    render_card(row, f"t{idx}")
