@@ -226,11 +226,12 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
         pending = [message for message in reversed(list(messages)) if len((message.text or "").strip()) > 15]
         total = max(len(pending), 1)
-        _report(on_progress, f"تم جلب {len(pending)} رسالة من تيليجرام.", 0.38)
+        _report(on_progress, f"تم جلب {len(pending)} رسالة من تيليجرام.", 0.36)
 
         for index, message in enumerate(pending, start=1):
             text = (message.text or "").strip()
             step = 0.4 + 0.55 * ((index - 1) / total)
+            _report(on_progress, f"جاري جلب الرسالة {index} من {len(pending)}...", step)
             result["scanned"] += 1
             try:
                 sender = await message.get_sender()
@@ -238,7 +239,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             except Exception:
                 author_name = "عضو"
 
-            _report(on_progress, f"الرسالة {index} من {len(pending)}: جاري تحليلها عبر Groq...", step)
+            _report(on_progress, "جاري تحليل الرسالة عبر Groq...", min(0.97, step + (0.2 / total)))
             try:
                 card = analyze_thread_with_ai(f"محتوى الرسالة: {text}", groq_key)
             except Exception as exc:
@@ -254,11 +255,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             save_card(card, message.id, thread_url, author_name, text)
             result["saved"] += 1
             _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-            _report(
-                on_progress,
-                f"الرسالة {index} من {len(pending)}: تم حفظ البطاقة بنجاح في قاعدة البيانات.",
-                step + (0.5 / total),
-            )
+            _report(on_progress, "تم حفظ البطاقة بنجاح", min(0.99, step + (0.45 / total)))
 
         result["ok"] = True
         _report(on_progress, "اكتمل السحب والتحليل.", 1.0)

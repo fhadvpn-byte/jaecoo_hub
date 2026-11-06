@@ -689,27 +689,54 @@ with pull_col:
         if _SYNC_STATE["running"]:
             st.info("السحب يعمل الآن، والنتائج ستظهر وحدها.")
         else:
-            live_lines: list[str] = ["جاري الاتصال ب تيليجرام..."]
-            with sync_feedback.container():
-                with st.expander("سجل السحب الحي", expanded=True):
-                    log_slot = st.empty()
-                    log_slot.code("\n".join(live_lines), language="text")
-                with st.status("جاري الاتصال ب تيليجرام...", expanded=True) as status:
-                    def _show_sync_progress(message: str, fraction: float) -> None:
-                        live_lines.append(message)
-                        log_slot.code("\n".join(live_lines), language="text")
-                        status.update(label=message, state="running")
+            live = {
+                "lines": ["جاري الاتصال ب تيليجرام..."],
+                "fraction": 0.08,
+                "message": "جاري الاتصال ب تيليجرام...",
+                "done": False,
+                "result": None,
+            }
+            live_lock = threading.Lock()
 
-                    result = run_sync(int(limit_val), on_progress=_show_sync_progress)
-                    if result.get("ok"):
-                        live_lines.append(
-                            f"انتهى السحب. المفحوص: {result.get('scanned', 0)}، "
-                            f"المحفوظ: {result.get('saved', 0)}."
-                        )
-                        log_slot.code("\n".join(live_lines), language="text")
-                        status.update(label="اكتمل السحب والتحليل.", state="complete")
-                    else:
-                        status.update(label=result.get("error") or "تعذر إكمال السحب.", state="error")
+            def _pull_worker() -> None:
+                def _on_progress(message: str, fraction: float) -> None:
+                    with live_lock:
+                        live["lines"].append(message)
+                        live["fraction"] = fraction
+                        live["message"] = message
+
+                try:
+                    live["result"] = run_sync(int(limit_val), on_progress=_on_progress)
+                except Exception as exc:
+                    live["result"] = {"ok": False, "error": str(exc), "saved": 0, "scanned": 0}
+                finally:
+                    with live_lock:
+                        live["done"] = True
+
+            threading.Thread(target=_pull_worker, daemon=True).start()
+            with sync_feedback.container():
+                bar = st.progress(0.08, text="جاري الاتصال ب تيليجرام...")
+                log_slot = st.empty()
+                with st.spinner("جاري السحب والتحليل..."):
+                    while True:
+                        with live_lock:
+                            done = live["done"]
+                            lines = list(live["lines"])
+                            fraction = float(live["fraction"])
+                            message = str(live["message"])
+                        log_slot.write("\n\n".join(lines))
+                        bar.progress(min(1.0, max(0.0, fraction)), text=message)
+                        if done:
+                            break
+                        time.sleep(0.4)
+                result = live["result"] or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
+                if result.get("ok"):
+                    lines.append(
+                        f"انتهى السحب. المفحوص: {result.get('scanned', 0)}، المحفوظ: {result.get('saved', 0)}."
+                    )
+                    log_slot.write("\n\n".join(lines))
+                    bar.progress(1.0, text="اكتمل السحب والتحليل.")
+            live_lines = lines
             st.session_state["sync_logs"] = live_lines
             if result.get("ok"):
                 fresh = get_db_connection()
