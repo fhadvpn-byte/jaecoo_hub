@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from database_and_ai import (
@@ -43,7 +44,11 @@ DEFAULT_API_ID = 2040
 DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
 START_SYNC_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SYNC_GROUP_KEY = "jaecoo_2026"
-SYNC_CHAIN_BATCH = 500
+SYNC_CHAIN_BATCH = 100
+SESSION_PULL_CAP = 10000
+BATCH_PAUSE_SECONDS = 2
+RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_PAUSE_CAP = 20
 _REQUIRED_CARD_FIELDS = (
     "category",
     "car_model",
@@ -402,21 +407,45 @@ def _should_analyze_message(message) -> bool:
 
 
 async def _run_with_backoff(factory, on_progress):
-    """لا ينتظر دقيقة امتلاء النموذج. المحاولة التالية بعد 6 ثوانٍ فقط."""
-    try:
-        value = factory()
-        if asyncio.iscoroutine(value):
-            return await value
-        return value
-    except Exception as exc:
-        if not _is_rate_limit(exc):
-            raise
-        _report(on_progress, "رصيد النموذج ممتلئ. انتظار 5 ثوانٍ ثم المتابعة.", 0.45)
-        await asyncio.sleep(5)
-        value = factory()
-        if asyncio.iscoroutine(value):
-            return await value
-        return value
+    """يتخطى ضغط Groq بتهدئة قصيرة ويعيد المحاولة داخل نفس جلسة السحب."""
+    for attempt in range(RATE_LIMIT_RETRIES):
+        try:
+            value = factory()
+            if asyncio.iscoroutine(value):
+                return await value
+            return value
+        except Exception as exc:
+            if not _is_rate_limit(exc) or attempt + 1 >= RATE_LIMIT_RETRIES:
+                raise
+            pause = min(_rate_limit_wait_seconds(exc), RATE_LIMIT_PAUSE_CAP)
+            _report(
+                on_progress,
+                f"ضغط Groq. تريث {pause} ثانية ثم متابعة السحب من نفس النقطة.",
+                0.45,
+            )
+            await asyncio.sleep(pause)
+
+
+async def _resume_floor_id(client, target, last_id: int) -> int:
+    """يبدأ من آخر نقطة محفوظة، أو من الرسالة السابقة لتاريخ 1/1/2026، أو من أقدم رسالة."""
+    if last_id > 0:
+        return last_id
+    anchor = None
+    async for message in client.iter_messages(target, offset_date=START_SYNC_DATE, limit=1):
+        anchor = message
+        break
+    return int(getattr(anchor, "id", 0) or 0)
+
+
+async def _forward_page(client, target, after_id: int, page_size: int) -> list:
+    """يجلب صفحة تصاعدية: من الأقدم إلى الأحدث، وكل رسالة أحدث من after_id."""
+    page = []
+    async for message in client.iter_messages(target, min_id=after_id, reverse=True, limit=page_size):
+        if int(message.id) <= after_id:
+            continue
+        page.append(message)
+    page.sort(key=lambda item: item.id)
+    return page
 
 
 def _stored_card_count() -> int:
@@ -517,50 +546,53 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
         group_key = SYNC_GROUP_KEY
-        requested = max(1, int(limit or SYNC_CHAIN_BATCH))
+        requested = max(1, min(SESSION_PULL_CAP, int(limit or SESSION_PULL_CAP)))
 
         def _span(done_units: float) -> float:
             return min(0.98, 0.08 + 0.90 * (done_units / requested))
 
         last_id = get_last_synced_id(group_key)
+        cursor_id = await _resume_floor_id(client, target, last_id)
         if last_id > 0:
             start_note = (
-                f"يكمل السحب من الرسالة رقم {last_id + 1} بعد تاريخ 1/1/2026. "
+                f"يكمل السحب تصاعدياً من الرسالة رقم {last_id + 1} نحو الأحدث. "
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         else:
             start_note = (
-                f"يبدأ السحب من تاريخ 1/1/2026. "
+                f"يبدأ السحب تصاعدياً من 1/1/2026 أو أقدم رسالة متاحة في القروب نحو الأحدث. "
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         _report(on_progress, start_note, 0.08)
-        _report(on_progress, "البطاقات السابقة تبقى محفوظة. هذه السحبة تكمل من آخر نقطة فقط.", 0.1)
-        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}. المطلوب {requested}.")
+        _report(on_progress, "البطاقات السابقة تبقى محفوظة. نقطة آخر رسالة تُحفظ بعد كل دفعة.", 0.1)
+        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {cursor_id}. المطلوب {requested}.")
 
         pulled = 0
         batch_no = 0
         while pulled < requested:
             batch_no += 1
-            last_id = get_last_synced_id(group_key)
             this_limit = min(SYNC_CHAIN_BATCH, requested - pulled)
             batch_base = pulled
-            raw_messages = []
-            highest_id = last_id
-            fetched = 0
-            iter_kwargs = {"reverse": True, "limit": this_limit}
-            if last_id > 0:
-                iter_kwargs["min_id"] = last_id
-            else:
-                iter_kwargs["offset_date"] = START_SYNC_DATE
             _report(
                 on_progress,
-                f"الدفعة {batch_no}: سحب {this_limit} رسالة. المفحوص حتى الآن {pulled} من {requested}.",
+                f"الدفعة {batch_no}: سحب {this_limit} رسالة من الأقدم إلى الأحدث. المفحوص {pulled} من {requested}.",
                 _span(batch_base),
             )
-            async for message in client.iter_messages(target, **iter_kwargs):
+            try:
+                page = await _forward_page(client, target, cursor_id, this_limit)
+            except FloodWaitError as exc:
+                pause = min(int(getattr(exc, "seconds", BATCH_PAUSE_SECONDS)) + 1, RATE_LIMIT_PAUSE_CAP)
+                _report(on_progress, f"تيليجرام طلب التريث {pause} ثانية. السحب يتابع من الرسالة {cursor_id}.", _span(batch_base))
+                await asyncio.sleep(pause)
+                continue
+            if not page or page[-1].id <= cursor_id:
+                _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
+                break
+            raw_messages = []
+            fetched = 0
+            for message in page:
                 fetched += 1
                 pulled += 1
-                highest_id = message.id
                 if not _message_is_after_start(message):
                     continue
                 result["scanned"] += 1
@@ -575,9 +607,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     fraction,
                 )
                 raw_messages.append(message)
-            if fetched == 0 or highest_id <= last_id:
-                _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
-                break
+            cursor_id = page[-1].id
 
             referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
             batch = [
@@ -657,15 +687,18 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     fraction,
                 )
 
-            update_last_synced_id(highest_id, group_key)
+            update_last_synced_id(cursor_id, group_key)
             _report(
                 on_progress,
-                f"اكتملت الدفعة {batch_no}. المفحوص {pulled} من {requested}، والبطاقات {result['saved']}.",
+                (
+                    f"اكتملت الدفعة {batch_no}. المفحوص {pulled} من {requested}، "
+                    f"والبطاقات {result['saved']}. آخر رسالة محفوظة: {get_last_synced_id(group_key)}."
+                ),
                 _span(pulled),
             )
-            if fetched < this_limit:
-                _report(on_progress, "وصل السحب إلى آخر رسائل القروب المتاحة.", _span(pulled))
+            if pulled >= requested:
                 break
+            await asyncio.sleep(BATCH_PAUSE_SECONDS)
 
         result["ok"] = True
         _report(
