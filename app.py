@@ -993,7 +993,7 @@ with st.expander("🛠️ عرض تفاصيل وسجلات السحب الحي (
             log_status_box.code("\n".join(st.session_state["sync_logs"]), language="text")
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
-    if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
+    if st.button("🔄 تحديث قاعدة الأرشيف بالذكاء الاصطناعي", use_container_width=True, key="public_pull"):
         opening = (
             "جاري الاتصال بملف الجلسة المحلي..."
             if os.path.exists(PERSONAL_SESSION_FILE)
