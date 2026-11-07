@@ -25,7 +25,7 @@ from database_and_ai import (
     save_config,
     transcribe_media_bytes,
 )
-from telegram_scraper import PERSONAL_SESSION_FILE, run_sync
+from telegram_scraper import PERSONAL_SESSION_FILE, reset_sync_checkpoint, run_sync
 
 AUTO_SYNC_LIMIT = 30
 JAECOO_MODELS = [
@@ -886,6 +886,12 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
 
 limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
 st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. أول سحب يبدأ من هذا التاريخ باتجاه اليوم.")
+if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_sync_2026"):
+    if _SYNC_STATE["running"]:
+        st.warning("انتظر انتهاء السحب الحالي قبل إعادة الضبط.")
+    else:
+        reset_sync_checkpoint()
+        st.success("تم تصفير المؤشر jaecoo_2026. السحب القادم يبدأ من 1/1/2026.")
 sync_feedback = st.empty()
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):

@@ -37,6 +37,7 @@ RUNTIME_SESSION_FILE = os.path.join(PROJECT_DIR, f"scraper_runtime_{os.getpid()}
 DEFAULT_API_ID = 2040
 DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
 START_SYNC_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+SYNC_GROUP_KEY = "jaecoo_2026"
 _REQUIRED_CARD_FIELDS = (
     "category",
     "car_model",
@@ -291,6 +292,11 @@ def get_last_synced_id(group_key: str = "main_group") -> int:
     return int(row[0]) if row else 0
 
 
+def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
+    """يصفر مؤشر السحب حتى تبدأ الدفعة التالية من 1/1/2026."""
+    update_last_synced_id(0, group_key)
+
+
 def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
     conn = get_db_connection()
     try:
@@ -491,7 +497,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         result["group"] = target.name or str(target.id)
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
-        group_key = chat_id
+        group_key = SYNC_GROUP_KEY
         last_id = get_last_synced_id(group_key)
         batch_limit = int(limit) if limit else None
         if last_id > 0:
