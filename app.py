@@ -22,6 +22,8 @@ from database_and_ai import (
     get_app_setting,
     get_db_connection,
     init_db,
+    list_maintenance_rows,
+    list_spare_parts,
     load_config,
     load_telegram_session,
     save_card,
@@ -910,6 +912,87 @@ st.markdown("""
     <p>منظومة ذكاء اصطناعي لتحليل وأرشفة الخبرات الفنية والأعطال والحلول لقروب ملاك جايكو</p>
 </div>
 """, unsafe_allow_html=True)
+
+_SERVICE_MODELS = {
+    "Jaecoo J8": "Jaecoo J8",
+    "Jaecoo J8 SHS": "Jaecoo J7 PHEV",
+    "Jaecoo J7": "Jaecoo J7",
+    "Jaecoo J5": "Jaecoo J5",
+}
+_PART_MODELS = {
+    "Jaecoo J8": "Jaecoo J7",
+    "Jaecoo J8 SHS": "Jaecoo J7 PHEV",
+    "Jaecoo J7": "Jaecoo J7",
+    "Jaecoo J5": "Jaecoo J5",
+}
+
+
+def _render_service_reference() -> None:
+    schedule_tab, parts_tab = st.tabs([
+        "🛠️ جدول الصيانة الدورية والأسعار",
+        "📦 أسعار القطع وأرقامها",
+    ])
+    with schedule_tab:
+        chosen = st.selectbox(
+            "الطراز",
+            list(_SERVICE_MODELS),
+            key="service_model_choice",
+        )
+        st.caption(
+            "الأرقام من جدول OMODA | JAECOO الرسمي المنشور لعام 2026 بالرينغت الماليزي. "
+            "الضريبة غير مفصولة داخل الوثيقة، لذلك لا يُضاف تقدير لضريبة السعودية. "
+            "تجارب الملاك مثل ترصيص الهايبرد SHS تبقى في أرشيف القروب."
+        )
+        if chosen == "Jaecoo J8 SHS":
+            st.info("لا يوجد جدول سعر مستقل لـ Jaecoo J8 SHS في الجداول المنشورة. المعروض هو جدول Jaecoo J7 PHEV، وهو أقرب جدول هايبرد رسمي منشور.")
+        elif chosen == "Jaecoo J8":
+            st.caption("فئة الدفع الرباعي من J8: عند 60 ألف كم يصبح الإلزامي 1,901.20 رينغت بسبب سوائل الدبل.")
+        elif chosen == "Jaecoo J7":
+            st.caption("فئة الدفع الرباعي من J7: عند 60 ألف كم يصبح الإلزامي 1,690.90 رينغت بسبب سوائل الدبل.")
+        rows = list_maintenance_rows(_SERVICE_MODELS[chosen])
+        if not rows:
+            st.warning("لا توجد صفوف صيانة لهذا الطراز في قاعدة المرجع.")
+        else:
+            frame = pd.DataFrame([{
+                "المسافة (كم)": row["mileage_km"],
+                "القطع والسوائل": row["replaced_parts"],
+                "الإلزامي (رينغت)": row["compulsory_amount"],
+                "الإجمالي المنشور (رينغت)": row["published_total"],
+            } for row in rows])
+            st.dataframe(frame, use_container_width=True, hide_index=True)
+            st.caption(
+                f"مجموع الإلزامي حتى 100 ألف كم: {sum(row['compulsory_amount'] for row in rows):,.2f} رينغت. "
+                f"مجموع الإجمالي المنشور: {sum(row['published_total'] for row in rows):,.2f} رينغت. "
+                f"المصدر: {rows[0]['source_name']}"
+            )
+    with parts_tab:
+        part_choice = st.selectbox(
+            "الطراز",
+            list(_PART_MODELS),
+            key="parts_model_choice",
+        )
+        st.caption(
+            "أرقام القطع وأسعار التجزئة المنشورة بالجنيه من Jaecoo Parts Direct. "
+            "هذه ليست أسعار وكيل السعودية ولا تشمل ضريبة القيمة المضافة السعودية."
+        )
+        if part_choice == "Jaecoo J8":
+            st.info("لم يُنشر في هذا المصدر رقم قطعة مستقل لـ J8. الجدول يعرض قطع J7 الموثقة كمرجع استهلاك.")
+        elif part_choice == "Jaecoo J8 SHS":
+            st.info("قطع الهايبرد المعروضة هي أرقام Jaecoo J7 PHEV المنشورة، وليست قائمة وكيل J8 SHS.")
+        part_rows = list_spare_parts(_PART_MODELS[part_choice])
+        if not part_rows:
+            st.warning("لا توجد قطع مسجلة لهذا الطراز.")
+        else:
+            part_frame = pd.DataFrame([{
+                "القطعة": row["part_name"],
+                "رقم القطعة": row["part_number"],
+                "التصنيف": row["part_group"],
+                "السعر المنشور (جنيه)": row["price"],
+            } for row in part_rows])
+            st.dataframe(part_frame, use_container_width=True, hide_index=True)
+
+
+_render_service_reference()
 
 conn = get_db_connection()
 df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", conn)

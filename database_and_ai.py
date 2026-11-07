@@ -217,8 +217,197 @@ def init_db():
             value TEXT
         )
     """)
+    _ensure_service_tables(conn)
+    _seed_service_reference(conn)
     conn.commit()
     conn.close()
+
+
+SERVICE_SOURCE_KEY = "oj-my-2026"
+SERVICE_SOURCE_NAME = "جدول OMODA | JAECOO الرسمي المنشور لعام 2026"
+SERVICE_SOURCE_URL = "https://paultan.org/2026/06/26/omoda-jaecoo-service-cost-malaysia/"
+PARTS_SOURCE_KEY = "jaecoo-parts-direct"
+PARTS_SOURCE_NAME = "Jaecoo Parts Direct"
+PARTS_SOURCE_URL = "https://jaecoopartsdirect.co.uk/"
+
+
+def _ensure_service_tables(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS maintenance_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            car_model TEXT NOT NULL,
+            mileage_km INTEGER NOT NULL,
+            replaced_parts TEXT NOT NULL,
+            compulsory_amount REAL NOT NULL,
+            published_total REAL NOT NULL,
+            currency TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            UNIQUE(car_model, mileage_km, source_key)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS spare_part_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            car_model TEXT NOT NULL,
+            part_name TEXT NOT NULL,
+            part_number TEXT NOT NULL,
+            part_group TEXT NOT NULL,
+            price REAL NOT NULL,
+            currency TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            UNIQUE(car_model, part_number, source_key)
+        )
+    """)
+
+
+def _service_parts(mileage_km: int, hybrid: bool) -> str:
+    parts = ["زيت المحرك", "فلتر الزيت", "فحص دوري"]
+    if mileage_km in {30000, 60000, 90000}:
+        parts.append("بواجي في جدول البنزين كل 30 ألف كم")
+    if mileage_km in {40000, 80000}:
+        parts.append("سائل الفرامل")
+    if hybrid and mileage_km in {40000, 80000}:
+        parts.append("زيت القير")
+    elif mileage_km == 60000:
+        parts.append("زيت القير")
+    if mileage_km in {20000, 40000, 60000, 80000, 100000}:
+        parts.append("عند ارتفاع الإجمالي: فلتر المكيف وفلتر الهواء والمساحات")
+    return "، ".join(parts)
+
+
+def _seed_service_reference(conn) -> None:
+    """يعيد كتابة الجداول المرجعية المنشورة دون المساس ببطاقات الأرشيف."""
+    conn.execute("DELETE FROM maintenance_schedule WHERE source_key = ?", (SERVICE_SOURCE_KEY,))
+    conn.execute("DELETE FROM spare_part_prices WHERE source_key = ?", (PARTS_SOURCE_KEY,))
+    schedules = {
+        "Jaecoo J5": (False, [
+            (10000, 405.50, 405.50), (20000, 405.50, 835.20), (30000, 622.90, 622.90),
+            (40000, 555.50, 1127.00), (50000, 405.50, 405.50), (60000, 995.90, 1425.60),
+            (70000, 405.50, 405.50), (80000, 555.50, 1127.00), (90000, 622.90, 622.90),
+            (100000, 405.50, 835.20),
+        ]),
+        "Jaecoo J7": (False, [
+            (10000, 405.50, 405.50), (20000, 405.50, 865.10), (30000, 622.90, 622.90),
+            (40000, 505.50, 965.10), (50000, 405.50, 689.10), (60000, 1290.90, 1750.50),
+            (70000, 405.50, 405.50), (80000, 505.50, 965.10), (90000, 622.90, 622.90),
+            (100000, 405.50, 1148.70),
+        ]),
+        "Jaecoo J7 PHEV": (True, [
+            (10000, 406.20, 406.20), (20000, 406.20, 901.90), (30000, 764.60, 764.60),
+            (40000, 959.80, 2022.70), (50000, 406.20, 406.20), (60000, 764.60, 1260.30),
+            (70000, 406.20, 406.20), (80000, 959.80, 2022.70), (90000, 764.60, 764.60),
+            (100000, 406.20, 901.90),
+        ]),
+        "Jaecoo J8": (False, [
+            (10000, 385.50, 385.50), (20000, 385.50, 830.90), (30000, 669.10, 669.10),
+            (40000, 513.50, 958.90), (50000, 385.50, 669.10), (60000, 1601.20, 2046.60),
+            (70000, 385.50, 385.50), (80000, 513.50, 958.90), (90000, 669.10, 669.10),
+            (100000, 385.50, 1114.50),
+        ]),
+    }
+    rows = []
+    for model, (hybrid, visits) in schedules.items():
+        for mileage_km, compulsory, published in visits:
+            rows.append((
+                model, mileage_km, _service_parts(mileage_km, hybrid),
+                compulsory, published, "MYR",
+                SERVICE_SOURCE_KEY, SERVICE_SOURCE_NAME, SERVICE_SOURCE_URL,
+            ))
+    conn.executemany(
+        """
+        INSERT INTO maintenance_schedule (
+            car_model, mileage_km, replaced_parts, compulsory_amount, published_total,
+            currency, source_key, source_name, source_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    parts = [
+        ("Jaecoo J5", "فلتر الزيت", "110900104AA", "استهلاكية", 13.25),
+        ("Jaecoo J5", "بواجي", "111200100AA", "استهلاكية", 15.70),
+        ("Jaecoo J5", "فحمات خلفية", "T13J-6GN3502080AB", "استهلاكية", 158.70),
+        ("Jaecoo J5", "فلتر الهواء", "151000079AA", "استهلاكية", 11.42),
+        ("Jaecoo J7", "فلتر الزيت", "480-1012010", "استهلاكية", 19.39),
+        ("Jaecoo J7", "فلتر الهواء", "151000079AA", "استهلاكية", 11.42),
+        ("Jaecoo J7", "فحمات أمامية", "T1EJ-3501080AB", "استهلاكية", 198.82),
+        ("Jaecoo J7", "فحمات خلفية", "T22-3502080", "استهلاكية", 170.44),
+        ("Jaecoo J7", "قرص فرامل أمامي", "204004261AA", "استهلاكية", 114.77),
+        ("Jaecoo J7", "قرص فرامل خلفي", "204004266AA", "استهلاكية", 85.68),
+        ("Jaecoo J7 PHEV", "فلتر الهواء", "151000256AA", "استهلاكية", 61.18),
+        ("Jaecoo J7 PHEV", "كاليبر خلفي يمين", "204004265AA", "هيكل ومكابح", 317.36),
+        ("Jaecoo J7 PHEV", "كاليبر خلفي يسار", "204004264AA", "هيكل ومكابح", 317.36),
+        ("Jaecoo J5", "شبك الصدام الأمامي لطراز J5 BEV", "602008034AA", "هيكل", 61.55),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO spare_part_prices (
+            car_model, part_name, part_number, part_group, price, currency,
+            source_key, source_name, source_url
+        ) VALUES (?, ?, ?, ?, ?, 'GBP', ?, ?, ?)
+        """,
+        [(*item, PARTS_SOURCE_KEY, PARTS_SOURCE_NAME, PARTS_SOURCE_URL) for item in parts],
+    )
+
+
+def list_maintenance_rows(car_model: str) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        found = conn.execute(
+            """
+            SELECT mileage_km, replaced_parts, compulsory_amount, published_total, currency, source_name, source_url
+            FROM maintenance_schedule
+            WHERE car_model = ? AND source_key = ?
+            ORDER BY mileage_km
+            """,
+            (car_model, SERVICE_SOURCE_KEY),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "mileage_km": row[0],
+            "replaced_parts": row[1],
+            "compulsory_amount": row[2],
+            "published_total": row[3],
+            "currency": row[4],
+            "source_name": row[5],
+            "source_url": row[6],
+        }
+        for row in found
+    ]
+
+
+def list_spare_parts(car_model: str) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        found = conn.execute(
+            """
+            SELECT car_model, part_name, part_number, part_group, price, currency, source_name, source_url
+            FROM spare_part_prices
+            WHERE car_model = ? AND source_key = ?
+            ORDER BY part_group, part_name
+            """,
+            (car_model, PARTS_SOURCE_KEY),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "car_model": row[0],
+            "part_name": row[1],
+            "part_number": row[2],
+            "part_group": row[3],
+            "price": row[4],
+            "currency": row[5],
+            "source_name": row[6],
+            "source_url": row[7],
+        }
+        for row in found
+    ]
 
 
 def get_app_setting(key: str) -> str:
