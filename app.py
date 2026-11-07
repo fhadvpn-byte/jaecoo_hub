@@ -984,10 +984,13 @@ if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_s
         _SYNC_STATE["running"] = False
         _SYNC_STATE["done_at"] = 0
     st.success("تم تصفير المؤشر jaecoo_2026 وفك قفل الجلسة. السحب القادم يبدأ من 1/1/2026.")
-sync_feedback = st.empty()
-if st.session_state.get("sync_logs"):
-    with st.expander("سجل السحب الحي", expanded=True):
-        st.code("\n".join(st.session_state["sync_logs"]), language="text")
+with st.expander("🛠️ عرض تفاصيل وسجلات السحب الحي (اضغط للإخفاء/الإظهار)", expanded=False):
+    log_container = st.container(height=140)
+    with log_container:
+        log_status_box = st.empty()
+        log_progress_box = st.empty()
+        if st.session_state.get("sync_logs"):
+            log_status_box.code("\n".join(st.session_state["sync_logs"]), language="text")
 pull_col, analyze_col, sample_col = st.columns(3)
 with pull_col:
     if st.button("سحب رسائل القروب", use_container_width=True, key="public_pull"):
@@ -1016,38 +1019,36 @@ with pull_col:
 
             threading.Thread(target=_pull_worker, daemon=True).start()
 
-        with sync_feedback.container():
-            bar = st.progress(0.08, text=opening)
-            log_slot = st.empty()
-            with st.spinner("جاري سحب رسائل القروب..."):
-                while True:
-                    with _SYNC_GUARD:
-                        running = _SYNC_STATE["running"]
-                        lines = list(_SYNC_STATE["lines"])
-                        fraction = float(_SYNC_STATE["fraction"] or 0.0)
-                        message = str(_SYNC_STATE["message"] or "جاري السحب...")
-                        result = _SYNC_STATE["result"]
-                    log_slot.code("\n".join(lines) or message, language="text")
-                    bar.progress(min(1.0, max(0.0, fraction)), text=message)
-                    if not running:
-                        break
-                    time.sleep(0.4)
-            result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
-            fresh = get_db_connection()
-            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-            fresh.close()
-            total_cards = len(fresh_df)
-            if result.get("ok"):
-                lines.append(
-                    f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
-                    f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
-                    f"إجمالي القاعدة: {total_cards}."
-                )
-                bar.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
-            else:
-                lines.append(result.get("error") or "تعذر إكمال السحب.")
-                bar.progress(1.0, text="انتهى السحب")
-            log_slot.code("\n".join(lines), language="text")
+        log_progress_box.progress(0.08, text=opening)
+        log_status_box.code(opening, language="text")
+        while True:
+            with _SYNC_GUARD:
+                running = _SYNC_STATE["running"]
+                lines = list(_SYNC_STATE["lines"])
+                fraction = float(_SYNC_STATE["fraction"] or 0.0)
+                message = str(_SYNC_STATE["message"] or "جاري السحب...")
+                result = _SYNC_STATE["result"]
+            log_status_box.code("\n".join(lines) or message, language="text")
+            log_progress_box.progress(min(1.0, max(0.0, fraction)), text=message)
+            if not running:
+                break
+            time.sleep(0.4)
+        result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
+        fresh = get_db_connection()
+        fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+        fresh.close()
+        total_cards = len(fresh_df)
+        if result.get("ok"):
+            lines.append(
+                f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
+                f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
+                f"إجمالي القاعدة: {total_cards}."
+            )
+            log_progress_box.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
+        else:
+            lines.append(result.get("error") or "تعذر إكمال السحب.")
+            log_progress_box.progress(1.0, text="انتهى السحب")
+        log_status_box.code("\n".join(lines), language="text")
         st.session_state["sync_logs"] = lines
         if result.get("ok"):
             with metrics_box.container():
