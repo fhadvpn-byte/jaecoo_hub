@@ -68,6 +68,8 @@ class KnowledgeCardSchema(BaseModel):
         "التكييف والتبريد",
         "العضلات والفرامل والتعليق",
         "الهيكل الخارجي والمقصورة",
+        "الإكسسوارات ومنتجات AliExpress",
+        "تقييم العملية والمميزات والعيوب",
         "عام",
     ] = Field(description="النظام الفرعي. معلومات الوكيل والصيانة الدورية تستخدم أول خيارين.")
 
@@ -99,29 +101,65 @@ def is_dealer_or_maintenance_msg(text: str) -> bool:
     return any(keyword in text for keyword in DEALER_MAINTENANCE_KEYWORDS)
 
 
+def extract_urls(text: str) -> list:
+    if not text:
+        return []
+    return re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+
+
+def is_product_link_text(text: str) -> bool:
+    """روابط علي إكسبريس ومنتجات الإكسسوارات تُحفظ حتى لو كان النص قصيراً."""
+    raw = text or ""
+    lower = raw.lower()
+    return (
+        "aliexpress" in lower
+        or "علي اكسبرس" in raw
+        or "علي إكسبريس" in raw
+    )
+
+
+def is_owner_experience_msg(text: str) -> bool:
+    if not text:
+        return False
+    markers = (
+        "مميزات", "عيوب", "اعتمادية", "العزل", "صرفية", "رساوة",
+        "هل السيارة عملية", "تجربة السيارة", "بعد ممشى", "عملية السيارة",
+    )
+    return any(marker in text for marker in markers)
+
+
 SYSTEM_PROMPT = """
-أنت خبير فني ومستشار خدمات ما بعد البيع لسيارات جايكو (Jaecoo).
-استخرج بطاقة معرفية بالعربية الفصحى في مجالين:
+أنت خبير فني ومستشار لملاك سيارات جايكو (Jaecoo).
+استخرج بطاقة معرفية بالعربية الفصحى في أربعة مجالات:
 
-المجال الأول وله الأولوية: الوكيل والصيانة الدورية المعتمدة.
-- الوكيل الرسمي، الفروع، المدن، التواصل، وحجز المواعيد.
-- المراكز المعتمدة للصيانة الدورية داخل المدن وخارجها بما لا يسقط الضمان.
-- تكاليف صيانة 5000 و10000 و20000 كم، نوع الزيت، والقطع التي تُبدّل.
-- تجارب الضمان واستبدال القطع لدى الوكيل.
-- اجعل category = الصيانة الدورية والوكالات.
-- problem_or_topic هو الاستفسار، مثل تكلفة صيانة 10000 كم أو مراكز الصيانة المعتمدة.
-- solution_or_summary هو التفاصيل: اسم الوكيل أو المركز والمدينة والسعر والإجراء.
-- part_numbers_or_specs هو الزيت أو الفلتر أو اسم الفرع، وإلا فاكتب غير محدد.
-- sub_system يكون الوكيل والمراكز المعتمدة أو جدول وتكاليف الصيانة الدورية.
+المجال الأول: منتجات وإكسسوارات علي إكسبريس والتجهيزات.
+- أي رابط aliexpress.com أو s.click.aliexpress أو صورة إكسسوار (كفر مفتاح، دعاسات، شاحن، داش كام، حماية شاشة، ستائر، منظم، فلاتر) يعني is_worth_archiving = true.
+- category = الإكسسوارات والتجهيزات.
+- sub_system = الإكسسوارات ومنتجات AliExpress.
+- problem_or_topic = اسم الإكسسوار والغرض منه لسيارة جايكو.
+- solution_or_summary = المواصفات وانطباع العضو، مع إبقاء رابط الشراء كما هو.
+- part_numbers_or_specs = الرابط المباشر أو اسم القطعة.
 
-المجال الثاني: الأعطال، القطع البديلة، الشاشات، والتجهيزات.
-- الأعطال وحلولها، أرقام القطع، برمجة الشاشات، والإكسسوارات المجربة.
+المجال الثاني: الاعتمادية والعملية والمميزات والعيوب من تجارب الملاك.
+- إذا دار النقاش عن عملية السيارة أو مميزاتها أو عيوبها أو تجربة بعد ممشى أو العزل أو التكييف أو الصرفية أو رساوة الخط، اجعل is_worth_archiving = true.
+- category = تجارب القيادة والأداء الفعلي.
+- sub_system = تقييم العملية والمميزات والعيوب.
+- problem_or_topic = محور التقييم.
+- solution_or_summary = أولاً العملية والاعتمادية، ثم أبرز المميزات، ثم أبرز العيوب.
+
+المجال الثالث: الوكيل والصيانة الدورية المعتمدة.
+- الوكيل الرسمي، الفروع، المدن، الضمان، المراكز المعتمدة، وتكاليف صيانة 5000 و10000 و20000 كم.
+- category = الصيانة الدورية والوكالات.
+- sub_system = الوكيل والمراكز المعتمدة أو جدول وتكاليف الصيانة الدورية.
+- part_numbers_or_specs = الزيت أو الفلتر أو اسم الفرع، وإلا فاكتب غير محدد.
+
+المجال الرابع: الأعطال والحلول والشاشات والقطع البديلة.
+- صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو رقم القطعة أو جدول الصيانة يذهب إلى solution_or_summary.
 
 شروط صارمة:
-1. الحقول النصية بالعربية الفصحى فقط. ممنوع الجمل الإنجليزية وممنوع nan.
-2. يُسمح باسم الطراز أو رقم القطعة داخل جملة عربية.
-3. السؤال بلا إجابة والدردشة العامة تعني is_worth_archiving = false. لا تصنع بطاقة تكرر السؤال في خانة الحل. لا تتجاهل معلومة الوكيل أو الصيانة إذا وُجدت إجابة أو تفاصيل.
-5. إذا كانت الصورة أو الصوت أو الفيديو يشرح العطل فضعه في problem_or_topic، وإذا كان يشرح الحل أو رقم القطعة أو جدول الصيانة فضعه في solution_or_summary.
+1. الحقول النصية بالعربية الفصحى فقط. يُسمح بروابط الإنترنت وأرقام القطع وأسماء الطرازات.
+2. ممنوع الجمل الإنجليزية وممنوع nan.
+3. السؤال العابر بلا إجابة وبلا رابط منتج وبلا معلومة يعني is_worth_archiving = false. لا تكرر السؤال في خانة الحل.
 4. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
 """
 
@@ -304,10 +342,10 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                 "role": "system",
                 "content": (
                     "استخرج JSON فقط وبالعربية الفصحى. "
-                    "رسائل الوكيل والصيانة الدورية والضمان تُحفظ ولا تُتجاهل. "
-                    "إذا كانت الصورة أو الصوت أو الفيديو يشرح المشكلة فضعه في problem_or_topic، "
-                    "وإذا كان يشرح الحل أو رقم القطعة أو جدول الصيانة فضعه في solution_or_summary. "
-                    "السؤال بلا أي رد أو حل يعني is_worth_archiving = false، ولا تكرر السؤال في خانة الحل. "
+                    "احفظ روابط علي إكسبريس والإكسسوارات، وتجارب العملية والمميزات والعيوب، وبيانات الوكيل والصيانة. "
+                    "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
+                    "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
+                    "السؤال بلا رد وبلا رابط منتج يعني is_worth_archiving = false. "
                     "ممنوع إخراج nan."
                 ),
             },
@@ -322,20 +360,35 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         data["part_numbers_or_specs"] = "غير محدد"
     problem_text = str(data.get("problem_or_topic") or "")
     solution_text = str(data.get("solution_or_summary") or "")
-    question_only = any(
-        phrase in solution_text
-        for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل", "سؤال حول")
-    ) or (solution_text.strip() and solution_text.strip() == problem_text.strip())
-    if question_only:
+    has_arabic = bool(re.search(r"[\u0600-\u06FF]", problem_text + solution_text))
+    has_product = is_product_link_text(thread_text + "\n" + solution_text + "\n" + parts)
+    question_only = _solution_repeats_question(problem_text, solution_text)
+    if question_only and not has_product:
         data["is_worth_archiving"] = False
         return data
-    if is_dealer_or_maintenance_msg(thread_text) and re.search(r"[\u0600-\u06FF]", problem_text + solution_text):
+    if is_dealer_or_maintenance_msg(thread_text) and has_arabic:
         data["is_worth_archiving"] = True
         if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
             data["category"] = "الصيانة الدورية والوكالات"
+    elif has_product and (has_arabic or extract_urls(solution_text + "\n" + parts)):
+        data["is_worth_archiving"] = True
+        if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
+            data["category"] = "الإكسسوارات والتجهيزات"
+        if str(data.get("sub_system") or "") in {"", "عام"}:
+            data["sub_system"] = "الإكسسوارات ومنتجات AliExpress"
+        if parts.lower() in {"", "غير محدد", "nan", "none", "null"}:
+            product_urls = [url for url in extract_urls(thread_text) if "aliexpress" in url.lower()]
+            if product_urls:
+                data["part_numbers_or_specs"] = product_urls[0]
+    elif is_owner_experience_msg(thread_text) and has_arabic and not question_only:
+        data["is_worth_archiving"] = True
+        if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
+            data["category"] = "تجارب القيادة والأداء الفعلي"
+        if str(data.get("sub_system") or "") in {"", "عام"}:
+            data["sub_system"] = "تقييم العملية والمميزات والعيوب"
     elif data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
         data["is_worth_archiving"] = False
-    if _solution_repeats_question(problem_text, solution_text):
+    if question_only and not has_product:
         data["is_worth_archiving"] = False
     return data
 
@@ -343,7 +396,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
 def _solution_repeats_question(problem_text: str, solution_text: str) -> bool:
     solution = solution_text.strip()
     problem = problem_text.strip()
-    if any(phrase in solution for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل", "سؤال حول")):
+    if any(phrase in solution for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل محدد", "لا يوجد حل")):
         return True
     return bool(solution) and solution == problem
 
@@ -361,10 +414,9 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
     else:
         prompt = (
             "افحص هذه الصورة المرسلة في قروب سيارات جايكو (Jaecoo) بدقة وبالعربية. "
-            "إذا كانت توضح مشكلة أو عطلاً، مثل لمبة تحذير أو رسالة خطأ أو كسر أو تهريب، "
-            "فابدأ بـ [صورة توضح مشكلة]: واشرح العطل. "
-            "إذا كانت توضح حلاً أو معلومة، مثل قطعة مع رقمها أو فاتورة أو جدول صيانة أو مكان فيوز، "
-            "فابدأ بـ [صورة توضح حلاً/معلومة]: واستخرج البيانات والأرقام. "
+            "إذا كانت منتجاً أو إكسسواراً من علي إكسبريس أو متجر إلكتروني، فابدأ بـ [صورة منتج/إكسسوار]: واذكر الاسم والفائدة والسعر إن ظهر. "
+            "إذا كانت توضح مشكلة أو عطلاً، مثل لمبة تحذير أو رسالة خطأ أو كسر أو تهريب، فابدأ بـ [صورة توضح مشكلة]: واشرح العطل. "
+            "إذا كانت قطعة غيار أو جدول صيانة أو حلاً فنياً، فابدأ بـ [صورة توضح حلاً/معلومة]: واستخرج البيانات والأرقام. "
             f"تعليق العضو المرفق مع الصورة: {caption}"
         )
     client = Groq(api_key=api_key)

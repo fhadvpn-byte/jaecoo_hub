@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
+from datetime import datetime, timezone
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -13,9 +15,12 @@ from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
     compress_image_to_b64,
+    extract_urls,
     get_db_connection,
     init_db,
     is_dealer_or_maintenance_msg,
+    is_owner_experience_msg,
+    is_product_link_text,
     load_config,
     save_card,
     save_config,
@@ -24,12 +29,14 @@ from database_and_ai import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+_CLIENT_LOCK = threading.Lock()
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PERSONAL_SESSION_FILE = os.path.join(PROJECT_DIR, "user_session.session")
 RUNTIME_SESSION_FILE = os.path.join(PROJECT_DIR, f"scraper_runtime_{os.getpid()}.session")
 DEFAULT_API_ID = 2040
 DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
+START_SYNC_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _REQUIRED_CARD_FIELDS = (
     "category",
     "car_model",
@@ -159,9 +166,27 @@ def _preview_b64(image_bytes: bytes | None) -> str:
         return ""
 
 
+def _url_note(text: str) -> str:
+    urls = extract_urls(text)
+    if not urls:
+        return ""
+    return f"\n[روابط مرفقة في الرسالة: {' | '.join(urls)}]"
+
+
+def _message_is_after_start(message) -> bool:
+    msg_date = getattr(message, "date", None)
+    if msg_date is None:
+        return True
+    if msg_date.tzinfo is None:
+        msg_date = msg_date.replace(tzinfo=timezone.utc)
+    return msg_date >= START_SYNC_DATE
+
+
 async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str, str]:
     """يعيد النص ونوع الوسيط ونسخة الصورة المضغوطة."""
     caption = (message.message or message.text or "").strip()
+    url_note = _url_note(caption)
+    caption_for_ai = f"{caption}{url_note}".strip()
     kind = detect_msg_media_kind(message)
     file_ext = getattr(getattr(message, "file", None), "ext", None) or ""
     if kind == "image":
@@ -172,26 +197,26 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
             document = getattr(message, "document", None)
             if document and getattr(document, "mime_type", None):
                 mime = document.mime_type
-            vision_text = analyze_image_bytes(groq_key, image_bytes, caption, mime)
-            return f"{vision_text}\nالنص المرفق: {caption}".strip(), "image", preview
-        return caption, "image", preview
+            vision_text = analyze_image_bytes(groq_key, image_bytes, caption_for_ai, mime)
+            return f"{vision_text}\nالنص والروابط: {caption}{url_note}".strip(), "image", preview
+        return f"{caption}{url_note}".strip(), "image", preview
 
     if kind == "audio":
         audio_bytes = await tg_client.download_media(message, file=bytes)
         if audio_bytes:
             spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=file_ext or ".ogg")
-            return f"[مقطع صوتي مفرغ نصياً]: {spoken_text}\nتعليق مرفق: {caption}".strip(), "audio", ""
-        return caption, "audio", ""
+            return f"[مقطع صوتي مفرغ نصياً]: {spoken_text}\nتعليق: {caption}{url_note}".strip(), "audio", ""
+        return f"{caption}{url_note}".strip(), "audio", ""
 
     if kind == "video":
-        parts = [f"تعليق الفيديو: {caption}"] if caption else []
+        parts = [f"تعليق الفيديو: {caption}{url_note}"] if caption or url_note else []
         try:
             thumb_bytes = await tg_client.download_media(message, file=bytes, thumb=-1)
         except Exception:
             thumb_bytes = None
         preview = _preview_b64(thumb_bytes)
         if thumb_bytes:
-            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption, "video/thumb")
+            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption_for_ai, "video/thumb")
             parts.append(f"[المشهد المرئي في الفيديو]: {thumb_desc}")
         file_size = getattr(getattr(message, "file", None), "size", 0) or 0
         if 0 < file_size <= 20 * 1024 * 1024:
@@ -202,13 +227,13 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
                     parts.append(f"[الكلام المنطوق داخل الفيديو]: {spoken_video}")
         return "\n".join(part for part in parts if part.strip()), "video", preview
 
-    return caption, "text", ""
+    return f"{caption}{url_note}".strip(), "text", ""
 
 
 def _ignore_source(text: str) -> bool:
     """يتجاوز الرسائل العامة والأسئلة الإنجليزية والنصوص غير الواضحة قبل استدعاء Groq."""
     stripped = text.strip()
-    if is_dealer_or_maintenance_msg(stripped) or _has_arabic(stripped):
+    if is_dealer_or_maintenance_msg(stripped) or is_product_link_text(stripped) or is_owner_experience_msg(stripped) or _has_arabic(stripped):
         return False
     lower_words = stripped.lower().split()
     if "?" in stripped or (lower_words and lower_words[0] in {"what", "why", "how", "when", "where", "who", "can", "does", "do", "is", "are"}):
@@ -344,7 +369,7 @@ def _should_analyze_message(message) -> bool:
     if detect_msg_media_kind(message) != "text":
         return True
     text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
-    if is_dealer_or_maintenance_msg(text):
+    if is_dealer_or_maintenance_msg(text) or is_product_link_text(text) or is_owner_experience_msg(text):
         return True
     return len(text) >= 15
 
@@ -385,18 +410,33 @@ async def _open_client(cfg: dict, logs: list):
     api_id, api_hash = _api_credentials(cfg)
     if os.path.exists(PERSONAL_SESSION_FILE):
         session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
-        client = TelegramClient(session_name, api_id, api_hash, timeout=30)
-        if await _connect_saved_client(client, logs, "تم الاتصال بملف الجلسة المحلي user_session.session."):
-            return client, None
+        client = TelegramClient(session_name, api_id, api_hash, timeout=30, receive_updates=False)
+        try:
+            if await _connect_saved_client(client, logs, "تم الاتصال بملف الجلسة المحلي user_session.session."):
+                return client, None
+        except Exception:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
 
     session_text = _session_string(cfg)
     if session_text:
         try:
-            client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30)
+            client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30, receive_updates=False)
         except Exception:
             client = None
-        if client is not None and await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية."):
-            return client, None
+        if client is not None:
+            try:
+                if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية."):
+                    return client, None
+            except Exception:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise
 
     return None, "تعذر الاتصال بجلسة تيليجرام."
 
@@ -416,7 +456,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
     try:
         client, error = await _open_client(cfg, logs)
     except Exception as exc:
-        result["error"] = f"تعذر الاتصال بتلجرام: {exc}"
+        result["error"] = _telegram_error_message(exc)
         _note(logs, result["error"], "error")
         return result
     if error:
@@ -454,16 +494,23 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         group_key = chat_id
         last_id = get_last_synced_id(group_key)
         batch_limit = int(limit) if limit else None
-        _report(
-            on_progress,
-            f"بدأ السحب التسلسلي من الرسالة رقم {last_id + 1}، من أقدم رسائل القروب باتجاه اليوم.",
-            0.2,
-        )
+        if last_id > 0:
+            start_note = f"يكمل السحب من الرسالة رقم {last_id + 1} بعد تاريخ 1/1/2026."
+        else:
+            start_note = "يبدأ السحب من تاريخ 1/1/2026 باتجاه أحدث الرسائل."
+        _report(on_progress, start_note, 0.2)
         _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}.")
 
         raw_messages = []
         highest_id = last_id
-        async for message in client.iter_messages(target, reverse=True, min_id=last_id, limit=batch_limit):
+        iter_kwargs = {"reverse": True, "limit": batch_limit}
+        if last_id > 0:
+            iter_kwargs["min_id"] = last_id
+        else:
+            iter_kwargs["offset_date"] = START_SYNC_DATE
+        async for message in client.iter_messages(target, **iter_kwargs):
+            if not _message_is_after_start(message):
+                continue
             result["scanned"] += 1
             highest_id = message.id
             fraction = min(0.55, 0.25 + (0.3 * result["scanned"] / max(batch_limit or result["scanned"], 1)))
@@ -520,7 +567,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     best_thumb = media_b64
 
             thread_text = "\n\n".join(blocks).strip()
-            if len(thread_text) < 20 or _ignore_source("\n".join(raw_parts)):
+            content = "\n".join(raw_parts)
+            has_product = is_product_link_text(content)
+            if (len(content.strip()) < 15 and not has_product and dominant_media == "text") or _ignore_source(content):
                 continue
             _report(
                 on_progress,
@@ -562,7 +611,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:
-        result["error"] = f"تعذر سحب الرسائل: {exc}"
+        result["error"] = _telegram_error_message(exc)
         _note(logs, result["error"], "error")
         return result
     finally:
@@ -576,17 +625,41 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             pass
 
 
+def _telegram_error_message(exc: Exception) -> str:
+    text = str(exc)
+    if "authorization key" in text.lower() or "AuthKeyDuplicated" in text:
+        return (
+            "أُلغيت جلسة تيليجرام لأنها فُتحت من أكثر من مكان في الوقت نفسه. "
+            "ولّد كود جلسة جديد من جهازك، ضعه في TELEGRAM_SESSION، واحذف ملف user_session.session القديم."
+        )
+    if text.startswith("تعذر"):
+        return text
+    return f"تعذر سحب الرسائل: {text}"
+
+
 def run_sync(limit: int = 50, on_progress=None) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
+    if not _CLIENT_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "saved": 0,
+            "scanned": 0,
+            "group": "",
+            "error": "توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام.",
+            "logs": [],
+        }
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))
 
-    import concurrent.futures
+        import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))).result()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))).result()
+    finally:
+        _CLIENT_LOCK.release()
 
 
 if __name__ == "__main__":

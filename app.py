@@ -2,6 +2,7 @@ import base64
 import hmac
 import html
 import os
+import re
 import secrets
 from pathlib import Path
 import threading
@@ -78,6 +79,7 @@ def clean_database() -> None:
             DELETE FROM knowledge_cards
             WHERE title LIKE '%جزء جميلة%'
                OR problem_or_topic LIKE '%User asks about%'
+               OR solution_or_summary LIKE '%الرسالة تطلب معلومات%'
             """
         )
         conn.commit()
@@ -122,6 +124,26 @@ def _prepare_lab_source(lab_text: str, lab_file, api_key: str) -> tuple[str, str
         spoken_text = transcribe_media_bytes(api_key, media_bytes, extension or ".mp4")
         return f"الكلام المسموع في الفيديو: {spoken_text}\nتعليق الفيديو: {caption}".strip(), "video", ""
     return caption or "حلل المرفق", "text", ""
+
+
+def format_clickable_links(text: str) -> str:
+    """يحوّل روابط علي إكسبريس وغيرها إلى روابط قابلة للضغط بعد تهريب النص."""
+    if not text:
+        return ""
+    pattern = re.compile(r"https?://[^\s<>\"]+")
+    parts = []
+    last = 0
+    for match in pattern.finditer(text):
+        parts.append(html.escape(text[last:match.start()]))
+        url = match.group(0)
+        safe_url = html.escape(url, quote=True)
+        label = "🛒 اضغط هنا لفتح رابط المنتج (AliExpress)" if "aliexpress" in url.lower() else "🔗 فتح الرابط"
+        parts.append(
+            f'<a href="{safe_url}" target="_blank" style="color:#00e5ff; font-weight:bold; text-decoration:underline;">{label}</a>'
+        )
+        last = match.end()
+    parts.append(html.escape(text[last:]))
+    return "".join(parts).replace("\n", "<br>")
 
 
 def _card_text(value) -> str:
@@ -863,7 +885,7 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
     )
 
 limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
-st.caption("كل ضغطة تكمل من آخر رسالة توقفت عندها، بدءاً من أقدم رسائل القروب.")
+st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. أول سحب يبدأ من هذا التاريخ باتجاه اليوم.")
 sync_feedback = st.empty()
 if st.session_state.get("sync_logs"):
     with st.expander("سجل السحب الحي", expanded=True):
@@ -988,6 +1010,8 @@ with st.expander("➕ إضافة بطاقة معرفية يدوياً", expanded
         "التكييف والتبريد",
         "العضلات والفرامل والتعليق",
         "الهيكل الخارجي والمقصورة",
+        "الإكسسوارات ومنتجات AliExpress",
+        "تقييم العملية والمميزات والعيوب",
         "عام",
     ], key="manual_sub")
     m_prob = st.text_area("الوصف / المشكلة", key="manual_prob")
@@ -1077,7 +1101,7 @@ if search_q.strip() and not filtered_df.empty:
     )
     filtered_df = filtered_df[mask]
 
-categories = ["الكل", "الأعطال والتشخيص", "الإصلاحات والحلول المؤكدة", "بنك القطع البديلة والمطابقات", "الأنظمة الذكية والشاشات", "الصيانة الدورية والوكالات", "الإكسسوارات والتجهيزات"]
+categories = ["الكل", "الأعطال والتشخيص", "الإصلاحات والحلول المؤكدة", "بنك القطع البديلة والمطابقات", "الأنظمة الذكية والشاشات", "الصيانة الدورية والوكالات", "الإكسسوارات والتجهيزات", "تجارب القيادة والأداء الفعلي"]
 selected_cat = st.radio("الأقسام:", categories, horizontal=True)
 
 if selected_cat != "الكل" and not filtered_df.empty:
@@ -1111,10 +1135,10 @@ else:
     for _, row in filtered_df.iterrows():
         card_id = int(row["id"])
         title_safe = html.escape(_card_text(row.get("title")))
-        prob_safe = html.escape(_card_text(row.get("problem_or_topic")))
-        sol_safe = html.escape(_card_text(row.get("solution_or_summary")))
+        prob_safe = format_clickable_links(_card_text(row.get("problem_or_topic")))
+        sol_safe = format_clickable_links(_card_text(row.get("solution_or_summary")))
         parts_raw = _card_text(row.get("part_numbers_or_specs"))
-        parts_safe = html.escape(parts_raw)
+        parts_safe = format_clickable_links(parts_raw)
         car_safe = html.escape(_card_text(row.get("car_model")))
         sub_safe = html.escape(_card_text(row.get("sub_system")))
         cat_safe = html.escape(_card_text(row.get("category")))
