@@ -45,6 +45,7 @@ DEFAULT_API_ID = 2040
 DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
 START_SYNC_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SYNC_GROUP_KEY = "jaecoo_2026"
+SYNC_CHAIN_BATCH = 500
 _REQUIRED_CARD_FIELDS = (
     "category",
     "car_model",
@@ -525,122 +526,158 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
         group_key = SYNC_GROUP_KEY
-        last_id = get_last_synced_id(group_key)
-        batch_limit = int(limit) if limit else None
-        if last_id > 0:
-            start_note = f"يكمل السحب من الرسالة رقم {last_id + 1} بعد تاريخ 1/1/2026."
-        else:
-            start_note = "يبدأ السحب من تاريخ 1/1/2026 باتجاه أحدث الرسائل."
-        _report(on_progress, start_note, 0.2)
-        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}.")
+        requested = max(1, int(limit or SYNC_CHAIN_BATCH))
 
-        raw_messages = []
-        highest_id = last_id
-        iter_kwargs = {"reverse": True, "limit": batch_limit}
+        def _span(done_units: float) -> float:
+            return min(0.98, 0.08 + 0.90 * (done_units / requested))
+
+        last_id = get_last_synced_id(group_key)
         if last_id > 0:
-            iter_kwargs["min_id"] = last_id
+            start_note = (
+                f"يكمل السحب من الرسالة رقم {last_id + 1} بعد تاريخ 1/1/2026. "
+                f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
+            )
         else:
-            iter_kwargs["offset_date"] = START_SYNC_DATE
-        async for message in client.iter_messages(target, **iter_kwargs):
-            if not _message_is_after_start(message):
-                continue
-            result["scanned"] += 1
-            highest_id = message.id
-            fraction = min(0.55, 0.25 + (0.3 * result["scanned"] / max(batch_limit or result["scanned"], 1)))
-            msg_date = message.date.strftime("%Y-%m-%d") if getattr(message, "date", None) else ""
+            start_note = (
+                f"يبدأ السحب من تاريخ 1/1/2026. "
+                f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
+            )
+        _report(on_progress, start_note, 0.08)
+        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}. المطلوب {requested}.")
+
+        pulled = 0
+        batch_no = 0
+        while pulled < requested:
+            batch_no += 1
+            last_id = get_last_synced_id(group_key)
+            this_limit = min(SYNC_CHAIN_BATCH, requested - pulled)
+            batch_base = pulled
+            raw_messages = []
+            highest_id = last_id
+            fetched = 0
+            iter_kwargs = {"reverse": True, "limit": this_limit}
+            if last_id > 0:
+                iter_kwargs["min_id"] = last_id
+            else:
+                iter_kwargs["offset_date"] = START_SYNC_DATE
             _report(
                 on_progress,
-                (
-                    f"جاري فحص الرسالة رقم {message.id} | التاريخ {msg_date} | "
-                    f"تم فحص {result['scanned']} | بطاقات {result['saved']}"
-                ),
-                fraction,
+                f"الدفعة {batch_no}: سحب {this_limit} رسالة. المفحوص حتى الآن {pulled} من {requested}.",
+                _span(batch_base),
             )
-            raw_messages.append(message)
-        referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
-        batch = [
-            message for message in raw_messages
-            if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
-        ]
+            async for message in client.iter_messages(target, **iter_kwargs):
+                fetched += 1
+                pulled += 1
+                highest_id = message.id
+                if not _message_is_after_start(message):
+                    continue
+                result["scanned"] += 1
+                fraction = _span(batch_base + fetched * 0.45)
+                msg_date = message.date.strftime("%Y-%m-%d") if getattr(message, "date", None) else ""
+                _report(
+                    on_progress,
+                    (
+                        f"الدفعة {batch_no}: الرسالة رقم {message.id} | التاريخ {msg_date} | "
+                        f"تم فحص {result['scanned']} من {requested} | بطاقات {result['saved']}"
+                    ),
+                    fraction,
+                )
+                raw_messages.append(message)
+            if fetched == 0 or highest_id <= last_id:
+                _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
+                break
 
-        threads = _group_reply_threads(batch)
-        thread_total = max(len(threads), 1)
-        for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
-            fraction = min(0.95, 0.55 + (0.4 * thread_index / thread_total))
-            blocks = []
-            raw_parts = []
-            dominant_media = "text"
-            best_thumb = ""
-            author_name = "عضو"
-            for index, message in enumerate(thread_messages):
-                role = "الرسالة الأساسية (طرح المشكلة أو الموضوع)" if index == 0 else f"الرد رقم {index} (الإجابة أو الحل)"
-                if index == 0:
+            referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
+            batch = [
+                message for message in raw_messages
+                if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
+            ]
+
+            threads = _group_reply_threads(batch)
+            thread_total = max(len(threads), 1)
+            for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
+                fraction = _span(batch_base + fetched * (0.45 + 0.55 * thread_index / thread_total))
+                blocks = []
+                raw_parts = []
+                dominant_media = "text"
+                best_thumb = ""
+                author_name = "عضو"
+                for index, message in enumerate(thread_messages):
+                    role = "الرسالة الأساسية (طرح المشكلة أو الموضوع)" if index == 0 else f"الرد رقم {index} (الإجابة أو الحل)"
+                    if index == 0:
+                        try:
+                            sender = await message.get_sender()
+                            author_name = getattr(sender, "first_name", None) or "عضو"
+                        except Exception:
+                            author_name = "عضو"
                     try:
-                        sender = await message.get_sender()
-                        author_name = getattr(sender, "first_name", None) or "عضو"
-                    except Exception:
-                        author_name = "عضو"
+                        parsed_text, media_kind, media_b64 = await _run_with_backoff(
+                            lambda message=message: _extract_message_content(client, groq_key, message),
+                            on_progress,
+                        )
+                    except Exception as exc:
+                        _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
+                        _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
+                        continue
+                    if media_kind != "text":
+                        await asyncio.sleep(1.5)
+                    if (parsed_text or "").strip():
+                        raw_parts.append(parsed_text.strip())
+                        blocks.append(f"--- {role} (نوعها: {media_kind}) ---\n{parsed_text}")
+                    if {"text": 0, "image": 1, "audio": 2, "video": 3}[media_kind] > {"text": 0, "image": 1, "audio": 2, "video": 3}[dominant_media]:
+                        dominant_media = media_kind
+                    if media_b64 and not best_thumb:
+                        best_thumb = media_b64
+
+                thread_text = "\n\n".join(blocks).strip()
+                content = "\n".join(raw_parts)
+                has_product = is_product_link_text(content)
+                if _ignore_source(content):
+                    continue
+                if not has_product and not is_car_related_thread(content, dominant_media):
+                    _report(on_progress, f"تخطي النقاش {root_id}: دردشة غير متعلقة بالسيارة.", fraction)
+                    continue
+                _report(
+                    on_progress,
+                    f"الدفعة {batch_no}: تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
+                    fraction,
+                )
                 try:
-                    parsed_text, media_kind, media_b64 = await _run_with_backoff(
-                        lambda message=message: _extract_message_content(client, groq_key, message),
+                    card = await _run_with_backoff(
+                        lambda thread_text=thread_text, fraction=fraction: analyze_thread_with_ai(
+                            thread_text,
+                            groq_key,
+                            on_switch=lambda note, fraction=fraction: _report(on_progress, note, fraction),
+                        ),
                         on_progress,
                     )
                 except Exception as exc:
-                    _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
-                    _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
+                    _note(logs, f"تخطي النقاش {root_id}: {exc}", "error")
+                    _report(on_progress, f"النقاش {root_id}: تعذر تحليله عبر Groq.", fraction)
                     continue
-                if media_kind != "text":
-                    await asyncio.sleep(1.5)
-                if (parsed_text or "").strip():
-                    raw_parts.append(parsed_text.strip())
-                    blocks.append(f"--- {role} (نوعها: {media_kind}) ---\n{parsed_text}")
-                if {"text": 0, "image": 1, "audio": 2, "video": 3}[media_kind] > {"text": 0, "image": 1, "audio": 2, "video": 3}[dominant_media]:
-                    dominant_media = media_kind
-                if media_b64 and not best_thumb:
-                    best_thumb = media_b64
-
-            thread_text = "\n\n".join(blocks).strip()
-            content = "\n".join(raw_parts)
-            has_product = is_product_link_text(content)
-            if _ignore_source(content):
-                continue
-            if not has_product and not is_car_related_thread(content, dominant_media):
-                _report(on_progress, f"تخطي النقاش {root_id}: دردشة غير متعلقة بالسيارة.", fraction)
-                continue
-            _report(
-                on_progress,
-                f"جاري تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
-                fraction,
-            )
-            try:
-                card = await _run_with_backoff(
-                    lambda thread_text=thread_text: analyze_thread_with_ai(
-                        thread_text,
-                        groq_key,
-                        on_switch=lambda note: _report(on_progress, note, fraction),
-                    ),
+                await asyncio.sleep(1.5)
+                if not _worth_archiving(card):
+                    _report(on_progress, f"النقاش {root_id}: لا يحتوي حلاً كافياً لحفظ بطاقة.", fraction)
+                    continue
+                thread_url = f"https://t.me/c/{public_id}/{root_id}"
+                save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb)
+                result["saved"] += 1
+                _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                _report(
                     on_progress,
+                    f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
+                    fraction,
                 )
-            except Exception as exc:
-                _note(logs, f"تخطي النقاش {root_id}: {exc}", "error")
-                _report(on_progress, f"النقاش {root_id}: تعذر تحليله عبر Groq.", fraction)
-                continue
-            await asyncio.sleep(1.5)
-            if not _worth_archiving(card):
-                _report(on_progress, f"النقاش {root_id}: لا يحتوي حلاً كافياً لحفظ بطاقة.", fraction)
-                continue
-            thread_url = f"https://t.me/c/{public_id}/{root_id}"
-            save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb)
-            result["saved"] += 1
-            _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+
+            update_last_synced_id(highest_id, group_key)
             _report(
                 on_progress,
-                f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
-                fraction,
+                f"اكتملت الدفعة {batch_no}. المفحوص {pulled} من {requested}، والبطاقات {result['saved']}.",
+                _span(pulled),
             )
-
-        if highest_id > last_id:
-            update_last_synced_id(highest_id, group_key)
+            if fetched < this_limit:
+                _report(on_progress, "وصل السحب إلى آخر رسائل القروب المتاحة.", _span(pulled))
+                break
 
         result["ok"] = True
         _report(

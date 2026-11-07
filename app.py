@@ -970,14 +970,14 @@ if _telegram_login_needed(cfg):
 
 limit_val = st.slider(
     "عدد الرسائل في السحبة الواحدة",
-    min_value=50,
-    max_value=500,
-    value=250,
-    step=50,
-    key="public_pull_limit_batch",
-    help="يسحب حتى 500 رسالة في الدفعة الواحدة، ويكمل تلقائياً من آخر رسالة توقف عندها بدءاً من 1/1/2026.",
+    min_value=500,
+    max_value=10000,
+    value=2000,
+    step=500,
+    key="public_pull_limit_archive",
+    help="يسحب حتى 10,000 رسالة في الضغطة الواحدة، على دفعات تلقائية من 500، ويكمل من آخر رسالة بعد 1/1/2026.",
 )
-st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. أول سحب يبدأ من هذا التاريخ باتجاه اليوم.")
+st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. السحب الكبير يُقسَّم إلى دفعات من 500 مع شريط تقدم مستمر.")
 if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_sync_2026"):
     reset_sync_checkpoint()
     with _SYNC_GUARD:
