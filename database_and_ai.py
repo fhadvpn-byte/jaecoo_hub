@@ -162,9 +162,7 @@ SYSTEM_PROMPT = """
 2. ممنوع الجمل الإنجليزية وممنوع nan.
 3. السؤال العابر بلا إجابة وبلا رابط منتج وبلا معلومة يعني is_worth_archiving = false. لا تكرر السؤال في خانة الحل.
 4. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
-5. منظومة SHS الهجينة لسيارة Jaecoo J8 تُصنَّف حصراً car_model = Jaecoo J8 SHS، وليس Jaecoo J8.
-   يكفي ذكر أي اختصار: SHS، هايبرد، هجين، الهجينة، الكهربائية، الشاحن، محرك الشحن، البطارية الكبيرة، الفيش.
-   إذا ذُكر J7 أو J5 صراحة ولم تُذكر J8 ولا كلمة SHS، أبقِ طراز تلك السيارة.
+5. أي ذكر لـ SHS أو هجين أو هايبرد أو بطارية أو شاحن يُصنَّف فوراً car_model = Jaecoo J8 SHS، وليس Jaecoo J8 ولا جميع الطرازات / عام.
 """
 
 # ==========================================
@@ -342,12 +340,9 @@ CAR_THREAD_KEYWORDS = [
     "هايبرد", "هجين", "الهجينة", "الكهربائية", "الشاحن", "محرك الشحن", "البطارية الكبيرة", "الفيش",
 ]
 SHS_MODEL_KEYWORDS = [
-    "shs", "hybrid", "phev", "هايبرد", "هجين", "الكهربائية", "الشاحن", "شاحن",
+    "shs", "hybrid", "phev", "هايبرد", "هجين", "بطارية", "الكهربائية", "الشاحن", "شاحن",
     "محرك الشحن", "البطارية الكبيرة", "الفيش", "فيش",
 ]
-_SHS_STRONG_KEYWORDS = ("shs", "hybrid", "phev", "هايبرد", "هجين", "محرك الشحن", "البطارية الكبيرة")
-_J8_MODEL_MARKERS = ("j8", "جي 8", "جيه 8", "جايكو 8", "جايكو ٨")
-_OTHER_MODEL_MARKERS = ("j7", "j5", "جي 7", "جيه 7", "جي 5", "جيه 5", "جايكو 7", "جايكو 5")
 EXPERT_GUIDELINES_TOPICS = [
     "خطوات", "استلام", "الوكيل", "المعرض", "فحص", "تشييك", "قبل الخروج",
     "دليل", "نصائح", "تعليمات", "ملاحظات", "الترخيص", "اللوحات", "التأمين",
@@ -356,15 +351,21 @@ EXPERT_GUIDELINES_TOPICS = [
 ]
 
 
+def has_analyzable_text(text: str) -> bool:
+    """يكفي أن يزيد النص على خمس كلمات حتى يُرسل إلى الذكاء الاصطناعي."""
+    words = [word for word in re.split(r"\s+", (text or "").strip()) if word]
+    return len(words) > 5
+
+
 def is_car_related_thread(text: str, media_type: str = "text") -> bool:
-    """يلتقط الأعطال وقوائم الفحص وخطوات الاستلام والنصائح ومنتجات AliExpress. الوسائط تُحلَّل دائماً."""
+    """يمرر الصور والفيديو والصوت، وأي نص أطول من خمس كلمات، دون فلتر كلمات محلي."""
     if media_type in {"image", "audio", "video"}:
         return True
-    lowered = (text or "").strip().lower()
-    if len(lowered) < 15:
-        return False
-    allowed = CAR_THREAD_KEYWORDS + EXPERT_GUIDELINES_TOPICS
-    return any(keyword in lowered for keyword in allowed)
+    return has_analyzable_text(text)
+
+
+def should_analyze_thread(text: str, media_type: str = "text") -> bool:
+    return is_car_related_thread(text, media_type)
 
 
 def collect_groq_keys(primary: str = "") -> list[str]:
@@ -442,13 +443,7 @@ def force_j8_shs_model(data: dict, source_text: str = "") -> dict:
             data.get("part_numbers_or_specs"),
         )
     )
-    lowered = blob.lower()
     if not text_mentions_shs(blob):
-        return data
-    mentions_j8 = any(marker in lowered for marker in _J8_MODEL_MARKERS)
-    mentions_other = any(marker in lowered for marker in _OTHER_MODEL_MARKERS)
-    strong = any(keyword in lowered for keyword in _SHS_STRONG_KEYWORDS)
-    if mentions_other and not mentions_j8 and not strong:
         return data
     data["car_model"] = "Jaecoo J8 SHS"
     return data
@@ -502,8 +497,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                     "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
                     "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
                     "السؤال بلا رد وبلا رابط منتج يعني is_worth_archiving = false. "
-                    "إذا ذُكر SHS أو هايبرد أو هجين أو الشاحن أو البطارية الكبيرة أو الفيش لسيارة J8، "
-                    "فاجعل car_model هو Jaecoo J8 SHS حصراً. "
+                    "أي ذكر لـ SHS أو هجين أو هايبرد أو بطارية أو شاحن يعني car_model = Jaecoo J8 SHS فوراً. "
                     "ممنوع إخراج nan."
                 ),
             },
@@ -577,7 +571,7 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
             "إذا كانت توضح مشكلة أو عطلاً، مثل لمبة تحذير أو رسالة خطأ أو كسر أو تهريب، فابدأ بـ [صورة توضح مشكلة]: واشرح العطل. "
             "إذا كانت قطعة غيار أو جدول صيانة أو حلاً فنياً، فابدأ بـ [صورة توضح حلاً/معلومة]: واستخرج البيانات والأرقام. "
             "إذا ظهرت منظومة Jaecoo J8 SHS الهجينة، أو شعار SHS، أو منفذ الشحن (الفيش)، أو البطارية الكبيرة، أو وضع الهايبرد، "
-            "فاذكر ذلك صراحة بالكلمات: SHS، هجين، الشاحن، البطارية الكبيرة. "
+            "فاذكر ذلك صراحة بالكلمات: SHS، هجين، هايبرد، بطارية، شاحن. "
             f"تعليق العضو المرفق مع الصورة: {caption}"
         )
     client = Groq(api_key=api_key)

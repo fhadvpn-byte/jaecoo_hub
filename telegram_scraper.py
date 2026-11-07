@@ -20,7 +20,8 @@ from database_and_ai import (
     extract_urls,
     get_db_connection,
     init_db,
-    is_car_related_thread,
+    has_analyzable_text,
+    should_analyze_thread,
     is_dealer_or_maintenance_msg,
     load_telegram_session,
     mark_telegram_session_invalid,
@@ -407,7 +408,7 @@ def _should_analyze_message(message) -> bool:
     text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
     if is_dealer_or_maintenance_msg(text) or is_product_link_text(text) or is_owner_experience_msg(text):
         return True
-    return len(text) >= 15
+    return has_analyzable_text(text)
 
 
 async def _run_with_backoff(factory, on_progress):
@@ -634,8 +635,8 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 has_product = is_product_link_text(content)
                 if _ignore_source(content):
                     continue
-                if not has_product and not is_car_related_thread(content, dominant_media):
-                    _report(on_progress, f"تخطي النقاش {root_id}: دردشة غير متعلقة بالسيارة.", fraction)
+                if not has_product and not should_analyze_thread(content, dominant_media):
+                    _report(on_progress, f"تخطي النقاش {root_id}: النص أقصر من ست كلمات.", fraction)
                     continue
                 _report(
                     on_progress,
