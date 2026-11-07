@@ -5,6 +5,7 @@ __pycache__/
 *.db-shm
 *.session
 *.session-journal
+user_session.session
 telegram_string_session.txt
 jaecoo_session*
 jaecoo_bot_session*

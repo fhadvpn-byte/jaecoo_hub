@@ -207,8 +207,60 @@ def init_db():
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+def get_app_setting(key: str) -> str:
+    try:
+        conn = get_db_connection()
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        conn.close()
+    except sqlite3.Error:
+        return ""
+    return str(row[0] or "").strip() if row else ""
+
+
+def set_app_setting(key: str, value: str) -> None:
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_telegram_session() -> str:
+    return get_app_setting("telegram_string_session")
+
+
+def save_telegram_session(session_text: str) -> None:
+    """يحفظ String Session الجديدة محلياً ويعلّم الجلسة صالحة."""
+    set_app_setting("telegram_string_session", session_text.strip())
+    set_app_setting("telegram_session_status", "ok")
+    cfg = load_config()
+    cfg["tg_session"] = session_text.strip()
+    save_config(cfg)
+
+
+def mark_telegram_session_invalid() -> None:
+    set_app_setting("telegram_session_status", "invalid")
+
+
+def telegram_session_status() -> str:
+    return get_app_setting("telegram_session_status")
+
 
 def compress_image_to_b64(image_bytes: bytes, max_size: int = 600, quality: int = 70) -> str:
     """يصغّر الصورة إلى 600×600 وجودة JPEG 70٪ ثم يعيدها كنص Base64."""

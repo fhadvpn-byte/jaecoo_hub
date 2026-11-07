@@ -18,14 +18,23 @@ from database_and_ai import (
     compress_image_to_b64,
     find_matching_solution_in_db,
     generate_daily_pulse_summary,
+    get_app_setting,
     get_db_connection,
     init_db,
     load_config,
+    load_telegram_session,
     save_card,
     save_config,
+    telegram_session_status,
     transcribe_media_bytes,
 )
-from telegram_scraper import PERSONAL_SESSION_FILE, reset_sync_checkpoint, run_sync
+from telegram_scraper import (
+    PERSONAL_SESSION_FILE,
+    confirm_telegram_login,
+    request_telegram_code,
+    reset_sync_checkpoint,
+    run_sync,
+)
 
 AUTO_SYNC_LIMIT = 30
 JAECOO_MODELS = [
@@ -155,6 +164,63 @@ def _card_text(value) -> str:
     return text
 
 
+def _telegram_login_needed(config: dict) -> bool:
+    if st.session_state.get("tg_phone_code_hash") or st.session_state.get("tg_active_session"):
+        return True
+    if telegram_session_status() == "invalid":
+        return True
+    error = str((st.session_state.get("auto_sync_result") or {}).get("error") or "")
+    if any(part in error for part in ("أُلغيت جلسة", "غير صالحة", "غير مفعّلة", "authorization key")):
+        return True
+    has_session = bool(load_telegram_session() or str(config.get("tg_session") or "").strip())
+    return not has_session
+
+
+def render_telegram_login(config: dict) -> None:
+    with st.expander("🔑 تفعيل أو تجديد جلسة تيليجرام مباشرة", expanded=True):
+        st.caption("أدخل رقم الجوال بالصيغة الدولية. يصل رمز التحقق داخل تطبيق تيليجرام.")
+        phone = st.text_input("رقم الجوال", key="tg_phone", placeholder="+9665xxxxxxx")
+        if st.button("إرسال رمز التحقق", key="tg_send_code"):
+            result = request_telegram_code(phone)
+            if result.get("ok"):
+                st.session_state["tg_phone_code_hash"] = result.get("phone_code_hash", "")
+                st.session_state["tg_temp_session"] = result.get("temp_session", "")
+                st.session_state["tg_phone_confirmed"] = phone.strip().replace(" ", "")
+                st.success("أُرسل رمز التحقق إلى تطبيق تيليجرام.")
+            else:
+                st.error(result.get("error") or "تعذر إرسال الرمز.")
+        if st.session_state.get("tg_phone_code_hash"):
+            st.text_input("رمز التحقق", key="tg_code")
+            st.text_input("كلمة مرور التحقق بخطوتين (إن وجدت)", type="password", key="tg_password")
+            if st.session_state.get("tg_needs_password"):
+                st.warning("الحساب يطلب كلمة مرور التحقق بخطوتين.")
+            if st.button("تفعيل الجلسة", key="tg_confirm_login"):
+                result = confirm_telegram_login(
+                    st.session_state.get("tg_phone_confirmed") or phone,
+                    st.session_state.get("tg_code", ""),
+                    st.session_state.get("tg_phone_code_hash", ""),
+                    st.session_state.get("tg_temp_session", ""),
+                    st.session_state.get("tg_password", ""),
+                )
+                if result.get("needs_password"):
+                    st.session_state["tg_needs_password"] = True
+                    if result.get("temp_session"):
+                        st.session_state["tg_temp_session"] = result["temp_session"]
+                    st.warning(result.get("error") or "أدخل كلمة مرور التحقق بخطوتين.")
+                elif result.get("ok"):
+                    st.session_state["tg_active_session"] = result.get("session", "")
+                    st.session_state["tg_phone_code_hash"] = ""
+                    st.session_state["tg_needs_password"] = False
+                    config["tg_session"] = result.get("session", "")
+                    os.environ["TELEGRAM_SESSION"] = result.get("session", "")
+                    st.success("تم التفعيل. انسخ الكود إلى TELEGRAM_SESSION في Secrets. السحب يستخدمه الآن.")
+                else:
+                    st.error(result.get("error") or "تعذر التفعيل.")
+        active_session = str(st.session_state.get("tg_active_session") or "").strip()
+        if active_session:
+            st.text_area("TELEGRAM_SESSION", value=active_session, height=140)
+
+
 def _record_sync_progress(message: str, fraction: float) -> None:
     with _SYNC_GUARD:
         _SYNC_STATE["lines"].append(message)
@@ -177,6 +243,12 @@ def start_auto_sync(config: dict):
     has_api = bool(str(config.get("tg_api_id") or "").strip() and str(config.get("tg_api_hash") or "").strip())
     has_login = bool(str(config.get("tg_session") or "").strip() or os.path.exists(PERSONAL_SESSION_FILE))
     if not (config.get("groq_api_key") or config.get("gemini_api_key")) or not (has_api or has_login):
+        return
+    try:
+        last_attempt = float(get_app_setting("telegram_sync_attempt_at") or 0)
+    except ValueError:
+        last_attempt = 0
+    if time.time() - last_attempt < 180:
         return
     with _SYNC_GUARD:
         if _SYNC_STATE["running"]:
@@ -205,7 +277,8 @@ def auto_sync_status():
         return
     st.session_state.seen_sync_done_at = done_at
     st.session_state.auto_sync_result = result
-    if result.get("saved"):
+    error = str(result.get("error") or "")
+    if result.get("saved") or "أُلغيت جلسة" in error or "غير صالحة" in error or "غير مفعّلة" in error:
         st.rerun()
 
 # ==========================================
@@ -294,6 +367,11 @@ def read_cloud_string_session() -> str:
 
 
 def apply_cloud_string_session(cfg: dict) -> dict:
+    fresh = str(st.session_state.get("tg_active_session") or load_telegram_session() or "").strip()
+    if fresh:
+        cfg["tg_session"] = fresh
+        os.environ["TELEGRAM_SESSION"] = fresh
+        return cfg
     secret = read_cloud_string_session() or _read_secret(("TELEGRAM_SESSION", "tg_session", "telegram_session"))
     if secret:
         cfg["tg_session"] = secret
@@ -883,6 +961,9 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
         type=["png", "jpg", "jpeg", "mp3", "wav", "ogg", "m4a", "mp4"],
         key="public_lab_file",
     )
+
+if _telegram_login_needed(cfg):
+    render_telegram_login(cfg)
 
 limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
 st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. أول سحب يبدأ من هذا التاريخ باتجاه اليوم.")
