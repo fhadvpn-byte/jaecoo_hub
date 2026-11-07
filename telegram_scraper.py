@@ -20,15 +20,12 @@ from database_and_ai import (
     extract_urls,
     get_db_connection,
     init_db,
-    has_analyzable_text,
-    should_analyze_thread,
     is_dealer_or_maintenance_msg,
     load_telegram_session,
     mark_telegram_session_invalid,
     save_telegram_session,
     set_app_setting,
     is_owner_experience_msg,
-    is_product_link_text,
     load_config,
     save_card,
     save_config,
@@ -241,30 +238,20 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
     return f"{caption}{url_note}".strip(), "text", ""
 
 
-def _ignore_source(text: str) -> bool:
-    """يتجاوز الرسائل العامة والأسئلة الإنجليزية والنصوص غير الواضحة قبل استدعاء Groq."""
-    stripped = text.strip()
-    if is_dealer_or_maintenance_msg(stripped) or is_product_link_text(stripped) or is_owner_experience_msg(stripped) or _has_arabic(stripped):
-        return False
-    lower_words = stripped.lower().split()
-    if "?" in stripped or (lower_words and lower_words[0] in {"what", "why", "how", "when", "where", "who", "can", "does", "do", "is", "are"}):
-        return True
-    letters = re.sub(r"[^A-Za-z]", "", stripped)
-    return len(letters) < 40
-
-
 def _worth_archiving(card: dict) -> bool:
     if not isinstance(card, dict):
         return False
     flag = card.get("is_worth_archiving")
     if flag in (False, 0, "0", "false", "False", None):
         return False
-    if _clean_text(card.get("category")) == "نبض القروب والدردشة العامة":
-        return False
     cleaned = {field: _clean_text(card.get(field)) for field in _REQUIRED_CARD_FIELDS}
-    if not all(cleaned.values()):
+    blob = " ".join(cleaned.values())
+    specific = any(marker in blob for marker in ("ترصيص", "جدول", "SHS", "J8", "J7", "J5", "هايبرد", "هجين"))
+    if _clean_text(card.get("category")) == "نبض القروب والدردشة العامة" and not specific:
         return False
-    return all(_has_arabic(cleaned[field]) for field in ("title", "problem_or_topic", "solution_or_summary"))
+    if not cleaned["problem_or_topic"] or not cleaned["solution_or_summary"]:
+        return False
+    return _has_arabic(cleaned["problem_or_topic"]) and _has_arabic(cleaned["solution_or_summary"])
 
 
 def _note(logs: list, message: str, level: str = "info") -> None:
@@ -329,6 +316,10 @@ def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
 
 
 def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
+    """يحرك نقطة الاستئناف للأمام فقط. الصفر يُستخدم عند إعادة الضبط الصريحة."""
+    target = int(msg_id)
+    if target != 0 and target <= get_last_synced_id(group_key):
+        return
     conn = get_db_connection()
     try:
         conn.execute(
@@ -339,7 +330,7 @@ def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
                 last_msg_id = excluded.last_msg_id,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (group_key, int(msg_id)),
+            (group_key, target),
         )
         conn.commit()
     finally:
@@ -403,12 +394,11 @@ def _group_reply_threads(messages: list) -> dict:
 
 
 def _should_analyze_message(message) -> bool:
+    """يمرر كل رسالة نصية أو صورة أو فيديو أو صوت إلى التحليل."""
     if detect_msg_media_kind(message) != "text":
         return True
     text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
-    if is_dealer_or_maintenance_msg(text) or is_product_link_text(text) or is_owner_experience_msg(text):
-        return True
-    return has_analyzable_text(text)
+    return bool(text)
 
 
 async def _run_with_backoff(factory, on_progress):
@@ -544,6 +534,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         _report(on_progress, start_note, 0.08)
+        _report(on_progress, "البطاقات السابقة تبقى محفوظة. هذه السحبة تكمل من آخر نقطة فقط.", 0.1)
         _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {last_id}. المطلوب {requested}.")
 
         pulled = 0
@@ -632,11 +623,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
 
                 thread_text = "\n\n".join(blocks).strip()
                 content = "\n".join(raw_parts)
-                has_product = is_product_link_text(content)
-                if _ignore_source(content):
-                    continue
-                if not has_product and not should_analyze_thread(content, dominant_media):
-                    _report(on_progress, f"تخطي النقاش {root_id}: النص أقصر من ست كلمات.", fraction)
+                if not (content or "").strip() and dominant_media == "text":
                     continue
                 _report(
                     on_progress,
