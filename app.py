@@ -1148,6 +1148,7 @@ with col_s2:
     model_filter = st.selectbox(
         "🚙 تصفية حسب الطراز:",
         ["الكل", *JAECOO_MODELS],
+        help="يشمل Jaecoo J8 SHS للسيارات الهجينة: SHS، هايبرد، هجين، الشاحن، والبطارية الكبيرة.",
     )
 
 if is_admin:
