@@ -337,16 +337,23 @@ CAR_THREAD_KEYWORDS = [
     "فرع", "تحديث", "برمجة", "كاربلاي", "اندرويد", "صوت", "طقطقة", "رجة", "حرارة",
     "فرامل", "فحمات", "مساعدات", "كفرات", "بنزين", "صرفية", "دبل", "رادار", "كاميرا",
 ]
+EXPERT_GUIDELINES_TOPICS = [
+    "خطوات", "استلام", "الوكيل", "المعرض", "فحص", "تشييك", "قبل الخروج",
+    "دليل", "نصائح", "تعليمات", "ملاحظات", "الترخيص", "اللوحات", "التأمين",
+    "تلميع", "حماية", "تظليل", "عزل", "ممشى", "تمرين", "الاطارات", "الإطارات",
+    "الكاوتشوك", "تشيك",
+]
 
 
 def is_car_related_thread(text: str, media_type: str = "text") -> bool:
-    """يتخطى الدردشة العامة قبل استدعاء Groq. الصور والصوت والفيديو تُحلَّل دائماً."""
+    """يلتقط الأعطال وقوائم الفحص وخطوات الاستلام والنصائح ومنتجات AliExpress. الوسائط تُحلَّل دائماً."""
     if media_type in {"image", "audio", "video"}:
         return True
     lowered = (text or "").strip().lower()
-    if len(lowered) < 20:
+    if len(lowered) < 15:
         return False
-    return any(keyword in lowered for keyword in CAR_THREAD_KEYWORDS)
+    allowed = CAR_THREAD_KEYWORDS + EXPERT_GUIDELINES_TOPICS
+    return any(keyword in lowered for keyword in allowed)
 
 
 def collect_groq_keys(primary: str = "") -> list[str]:
