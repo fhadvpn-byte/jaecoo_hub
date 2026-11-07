@@ -89,7 +89,6 @@ def clean_database() -> None:
             DELETE FROM knowledge_cards
             WHERE title LIKE '%جزء جميلة%'
                OR problem_or_topic LIKE '%User asks about%'
-               OR solution_or_summary LIKE '%الرسالة تطلب معلومات%'
             """
         )
         conn.commit()
@@ -949,6 +948,16 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         _render_stat_card("بطاقات Jaecoo J7", _model_count(frame, "Jaecoo J7"), "🚘")
     with col_j5:
         _render_stat_card("بطاقات Jaecoo J5", _model_count(frame, "Jaecoo J5"), "🚗")
+    shs_count = _model_count(frame, "Jaecoo J8 SHS")
+    if frame.empty or "car_model" not in frame.columns or shs_count == 0:
+        st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: 0.")
+    else:
+        shs_titles = frame.loc[
+            frame["car_model"].fillna("").str.strip().str.upper().eq("JAECOO J8 SHS"),
+            "title",
+        ].fillna("").head(3)
+        latest = "، ".join(title for title in shs_titles if str(title).strip())
+        st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: {shs_count}. أحدثها: {latest}")
 
 metrics_box = st.empty()
 with metrics_box.container():
@@ -1053,9 +1062,11 @@ with pull_col:
         if result.get("ok"):
             with metrics_box.container():
                 _render_metrics(fresh_df)
+            shs_now = _model_count(fresh_df, "Jaecoo J8 SHS")
             st.session_state["sync_notice"] = (
                 f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}."
+                f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}. "
+                f"بطاقات Jaecoo J8 SHS: {shs_now}."
             )
             st.rerun()
 with analyze_col:

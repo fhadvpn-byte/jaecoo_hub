@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Optional, Literal
@@ -43,7 +44,7 @@ def save_config(cfg: dict):
 # ==========================================
 class KnowledgeCardSchema(BaseModel):
     is_worth_archiving: bool = Field(
-        description="True لمعلومة فنية أو لبيانات الوكيل والصيانة الدورية والضمان. False للرسائل العامة والتحيات والأسئلة بلا إجابة."
+        description="True لأي معلومة أو استفسار أو رد فني أو وسائط مفيدة. False للتحيات والدردشة الفارغة فقط."
     )
     category: Literal[
         "الأعطال والتشخيص",
@@ -160,9 +161,10 @@ SYSTEM_PROMPT = """
 شروط صارمة:
 1. الحقول النصية بالعربية الفصحى فقط. يُسمح بروابط الإنترنت وأرقام القطع وأسماء الطرازات.
 2. ممنوع الجمل الإنجليزية وممنوع nan.
-3. السؤال العابر بلا إجابة وبلا رابط منتج وبلا معلومة يعني is_worth_archiving = false. لا تكرر السؤال في خانة الحل.
-4. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
-5. أي ذكر لـ SHS أو هجين أو هايبرد أو بطارية أو شاحن يُصنَّف فوراً car_model = Jaecoo J8 SHS، وليس Jaecoo J8 ولا جميع الطرازات / عام.
+3. كل رسالة فيها معلومة أو استفسار أو رد فني تعني is_worth_archiving = true. الاستفسار يذهب إلى problem_or_topic، والرد أو المعلومة إلى solution_or_summary. إذا لم يظهر رد بعد، لخّص الاستفسار في الحل ولا ترفض البطاقة.
+4. التحيات والدردشة الفارغة بلا معلومة وبلا استفسار وبلا وسائط تعني is_worth_archiving = false.
+5. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
+6. أي ذكر لـ SHS أو هجين أو الهايبرد أو هايبرد أو الشاحن أو البطارية الكبيرة يُصنَّف فوراً وحصراً car_model = Jaecoo J8 SHS. ممنوع وضع هذه الحالات تحت Jaecoo J8 أو جميع الطرازات / عام.
 """
 
 # ==========================================
@@ -283,6 +285,9 @@ def compress_image_to_b64(image_bytes: bytes, max_size: int = 600, quality: int 
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+_CARD_SAVE_LOCK = threading.Lock()
+
+
 def save_card(
     card_data: dict,
     telegram_msg_id: int,
@@ -292,16 +297,10 @@ def save_card(
     media_type: str = "text",
     media_b64: str = "",
 ):
-    conn = get_db_connection()
-    conn.execute("""
-        INSERT OR REPLACE INTO knowledge_cards (
-            telegram_msg_id, thread_url, category, car_model, sub_system,
-            title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
-            is_verified_solution, keywords, author_name, raw_thread_text, created_at,
-            media_type, media_b64
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        telegram_msg_id,
+    """يحفظ البطاقة فوراً. الرسالة نفسها تُحدَّث في صفها، ولا تُستبدل بطاقة أخرى."""
+    card_data = force_j8_shs_model(dict(card_data or {}), raw_text or "")
+    params = (
+        int(telegram_msg_id),
         thread_url,
         card_data["category"],
         card_data["car_model"],
@@ -317,9 +316,40 @@ def save_card(
         datetime.now().strftime("%Y-%m-%d %H:%M"),
         media_type if media_type in {"text", "image", "audio", "video"} else "text",
         media_b64 or "",
-    ))
-    conn.commit()
-    conn.close()
+    )
+    with _CARD_SAVE_LOCK:
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO knowledge_cards (
+                    telegram_msg_id, thread_url, category, car_model, sub_system,
+                    title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
+                    is_verified_solution, keywords, author_name, raw_thread_text, created_at,
+                    media_type, media_b64
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(telegram_msg_id) DO UPDATE SET
+                    thread_url = excluded.thread_url,
+                    category = excluded.category,
+                    car_model = excluded.car_model,
+                    sub_system = excluded.sub_system,
+                    title = excluded.title,
+                    problem_or_topic = excluded.problem_or_topic,
+                    solution_or_summary = excluded.solution_or_summary,
+                    part_numbers_or_specs = excluded.part_numbers_or_specs,
+                    is_verified_solution = excluded.is_verified_solution,
+                    keywords = excluded.keywords,
+                    author_name = excluded.author_name,
+                    raw_thread_text = excluded.raw_thread_text,
+                    created_at = excluded.created_at,
+                    media_type = excluded.media_type,
+                    media_b64 = excluded.media_b64
+                """,
+                params,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 # ==========================================
 # 4. محرك Groq الذكي والسريع
@@ -352,13 +382,12 @@ EXPERT_GUIDELINES_TOPICS = [
 
 
 def has_analyzable_text(text: str) -> bool:
-    """يكفي أن يزيد النص على خمس كلمات حتى يُرسل إلى الذكاء الاصطناعي."""
-    words = [word for word in re.split(r"\s+", (text or "").strip()) if word]
-    return len(words) > 5
+    """أي نص غير فارغ يذهب إلى الذكاء الاصطناعي."""
+    return bool((text or "").strip())
 
 
 def is_car_related_thread(text: str, media_type: str = "text") -> bool:
-    """يمرر الصور والفيديو والصوت، وأي نص أطول من خمس كلمات، دون فلتر كلمات محلي."""
+    """يمرر كل النصوص والصور والفيديو والصوت دون فلتر كلمات محلي."""
     if media_type in {"image", "audio", "video"}:
         return True
     return has_analyzable_text(text)
@@ -496,8 +525,8 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                     "احفظ روابط علي إكسبريس والإكسسوارات، وتجارب العملية والمميزات والعيوب، وبيانات الوكيل والصيانة. "
                     "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
                     "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
-                    "السؤال بلا رد وبلا رابط منتج يعني is_worth_archiving = false. "
-                    "أي ذكر لـ SHS أو هجين أو هايبرد أو بطارية أو شاحن يعني car_model = Jaecoo J8 SHS فوراً. "
+                    "أي معلومة أو استفسار أو رد فني يعني is_worth_archiving = true. "
+                    "أي ذكر لـ SHS أو هجين أو الهايبرد أو الشاحن أو البطارية الكبيرة يعني car_model = Jaecoo J8 SHS فوراً وحصراً. "
                     "ممنوع إخراج nan."
                 ),
             },
@@ -515,10 +544,8 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     solution_text = str(data.get("solution_or_summary") or "")
     has_arabic = bool(re.search(r"[\u0600-\u06FF]", problem_text + solution_text))
     has_product = is_product_link_text(thread_text + "\n" + solution_text + "\n" + parts)
-    question_only = _solution_repeats_question(problem_text, solution_text)
-    if question_only and not has_product:
-        data["is_worth_archiving"] = False
-        return force_j8_shs_model(data, thread_text)
+    if text_mentions_shs("\n".join((thread_text, problem_text, solution_text, parts))):
+        data["is_worth_archiving"] = True
     if is_dealer_or_maintenance_msg(thread_text) and has_arabic:
         data["is_worth_archiving"] = True
         if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
@@ -533,25 +560,22 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             product_urls = [url for url in extract_urls(thread_text) if "aliexpress" in url.lower()]
             if product_urls:
                 data["part_numbers_or_specs"] = product_urls[0]
-    elif is_owner_experience_msg(thread_text) and has_arabic and not question_only:
+    elif is_owner_experience_msg(thread_text) and has_arabic:
         data["is_worth_archiving"] = True
         if str(data.get("category") or "") in {"", "نبض القروب والدردشة العامة"}:
             data["category"] = "تجارب القيادة والأداء الفعلي"
         if str(data.get("sub_system") or "") in {"", "عام"}:
             data["sub_system"] = "تقييم العملية والمميزات والعيوب"
-    elif data.get("is_worth_archiving") and not re.search(r"[\u0600-\u06FF]", problem_text):
+    elif (
+        data.get("is_worth_archiving")
+        and not has_arabic
+        and not has_product
+        and not text_mentions_shs("\n".join((thread_text, problem_text, solution_text, parts)))
+    ):
         data["is_worth_archiving"] = False
-    if question_only and not has_product:
-        data["is_worth_archiving"] = False
+    if not solution_text.strip() and problem_text.strip():
+        data["solution_or_summary"] = problem_text.strip()
     return force_j8_shs_model(data, thread_text)
-
-
-def _solution_repeats_question(problem_text: str, solution_text: str) -> bool:
-    solution = solution_text.strip()
-    problem = problem_text.strip()
-    if any(phrase in solution for phrase in ("الرسالة تطلب معلومات", "لا يوجد حل محدد", "لا يوجد حل")):
-        return True
-    return bool(solution) and solution == problem
 
 
 VISION_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct"]
