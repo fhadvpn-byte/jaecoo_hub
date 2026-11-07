@@ -15,10 +15,12 @@ from telethon.sessions import StringSession
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    collect_groq_keys,
     compress_image_to_b64,
     extract_urls,
     get_db_connection,
     init_db,
+    is_car_related_thread,
     is_dealer_or_maintenance_msg,
     load_telegram_session,
     mark_telegram_session_invalid,
@@ -408,26 +410,21 @@ def _should_analyze_message(message) -> bool:
 
 
 async def _run_with_backoff(factory, on_progress):
-    last_error = None
-    for attempt in range(5):
-        try:
-            value = factory()
-            if asyncio.iscoroutine(value):
-                return await value
-            return value
-        except Exception as exc:
-            last_error = exc
-            if _is_rate_limit(exc) and attempt < 4:
-                wait_sec = _rate_limit_wait_seconds(exc)
-                _report(
-                    on_progress,
-                    f"تهدئة تلقائية لمدة {wait_sec} ثانية لتجديد رصيد Groq ثم يكمل السحب.",
-                    0.45,
-                )
-                await asyncio.sleep(wait_sec)
-                continue
+    """لا ينتظر دقيقة امتلاء النموذج. المحاولة التالية بعد 6 ثوانٍ فقط."""
+    try:
+        value = factory()
+        if asyncio.iscoroutine(value):
+            return await value
+        return value
+    except Exception as exc:
+        if not _is_rate_limit(exc):
             raise
-    raise last_error
+        _report(on_progress, "رصيد النموذج ممتلئ. انتظار 6 ثوانٍ ثم المتابعة.", 0.45)
+        await asyncio.sleep(6)
+        value = factory()
+        if asyncio.iscoroutine(value):
+            return await value
+        return value
 
 
 def _stored_card_count() -> int:
@@ -482,8 +479,8 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
     result = {"ok": False, "saved": 0, "scanned": 0, "group": "", "error": None, "logs": logs}
     init_db()
     cfg = load_config()
-    groq_key = _groq_key(cfg)
-    if not groq_key:
+    groq_key = _groq_key(cfg) or (collect_groq_keys() or [""])[0]
+    if not collect_groq_keys(groq_key):
         result["error"] = "مفتاح Groq API غير موجود. أدخله في الإعدادات ثم احفظ."
         _note(logs, result["error"], "error")
         return result
@@ -606,6 +603,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             content = "\n".join(raw_parts)
             has_product = is_product_link_text(content)
             if (len(content.strip()) < 15 and not has_product and dominant_media == "text") or _ignore_source(content):
+                continue
+            if not is_car_related_thread(content, dominant_media):
+                _report(on_progress, f"تخطي النقاش {root_id}: دردشة غير متعلقة بالسيارة.", fraction)
                 continue
             _report(
                 on_progress,

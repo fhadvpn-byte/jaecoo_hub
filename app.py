@@ -15,6 +15,7 @@ import streamlit as st
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    collect_groq_keys,
     compress_image_to_b64,
     find_matching_solution_in_db,
     generate_daily_pulse_summary,
@@ -242,7 +243,7 @@ def _auto_sync_worker():
 def start_auto_sync(config: dict):
     has_api = bool(str(config.get("tg_api_id") or "").strip() and str(config.get("tg_api_hash") or "").strip())
     has_login = bool(str(config.get("tg_session") or "").strip() or os.path.exists(PERSONAL_SESSION_FILE))
-    if not (config.get("groq_api_key") or config.get("gemini_api_key")) or not (has_api or has_login):
+    if not collect_groq_keys(config.get("groq_api_key") or config.get("gemini_api_key") or "") or not (has_api or has_login):
         return
     try:
         last_attempt = float(get_app_setting("telegram_sync_attempt_at") or 0)
@@ -318,6 +319,8 @@ _publish_share_title(PAGE_TITLE)
 
 _SETTING_SOURCES = {
     "groq_api_key": ("groq_api_key", "GROQ_API_KEY", "gemini_api_key"),
+    "groq_api_key_2": ("groq_api_key_2", "GROQ_API_KEY_2"),
+    "groq_api_key_3": ("groq_api_key_3", "GROQ_API_KEY_3"),
     "tg_api_id": ("tg_api_id", "telegram_api_id", "TG_API_ID"),
     "tg_api_hash": ("tg_api_hash", "telegram_api_hash", "TG_API_HASH"),
     "tg_group": ("tg_group", "TG_GROUP"),

@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
@@ -322,32 +323,79 @@ def save_card(
 # ==========================================
 # 4. محرك Groq الذكي والسريع
 # ==========================================
-GROQ_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+]
+CAR_THREAD_KEYWORDS = [
+    "جايكو", "j8", "j7", "j5", "shs", "وكيل", "وكالة", "صيانة", "معتمد", "ضمان",
+    "عطل", "مشكلة", "حل", "قطعة", "قطع", "سعر", "زيت", "فلتر", "بطارية", "شاشة",
+    "حساس", "قير", "مكينة", "تيربو", "مكيف", "تكييف", "عزل", "عملية", "عمليه",
+    "مميزات", "عيوب", "تجربة", "تجربتي", "علي اكسبرس", "aliexpress", "http",
+    "فرع", "تحديث", "برمجة", "كاربلاي", "اندرويد", "صوت", "طقطقة", "رجة", "حرارة",
+]
+
+
+def is_car_related_thread(text: str, media_type: str = "text") -> bool:
+    """يتخطى الدردشة العامة قبل استدعاء Groq. الصور والصوت والفيديو تُحلَّل دائماً."""
+    if media_type in {"image", "audio", "video"}:
+        return True
+    lowered = (text or "").lower()
+    return any(keyword in lowered for keyword in CAR_THREAD_KEYWORDS)
+
+
+def collect_groq_keys(primary: str = "") -> list[str]:
+    """يجمع المفتاح الأساسي والمفاتيح الإضافية، ولكل مفتاح رصيده المستقل."""
+    cfg = {}
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    keys = []
+    for value in (
+        primary,
+        cfg.get("groq_api_key"),
+        cfg.get("gemini_api_key"),
+        cfg.get("groq_api_key_2"),
+        cfg.get("groq_api_key_3"),
+        os.environ.get("GROQ_API_KEY"),
+        os.environ.get("GROQ_API_KEY_2"),
+        os.environ.get("GROQ_API_KEY_3"),
+    ):
+        text = str(value or "").strip()
+        if text and text not in keys:
+            keys.append(text)
+    return keys
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False):
-    client = Groq(api_key=api_key)
+    """يجرّب المفاتيح والنماذج بالتتابع. عند 429 ينتقل فوراً دون انتظار تهدئة طويلة."""
+    keys = collect_groq_keys(api_key)
+    if not keys:
+        raise RuntimeError("مفتاح Groq API غير موجود")
     last_error = None
-    for model_name in GROQ_MODELS:
-        kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        try:
-            return client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            last_error = exc
-            message = str(exc)
-            if json_mode and "response_format" in message.lower():
-                kwargs.pop("response_format", None)
-                try:
-                    return client.chat.completions.create(**kwargs)
-                except Exception as retry_exc:
-                    last_error = retry_exc
-                    message = str(retry_exc)
-            if "404" in message or "model_not_found" in message or "does not exist" in message:
+    for key in keys:
+        client = Groq(api_key=key)
+        for model_name in GROQ_MODELS:
+            kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                return client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if json_mode and "response_format" in message:
+                    kwargs.pop("response_format", None)
+                    try:
+                        return client.chat.completions.create(**kwargs)
+                    except Exception as retry_exc:
+                        last_error = retry_exc
                 continue
-            raise
-    raise last_error
+    time.sleep(6)
+    raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
 
 
 def _normalize_card_fields(data: dict) -> dict:
