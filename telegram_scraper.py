@@ -298,9 +298,30 @@ def get_last_synced_id(group_key: str = "main_group") -> int:
     return int(row[0]) if row else 0
 
 
+def _set_sync_active(active: bool) -> None:
+    try:
+        set_app_setting("telegram_sync_active", "1" if active else "0")
+    except Exception:
+        pass
+
+
+def force_release_client_lock() -> None:
+    """يفك قفل الجلسة العالق ويصفّر حالة الانشغال حتى لو انقطع الاتصال."""
+    try:
+        _CLIENT_LOCK.release()
+    except RuntimeError:
+        pass
+    _set_sync_active(False)
+    try:
+        set_app_setting("telegram_sync_attempt_at", "0")
+    except Exception:
+        pass
+
+
 def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
-    """يصفر مؤشر السحب حتى تبدأ الدفعة التالية من 1/1/2026."""
+    """يصفر مؤشر السحب ويفك أي قفل عالق حتى تبدأ الدفعة التالية من 1/1/2026."""
     update_last_synced_id(0, group_key)
+    force_release_client_lock()
 
 
 def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
@@ -712,9 +733,12 @@ async def _confirm_login(phone: str, code: str, phone_code_hash: str, temp_sessi
 
 
 def _run_login(factory):
-    if not _CLIENT_LOCK.acquire(timeout=20):
-        return {"ok": False, "error": "توجد محاولة اتصال جارية. انتظر ثواني ثم أعد المحاولة."}
+    acquired = False
     try:
+        acquired = _CLIENT_LOCK.acquire(timeout=20)
+        if not acquired:
+            return {"ok": False, "error": "توجد محاولة اتصال جارية. انتظر ثواني ثم أعد المحاولة."}
+        _set_sync_active(True)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -723,7 +747,12 @@ def _run_login(factory):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(lambda: asyncio.run(factory())).result()
     finally:
-        _CLIENT_LOCK.release()
+        if acquired:
+            try:
+                _CLIENT_LOCK.release()
+            except RuntimeError:
+                pass
+            _set_sync_active(False)
 
 
 def request_telegram_code(phone: str) -> dict:
@@ -759,17 +788,20 @@ def _telegram_error_message(exc: Exception) -> str:
 def run_sync(limit: int = 50, on_progress=None) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     init_db()
-    set_app_setting("telegram_sync_attempt_at", str(time.time()))
-    if not _CLIENT_LOCK.acquire(blocking=False):
-        return {
-            "ok": False,
-            "saved": 0,
-            "scanned": 0,
-            "group": "",
-            "error": "توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام.",
-            "logs": [],
-        }
+    acquired = False
     try:
+        acquired = _CLIENT_LOCK.acquire(blocking=False)
+        if not acquired:
+            return {
+                "ok": False,
+                "saved": 0,
+                "scanned": 0,
+                "group": "",
+                "error": "توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام.",
+                "logs": [],
+            }
+        _set_sync_active(True)
+        set_app_setting("telegram_sync_attempt_at", str(time.time()))
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -780,7 +812,12 @@ def run_sync(limit: int = 50, on_progress=None) -> dict:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))).result()
     finally:
-        _CLIENT_LOCK.release()
+        if acquired:
+            try:
+                _CLIENT_LOCK.release()
+            except RuntimeError:
+                pass
+            _set_sync_active(False)
 
 
 if __name__ == "__main__":
