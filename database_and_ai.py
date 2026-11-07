@@ -335,6 +335,7 @@ CAR_THREAD_KEYWORDS = [
     "حساس", "قير", "مكينة", "تيربو", "مكيف", "تكييف", "عزل", "عملية", "عمليه",
     "مميزات", "عيوب", "تجربة", "تجربتي", "علي اكسبرس", "aliexpress", "http",
     "فرع", "تحديث", "برمجة", "كاربلاي", "اندرويد", "صوت", "طقطقة", "رجة", "حرارة",
+    "فرامل", "فحمات", "مساعدات", "كفرات", "بنزين", "صرفية", "دبل", "رادار", "كاميرا",
 ]
 
 
@@ -342,7 +343,9 @@ def is_car_related_thread(text: str, media_type: str = "text") -> bool:
     """يتخطى الدردشة العامة قبل استدعاء Groq. الصور والصوت والفيديو تُحلَّل دائماً."""
     if media_type in {"image", "audio", "video"}:
         return True
-    lowered = (text or "").lower()
+    lowered = (text or "").strip().lower()
+    if len(lowered) < 20:
+        return False
     return any(keyword in lowered for keyword in CAR_THREAD_KEYWORDS)
 
 
@@ -370,7 +373,7 @@ def collect_groq_keys(primary: str = "") -> list[str]:
     return keys
 
 
-def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False):
+def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
     """يجرّب المفاتيح والنماذج بالتتابع. عند 429 ينتقل فوراً دون انتظار تهدئة طويلة."""
     keys = collect_groq_keys(api_key)
     if not keys:
@@ -387,6 +390,8 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
             except Exception as exc:
                 last_error = exc
                 message = str(exc).lower()
+                if on_switch and ("429" in message or "rate_limit" in message):
+                    on_switch(f"تبديل فوري إلى النموذج البديل ({model_name.split('/')[-1]}) لمواصلة السحب بدون انتظار.")
                 if json_mode and "response_format" in message:
                     kwargs.pop("response_format", None)
                     try:
@@ -394,7 +399,7 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
                     except Exception as retry_exc:
                         last_error = retry_exc
                 continue
-    time.sleep(6)
+    time.sleep(5)
     raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
 
 
@@ -417,7 +422,7 @@ def _normalize_card_fields(data: dict) -> dict:
     return data
 
 
-def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None) -> dict:
+def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None, on_switch=None) -> dict:
     schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
     dealer_hint = ""
     if is_dealer_or_maintenance_msg(thread_text):
@@ -452,6 +457,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             {"role": "user", "content": prompt},
         ],
         json_mode=True,
+        on_switch=on_switch,
     )
 
     data = _normalize_card_fields(json.loads(completion.choices[0].message.content))

@@ -968,7 +968,15 @@ with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=Fa
 if _telegram_login_needed(cfg):
     render_telegram_login(cfg)
 
-limit_val = st.slider("عدد الرسائل", min_value=1, max_value=50, value=30, step=1, key="public_pull_limit_cap")
+limit_val = st.slider(
+    "عدد الرسائل في السحبة الواحدة",
+    min_value=50,
+    max_value=500,
+    value=250,
+    step=50,
+    key="public_pull_limit_batch",
+    help="يسحب حتى 500 رسالة في الدفعة الواحدة، ويكمل تلقائياً من آخر رسالة توقف عندها بدءاً من 1/1/2026.",
+)
 st.caption("كل ضغطة تكمل من آخر رسالة بعد 1/1/2026. أول سحب يبدأ من هذا التاريخ باتجاه اليوم.")
 if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_sync_2026"):
     reset_sync_checkpoint()

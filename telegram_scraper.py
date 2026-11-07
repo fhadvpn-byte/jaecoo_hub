@@ -419,8 +419,8 @@ async def _run_with_backoff(factory, on_progress):
     except Exception as exc:
         if not _is_rate_limit(exc):
             raise
-        _report(on_progress, "رصيد النموذج ممتلئ. انتظار 6 ثوانٍ ثم المتابعة.", 0.45)
-        await asyncio.sleep(6)
+        _report(on_progress, "رصيد النموذج ممتلئ. انتظار 5 ثوانٍ ثم المتابعة.", 0.45)
+        await asyncio.sleep(5)
         value = factory()
         if asyncio.iscoroutine(value):
             return await value
@@ -602,9 +602,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             thread_text = "\n\n".join(blocks).strip()
             content = "\n".join(raw_parts)
             has_product = is_product_link_text(content)
-            if (len(content.strip()) < 15 and not has_product and dominant_media == "text") or _ignore_source(content):
+            if _ignore_source(content):
                 continue
-            if not is_car_related_thread(content, dominant_media):
+            if not has_product and not is_car_related_thread(content, dominant_media):
                 _report(on_progress, f"تخطي النقاش {root_id}: دردشة غير متعلقة بالسيارة.", fraction)
                 continue
             _report(
@@ -614,7 +614,11 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             )
             try:
                 card = await _run_with_backoff(
-                    lambda thread_text=thread_text: analyze_thread_with_ai(thread_text, groq_key),
+                    lambda thread_text=thread_text: analyze_thread_with_ai(
+                        thread_text,
+                        groq_key,
+                        on_switch=lambda note: _report(on_progress, note, fraction),
+                    ),
                     on_progress,
                 )
             except Exception as exc:
