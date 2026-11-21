@@ -459,8 +459,10 @@ def save_telegram_session(session_text: str) -> None:
 
 
 def mark_telegram_session_invalid() -> None:
-    current = str(get_app_setting("telegram_string_session") or "").strip()
     set_app_setting("telegram_session_status", "invalid")
+    if str(get_app_setting("invalid_tg_session") or "").strip():
+        return
+    current = str(get_app_setting("telegram_string_session") or "").strip()
     if current:
         set_app_setting("invalid_tg_session", current)
 

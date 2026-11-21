@@ -98,10 +98,84 @@ def _groq_key(cfg: dict) -> str:
     ).strip()
 
 
+def _clean_session_token(raw: str) -> str:
+    text = str(raw or "").strip()
+    if "=" in text and text.upper().startswith("TELEGRAM_SESSION"):
+        text = text.split("=", 1)[1].strip()
+    quotes = "\"'`“”‘’"
+    while len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
+        text = text[1:-1].strip()
+    return re.sub(r"\s+", "", text)
+
+
+def _secret_value_from_streamlit(keys: tuple[str, ...]) -> str:
+    import sys
+    if "streamlit" not in sys.modules:
+        return ""
+    try:
+        import streamlit as st
+        secrets_obj = st.secrets
+    except Exception:
+        return ""
+    for key in keys:
+        try:
+            val = str(secrets_obj.get(key, "") or "").strip()
+            if val:
+                return val
+        except Exception:
+            pass
+    try:
+        sections = list(secrets_obj.keys())
+    except Exception:
+        sections = []
+    for sec in sections:
+        try:
+            bag = secrets_obj[sec]
+            if hasattr(bag, "get"):
+                for key in keys:
+                    val = str(bag.get(key, "") or "").strip()
+                    if val:
+                        return val
+        except Exception:
+            continue
+    return ""
+
+
 def _api_credentials(cfg: dict) -> tuple[int, str]:
-    api_id = str(cfg.get("tg_api_id") or cfg.get("telegram_api_id") or DEFAULT_API_ID).strip()
-    api_hash = (cfg.get("tg_api_hash") or cfg.get("telegram_api_hash") or DEFAULT_API_HASH).strip()
-    return int(api_id), api_hash
+    api_id = (
+        os.environ.get("TG_API_ID")
+        or _secret_value_from_streamlit(("TG_API_ID", "tg_api_id", "telegram_api_id"))
+        or cfg.get("tg_api_id")
+        or cfg.get("telegram_api_id")
+        or DEFAULT_API_ID
+    )
+    api_hash = (
+        os.environ.get("TG_API_HASH")
+        or _secret_value_from_streamlit(("TG_API_HASH", "tg_api_hash", "telegram_api_hash"))
+        or cfg.get("tg_api_hash")
+        or cfg.get("telegram_api_hash")
+        or DEFAULT_API_HASH
+    )
+    return int(str(api_id).strip()), str(api_hash).strip()
+
+
+def _candidate_sessions(cfg: dict) -> list[str]:
+    """يضع جلسة البيئة وSecrets في المرتبة الأولى قبل قاعدة البيانات المحلية."""
+    candidates = []
+    secret_sess = _secret_value_from_streamlit(
+        ("TELEGRAM_SESSION", "tg_session", "telegram_session", "TG_SESSION", "SESSION_STRING")
+    )
+    for source in (
+        os.environ.get("TELEGRAM_SESSION"),
+        secret_sess,
+        cfg.get("tg_session"),
+        cfg.get("telegram_session"),
+        load_telegram_session(),
+    ):
+        cleaned = _clean_session_token(source)
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    return candidates
 
 
 def _session_string(cfg: dict) -> str:
@@ -826,28 +900,34 @@ def _stored_card_count() -> int:
 
 
 async def _open_client(cfg: dict, logs: list):
-    """يفضل String Session المحفوظة، ثم ملف الجلسة إن لم توجد جلسة نصية."""
+    """يجرب جلسة Secrets أولاً ثم البدائل المحلية، ويصلح القاعدة تلقائياً عند الاتصال."""
     api_id, api_hash = _api_credentials(cfg)
-    session_text = _session_string(cfg)
-    if session_text:
+    sessions = _candidate_sessions(cfg)
+    for session_text in sessions:
         try:
             client = TelegramClient(StringSession(session_text), api_id, api_hash, timeout=30, receive_updates=False)
         except Exception:
-            client = None
-        if client is not None:
+            set_app_setting("invalid_tg_session", session_text)
+            continue
+        try:
+            if await _connect_saved_client(client, logs, "تم الاتصال بجلسة تيليجرام النصية بنجاح."):
+                set_app_setting("telegram_string_session", session_text)
+                set_app_setting("telegram_session_status", "ok")
+                set_app_setting("invalid_tg_session", "")
+                return client, None
+        except Exception as exc:
             try:
-                if await _connect_saved_client(client, logs, "تم الاتصال بجلسة الحساب النصية."):
-                    set_app_setting("telegram_session_status", "ok")
-                    return client, None
+                await client.disconnect()
             except Exception:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                raise
+                pass
+            if "authorization key" in str(exc).lower() or "AuthKeyDuplicated" in str(exc):
+                set_app_setting("invalid_tg_session", session_text)
+                continue
+            raise
+        set_app_setting("invalid_tg_session", session_text)
+    if sessions:
         mark_telegram_session_invalid()
-        return None, "جلسة تيليجرام غير صالحة. افتح قسم تفعيل الجلسة وأدخل رقم الجوال."
-
+        return None, "جلسة تيليجرام الحالية أُلغيت من تيليجرام. فعّل جلسة جديدة مرة واحدة وضعها في TELEGRAM_SESSION داخل Secrets."
     if os.path.exists(PERSONAL_SESSION_FILE):
         session_name = prepare_unlocked_session(PERSONAL_SESSION_FILE, RUNTIME_SESSION_FILE)
         client = TelegramClient(session_name, api_id, api_hash, timeout=30, receive_updates=False)
@@ -860,7 +940,6 @@ async def _open_client(cfg: dict, logs: list):
             except Exception:
                 pass
             raise
-
     return None, "جلسة تيليجرام غير مفعّلة. افتح قسم تفعيل الجلسة وأدخل رقم الجوال."
 
 
