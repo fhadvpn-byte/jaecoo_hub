@@ -496,6 +496,8 @@ def save_card(
 ):
     """يحفظ البطاقة فوراً. الرسالة نفسها تُحدَّث في صفها، ولا تُستبدل بطاقة أخرى."""
     card_data = merge_missing_links(force_j8_shs_model(dict(card_data or {}), raw_text or ""), raw_text or "")
+    if _field_is_blank(card_data.get("problem_or_topic")) and not _field_is_blank(card_data.get("title")):
+        card_data["problem_or_topic"] = card_data.get("title")
     if not card_passes_quality_gate(card_data):
         return False
     params = (
@@ -868,21 +870,27 @@ def _has_useful_info(text: str) -> bool:
 
 
 def card_passes_quality_gate(card: dict) -> bool:
-    """None لا يرفض البطاقة. الرفض الصريح لا يسقط بطاقة عنوانها أو حلها مفيد."""
+    """تقبل البطاقة العربية ذات العنوان والحل، وترفض فقط الدردشة الفارغة صراحةً."""
+    return not card_rejection_reason(card)
+
+
+def card_rejection_reason(card: dict) -> str:
     if not isinstance(card, dict):
-        return False
+        return "البطاقة ليست بيانات صالحة"
     title = str(card.get("title") or "").strip()
     problem = str(card.get("problem_or_topic") or "").strip()
     solution = str(card.get("solution_or_summary") or "").strip()
+    if _field_is_blank(title):
+        return "العنوان فارغ"
+    if _field_is_blank(solution):
+        return "الحل فارغ"
+    if not re.search(r"[\u0600-\u06FF]", title + problem + solution):
+        return "لا يوجد نص عربي في العنوان أو الحل"
     flag = card.get("is_worth_archiving")
     explicit_false = flag in (False, 0, "0", "false", "False")
-    if explicit_false and not _has_useful_info(solution):
-        return False
-    if any(_field_is_blank(item) for item in (title, problem, solution)):
-        return False
-    if _title_is_english(title):
-        return False
-    return bool(re.search(r"[\u0600-\u06FF]", problem + solution))
+    if explicit_false and not _has_useful_info("\n".join((title, problem, solution))):
+        return "صُنفت دردشة فارغة بلا فائدة فنية أو تجربة مالك"
+    return ""
 
 
 def merge_missing_links(card: dict, source_text: str) -> dict:
