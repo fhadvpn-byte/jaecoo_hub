@@ -165,12 +165,12 @@ SYSTEM_PROMPT = """
 4. التحيات والدردشة الفارغة بلا معلومة وبلا استفسار وبلا وسائط تعني is_worth_archiving = false.
 5. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
 6. صنّف car_model من نص النقاش أو وصف الصورة:
-- Jaecoo J5 عند ذكر J5 أو جي 5، بما فيها جداول الصيانة، ما لم تُذكر كلمة SHS.
-- Jaecoo J7 عند ذكر J7 أو جي 7، ما لم تُذكر كلمة SHS.
-- Jaecoo J8 SHS عند ذكر SHS أو هايبرد أو هجين أو البطارية الكبيرة أو ترصيص الهايبرد أو جدول صيانة J8 الهجين.
+- Jaecoo J5 عند ذكر J5 أو جي 5 أو جيكو ٥، ما لم تُذكر كلمة SHS.
+- Jaecoo J7 عند ذكر J7 أو جايكو 7 أو جيكو ٧، حتى لو كان هايبرد أو PHEV، ما لم يُذكر J8 أو SHS.
+- Jaecoo J8 SHS عند ذكر SHS، أو هايبرد مع J8، أو هايبرد دون تحديد J7 أو J5.
 - Jaecoo J8 عند ذكر J8 بلا إشارة هجينة.
 - جميع الطرازات / عام إذا لم يتضح الطراز.
-لا تنقل تجربة J5 أو J7 إلى Jaecoo J8 SHS لمجرد ذكر بطارية عادية أو شاحن جوال.
+لا تنقل هايبرد J7 أو J5 إلى Jaecoo J8 SHS.
 """
 
 # ==========================================
@@ -558,6 +558,21 @@ GROQ_MODELS = [
     "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
 ]
+_GROQ_COOLDOWN = {}
+_GROQ_COOLDOWN_SECONDS = 90
+_GROQ_DAILY_COOLDOWN_SECONDS = 600
+USEFUL_TOPIC_TERMS = (
+    "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "هجين", "phev", "مشكلة", "عطل", "صوت",
+    "رجة", "نتعة", "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت",
+    "صيانة", "ضمان", "وكالة", "وكيل", "تحديث", "كفر", "إطارات", "بنزين", "صرفية", "استهلاك",
+    "حساس", "لمبة", "كود", "تأمين", "قطع", "سعر", "أسعار", "كم", "كيف", "وين", "حل", "جرب",
+    "تجربة", "تجارب", "استلام", "ملاحظات", "فيوز", "لزوجة", "agm", "carplay", "tbox", "obd", "awd",
+)
+_LATIN_TECH_TOKENS = {"agm", "carplay", "tbox", "obd", "awd", "shs", "j8", "j7", "j5", "phev"}
+_SOLUTION_CONFIRMED = (
+    "انحلت", "انحل", "اشتغل", "نجحت", "زبط", "اختفت", "تم الإصلاح", "تم الحل",
+    "جربته ونفع", "بعد التغيير", "تأكد الحل",
+)
 CAR_THREAD_KEYWORDS = [
     "جايكو", "j8", "j7", "j5", "shs", "وكيل", "وكالة", "صيانة", "معتمد", "ضمان",
     "عطل", "مشكلة", "حل", "قطعة", "قطع", "سعر", "زيت", "فلتر", "بطارية", "شاشة",
@@ -571,9 +586,9 @@ SHS_MODEL_KEYWORDS = [
     "shs", "هايبرد", "هجين", "بلق ان", "بلقن", "phev", "plug-in", "plugin", "شحن كهرباء", "شحن كهربائي",
 ]
 _MODEL_MARKERS = {
-    "Jaecoo J5": ("جايكو 5", "جيكو 5", "جايكو ٥", "جي 5", "جيه 5"),
-    "Jaecoo J7": ("جايكو 7", "جيكو 7", "جايكو ٧", "جي 7", "جيه 7"),
-    "Jaecoo J8": ("جايكو 8", "جيكو 8", "جايكو ٨", "جي 8", "جيه 8"),
+    "Jaecoo J5": ("جايكو 5", "جيكو 5", "جايكو ٥", "جيكو ٥", "جي 5", "جي ٥", "جيه 5"),
+    "Jaecoo J7": ("جايكو 7", "جيكو 7", "جايكو ٧", "جيكو ٧", "جي 7", "جي ٧", "جيه 7"),
+    "Jaecoo J8": ("جايكو 8", "جيكو 8", "جايكو ٨", "جيكو ٨", "جي 8", "جي ٨", "جيه 8"),
 }
 EXPERT_GUIDELINES_TOPICS = [
     "خطوات", "استلام", "الوكيل", "المعرض", "فحص", "تشييك", "قبل الخروج",
@@ -623,37 +638,39 @@ def collect_groq_keys(primary: str = "") -> list[str]:
     return keys
 
 
+def _rate_limit_cooldown(error: Exception) -> int:
+    text = str(error).lower()
+    if any(token in text for token in ("tpd", "tokens per day", "per day", "daily", "quota")):
+        return _GROQ_DAILY_COOLDOWN_SECONDS
+    return _GROQ_COOLDOWN_SECONDS
+
+
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يبدّل مفاتيح Groq والنماذج عند 429 مع انتظار تراجعي قصير."""
+    """يتخطى النموذج المضغوط فوراً وينتقل للمفتاح أو النموذج التالي دون نوم."""
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("مفتاح Groq API غير موجود")
     last_error = None
-    attempt = 0
+    now = time.time()
     for key in keys:
         client = Groq(api_key=key)
         for model_name in GROQ_MODELS:
+            cooldown_until = _GROQ_COOLDOWN.get((key, model_name), 0)
+            if cooldown_until > now:
+                continue
             kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
-            if json_mode:
+            if json_mode and "qwen3-32b" not in model_name.lower():
                 kwargs["response_format"] = {"type": "json_object"}
             try:
                 return client.chat.completions.create(**kwargs)
             except Exception as exc:
                 last_error = exc
                 message = str(exc).lower()
-                if json_mode and "response_format" in message:
-                    kwargs.pop("response_format", None)
-                    try:
-                        return client.chat.completions.create(**kwargs)
-                    except Exception as retry_exc:
-                        last_error = retry_exc
-                        message = str(retry_exc).lower()
                 if "429" in message or "rate_limit" in message:
-                    pause = min(8, 2 ** attempt)
-                    attempt += 1
+                    pause = _rate_limit_cooldown(exc)
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + pause
                     if on_switch:
-                        on_switch(f"ضغط Groq. تبديل المفتاح والنموذج بعد {pause} ثوانٍ.")
-                    time.sleep(pause)
+                        on_switch(f"تخطى {model_name.split('/')[-1]} لمدة {pause} ثانية وانتقل فوراً.")
                 continue
     raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
 
@@ -688,18 +705,32 @@ def _card_blob(data: dict, source_text: str = "") -> str:
     )
 
 
+def _mentions_hybrid(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(token in lowered for token in ("هايبرد", "هجين", "phev", "بلق ان", "بلقن", "plug-in", "plugin"))
+
+
+def _mentions_shs_name(text: str) -> bool:
+    return bool(re.search(r"(?<![a-z0-9])shs(?![a-z0-9])", (text or "").lower()))
+
+
 def assign_jaecoo_model(data: dict, source_text: str = "") -> dict:
-    """يثبت الطراز من نص السلسلة والبطاقة بالترتيب: SHS ثم J8 ثم J7 ثم J5."""
+    """J7/J5 الهايبرد تبقى لطرازها. J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا طراز."""
     if not isinstance(data, dict):
         return data
     blob = _card_blob(data, source_text)
-    if text_mentions_shs(blob):
+    has_j5 = _mentions_model(blob, "Jaecoo J5")
+    has_j7 = _mentions_model(blob, "Jaecoo J7")
+    has_j8 = _mentions_model(blob, "Jaecoo J8")
+    hybrid = _mentions_hybrid(blob)
+    shs_name = _mentions_shs_name(blob)
+    if shs_name or (hybrid and has_j8) or (hybrid and not has_j7 and not has_j5):
         data["car_model"] = "Jaecoo J8 SHS"
-    elif _mentions_model(blob, "Jaecoo J8"):
+    elif has_j8:
         data["car_model"] = "Jaecoo J8"
-    elif _mentions_model(blob, "Jaecoo J7"):
+    elif has_j7:
         data["car_model"] = "Jaecoo J7"
-    elif _mentions_model(blob, "Jaecoo J5"):
+    elif has_j5:
         data["car_model"] = "Jaecoo J5"
     return data
 
@@ -712,7 +743,8 @@ def _title_is_english(title: str) -> bool:
     text = str(title or "").strip()
     if re.search(r"[\u0600-\u06FF]", text):
         return False
-    return bool(re.search(r"[A-Za-z]", text))
+    tokens = re.findall(r"[A-Za-z0-9]+", text)
+    return any(token.lower() not in _LATIN_TECH_TOKENS for token in tokens)
 
 
 def _has_useful_info(text: str) -> bool:
@@ -722,13 +754,7 @@ def _has_useful_info(text: str) -> bool:
     if "?" in cleaned or "؟" in cleaned:
         return True
     lowered = cleaned.lower()
-    markers = (
-        "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "مشكلة", "عطل", "صوت", "رجة", "نتعة",
-        "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت", "صيانة", "ضمان",
-        "وكالة", "تحديث", "كفر", "بنزين", "صرفية", "استهلاك", "حساس", "لمبة", "كود", "تأمين", "قطع",
-        "سعر", "كم", "كيف", "وين", "حل", "جرب",
-    )
-    return any(marker.lower() in lowered for marker in markers)
+    return any(marker.lower() in lowered for marker in USEFUL_TOPIC_TERMS)
 
 
 def card_passes_quality_gate(card: dict) -> bool:
@@ -740,7 +766,7 @@ def card_passes_quality_gate(card: dict) -> bool:
     solution = str(card.get("solution_or_summary") or "").strip()
     flag = card.get("is_worth_archiving")
     explicit_false = flag in (False, 0, "0", "false", "False")
-    if explicit_false and not (_has_useful_info(title) or _has_useful_info(solution)):
+    if explicit_false and not _has_useful_info(solution):
         return False
     if any(_field_is_blank(item) for item in (title, problem, solution)):
         return False
@@ -831,14 +857,15 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             {
                 "role": "system",
                 "content": (
-                    "استخرج JSON فقط وبالعربية الخالصة، بلا وسم think وبلا شرح خارج الكائن. "
-                    "استخرج كل عطل وتجربة ورقم قطعة وسعر صيانة ورد في السلسلة. "
-                    "أي استفسار فني أو تجربة مالك أو حل عملي يعني is_worth_archiving = true. "
-                    "احفظ روابط علي إكسبريس والإكسسوارات، وتجارب العملية والمميزات والعيوب، وبيانات الوكيل والصيانة. "
-                    "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
-                    "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
-                    "Jaecoo J8 SHS عند SHS أو هايبرد أو هجين أو بلق ان أو PHEV أو شحن كهرباء. "
-                    "ثم Jaecoo J8 وJaecoo J7 وJaecoo J5 حسب ذكر الطراز. "
+                    "استخرج JSON فقط وبالعربية، ويُسمح بالمصطلحات التقنية الإنجليزية مثل AGM وCarPlay وTbox وOBD وAWD وSHS. "
+                    "بلا وسم think وبلا سياج json. "
+                    "problem_or_topic = المشكلة أو الموضوع بدقة. "
+                    "solution_or_summary = خلاصة الحلول وتجارب الأعضاء، وإن تعددت الآراء فاذكرها بوضوح. "
+                    "part_numbers_or_specs = أرقام القطع والمقاسات: بطارية، إطارات، لزوجة زيت، فيوز، تحديث، سعر صيانة، أو رابط منتج. "
+                    "is_worth_archiving = true لأي استفسار فني أو تجربة مالك أو حل عملي أو ملاحظة وكيل أو تأمين أو سعر أو استلام. "
+                    "is_verified_solution = true فقط إذا أكد عضو أن الحل نجح فعلياً، وإلا false. "
+                    "Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 إذا لم يُذكر J8 أو SHS. "
+                    "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا تحديد J7 أو J5. "
                     "ممنوع إخراج nan."
                 ),
             },
@@ -891,6 +918,8 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         data["solution_or_summary"] = problem_text.strip()
     if _has_useful_info(thread_text) or _has_useful_info(problem_text) or _has_useful_info(str(data.get("solution_or_summary") or "")):
         data["is_worth_archiving"] = True
+    confirmed = any(phrase in thread_text for phrase in _SOLUTION_CONFIRMED)
+    data["is_verified_solution"] = bool(confirmed)
     return force_j8_shs_model(data, thread_text)
 
 

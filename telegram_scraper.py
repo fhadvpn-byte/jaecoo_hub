@@ -18,6 +18,7 @@ from database_and_ai import (
     analyze_thread_with_ai,
     collect_groq_keys,
     compress_image_to_b64,
+    USEFUL_TOPIC_TERMS,
     card_passes_quality_gate,
     extract_urls,
     get_db_connection,
@@ -433,12 +434,6 @@ _EDGE_GREETINGS = (
     "ياشباب",
     "هلا",
 )
-_USEFUL_TOPIC_TERMS = (
-    "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "مشكلة", "عطل", "صوت", "رجة", "نتعة",
-    "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت", "صيانة", "ضمان",
-    "وكالة", "تحديث", "كفر", "بنزين", "صرفية", "استهلاك", "حساس", "لمبة", "كود", "تأمين", "قطع",
-    "سعر", "كم", "كيف", "وين", "حل", "جرب",
-)
 
 
 def _strip_edge_greetings(text: str) -> str:
@@ -464,14 +459,15 @@ def _remaining_is_technical(text: str) -> bool:
     if "?" in text or "؟" in text:
         return True
     lowered = text.lower()
-    return any(term.lower() in lowered for term in _USEFUL_TOPIC_TERMS)
+    return any(term.lower() in lowered for term in USEFUL_TOPIC_TERMS)
 
 
 def _thread_is_noise(messages: list) -> bool:
-    """يستبعد التحية الفارغة فقط، ويبقي السؤال والمصطلح الفني مهما قصرا."""
+    """يتخطى التحية المجردة فقط. السؤال والرد والرابط والوسائط والمصطلح الفني تبقى."""
     texts = []
     has_link = False
     has_media = False
+    has_reply = False
     for message in messages:
         text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
         texts.append(text)
@@ -479,12 +475,22 @@ def _thread_is_noise(messages: list) -> bool:
             has_link = True
         if detect_msg_media_kind(message) != "text":
             has_media = True
-    if has_link or has_media:
+        if _reply_to_id(message):
+            has_reply = True
+    if has_link or has_media or has_reply:
         return False
     remaining = _strip_edge_greetings(" ".join(part for part in texts if part))
     if _remaining_is_technical(remaining):
         return False
     return len(remaining) < 15
+
+
+def _pull_digest(group: str, scanned: int, threads: int, skipped: int, saved: int) -> str:
+    return (
+        f"اسم القروب: ({group}) | فُحصت: {scanned} رسالة | "
+        f"سلاسل النقاش: {threads} | استُبعدت كترحيب عابر: {skipped} | "
+        f"حُفظت/حُدثت: {saved} بطاقة"
+    )
 
 
 def _is_blocking_failure(exc: Exception) -> bool:
@@ -620,7 +626,10 @@ async def _open_client(cfg: dict, logs: list):
 
 async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
     logs = []
-    result = {"ok": False, "saved": 0, "scanned": 0, "group": "", "error": None, "logs": logs}
+    result = {
+        "ok": False, "saved": 0, "scanned": 0, "threads": 0, "skipped": 0,
+        "group": "", "error": None, "logs": logs,
+    }
     init_db()
     cfg = load_config()
     groq_key = _groq_key(cfg) or (collect_groq_keys() or [""])[0]
@@ -747,11 +756,22 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     break
                 _note(logs, f"تعذر جلب بعض الرسائل الأصلية: {exc}", "error")
             threads = _build_dialogue_threads(batch)
+            result["threads"] += len(threads)
             thread_total = max(len(threads), 1)
             hold_checkpoint = False
+            _report(
+                on_progress,
+                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                _span(batch_base),
+            )
             for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
                 if _thread_is_noise(thread_messages):
-                    _report(on_progress, f"تخطي النقاش {root_id}: دردشة قصيرة بلا رابط أو رد فني.", _span(batch_base))
+                    result["skipped"] += 1
+                    _report(
+                        on_progress,
+                        _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                        _span(batch_base),
+                    )
                     continue
                 fraction = _span(batch_base + fetched * (0.45 + 0.55 * thread_index / thread_total))
                 blocks = []
@@ -834,7 +854,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
                 _report(
                     on_progress,
-                    f"تم حفظ البطاقة بنجاح. عدد البطاقات في القاعدة: {_stored_card_count()}.",
+                    _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                     fraction,
                 )
 
@@ -844,10 +864,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             update_last_synced_id(cursor_id, group_key)
             _report(
                 on_progress,
-                (
-                    f"اكتملت الدفعة {batch_no}. المفحوص {pulled} من {requested}، "
-                    f"والبطاقات {result['saved']}. آخر رسالة محفوظة: {get_last_synced_id(group_key)}."
-                ),
+                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 _span(pulled),
             )
             if pulled >= requested:
@@ -858,7 +875,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
             result["ok"] = True
             _report(
                 on_progress,
-                f"اكتمل السحب. تم فحص {result['scanned']} رسالة وإضافة {result['saved']} بطاقة. آخر نقطة: {get_last_synced_id(group_key)}.",
+                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 1.0,
             )
             _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")

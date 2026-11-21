@@ -1286,9 +1286,11 @@ if is_admin:
             total_cards = len(fresh_df)
             if result.get("ok"):
                 lines.append(
-                    f"اكتمل السحب. الرسائل المفحوصة: {result.get('scanned', 0)}، "
-                    f"البطاقات المحفوظة في هذه الجولة: {result.get('saved', 0)}، "
-                    f"إجمالي القاعدة: {total_cards}."
+                    f"اسم القروب: ({result.get('group') or 'القروب'}) | "
+                    f"فُحصت: {result.get('scanned', 0)} رسالة | "
+                    f"سلاسل النقاش: {result.get('threads', 0)} | "
+                    f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
+                    f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة | إجمالي القاعدة: {total_cards}."
                 )
                 log_progress_box.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
             else:
@@ -1302,9 +1304,12 @@ if is_admin:
                     _render_metrics(fresh_df)
                 shs_now = _model_count(fresh_df, "Jaecoo J8 SHS")
                 st.session_state["sync_notice"] = (
-                    f"تم سحب قروب {result.get('group') or 'التلجرام'} "
-                    f"وحفظ {result.get('saved', 0)} بطاقة. الإجمالي الآن {total_cards}. "
-                    f"بطاقات Jaecoo J8 SHS: {shs_now}."
+                    f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
+                    f"فُحصت: {result.get('scanned', 0)} رسالة | "
+                    f"سلاسل النقاش: {result.get('threads', 0)} | "
+                    f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
+                    f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
+                    f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {shs_now}."
                 )
                 st.rerun()
     with analyze_col:
