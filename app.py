@@ -17,6 +17,8 @@ from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
     collect_groq_keys,
+    describe_groq_error,
+    test_groq_key,
     compress_image_to_b64,
     DB_NAME,
     find_matching_solution_in_db,
@@ -279,8 +281,9 @@ def _trim_sync_lines() -> None:
 
 def _record_sync_progress(message: str, fraction: float) -> None:
     with _SYNC_GUARD:
-        _SYNC_STATE["lines"].append(message)
-        _trim_sync_lines()
+        if not (_SYNC_STATE["lines"] and _SYNC_STATE["lines"][-1] == message):
+            _SYNC_STATE["lines"].append(message)
+            _trim_sync_lines()
         _SYNC_STATE["fraction"] = fraction
         _SYNC_STATE["message"] = message
 
@@ -297,27 +300,8 @@ def _auto_sync_worker():
 
 
 def start_auto_sync(config: dict):
-    has_api = bool(str(config.get("tg_api_id") or "").strip() and str(config.get("tg_api_hash") or "").strip())
-    has_login = bool(str(config.get("tg_session") or "").strip() or os.path.exists(PERSONAL_SESSION_FILE))
-    if not collect_groq_keys(config.get("groq_api_key") or config.get("gemini_api_key") or "") or not (has_api or has_login):
-        return
-    try:
-        last_attempt = float(get_app_setting("telegram_sync_attempt_at") or 0)
-    except ValueError:
-        last_attempt = 0
-    if time.time() - last_attempt < 180:
-        return
-    with _SYNC_GUARD:
-        if _SYNC_STATE["running"]:
-            return
-        if time.time() - _SYNC_STATE["done_at"] < 180:
-            return
-        _SYNC_STATE["running"] = True
-        _SYNC_STATE["result"] = None
-        _SYNC_STATE["lines"] = ["جاري الاتصال بجلسة الحساب..."]
-        _SYNC_STATE["fraction"] = 0.08
-        _SYNC_STATE["message"] = "جاري الاتصال بجلسة الحساب..."
-    threading.Thread(target=_auto_sync_worker, daemon=True).start()
+    """لا يبدأ سحب الثلاثين رسالة حتى لا يحجب زر السحب اليدوي."""
+    return
 
 
 @st.fragment(run_every=timedelta(seconds=6))
@@ -501,7 +485,23 @@ def hydrate_config(cfg: dict) -> dict:
         changed = True
     if changed:
         save_config(cfg)
+    publish_groq_env(cfg)
     return cfg
+
+
+def publish_groq_env(cfg: dict) -> None:
+    """ينسخ مفاتيح Groq إلى البيئة قبل أي Thread لأن st.secrets لا يصل داخل الخيط."""
+    mapping = (
+        ("groq_api_key", "GROQ_API_KEY", ("GROQ_API_KEY", "groq_api_key", "gemini_api_key")),
+        ("groq_api_key_2", "GROQ_API_KEY_2", ("GROQ_API_KEY_2", "groq_api_key_2")),
+        ("groq_api_key_3", "GROQ_API_KEY_3", ("GROQ_API_KEY_3", "groq_api_key_3")),
+    )
+    for cfg_key, env_key, secret_names in mapping:
+        value = str(cfg.get(cfg_key) or "").strip() or _read_secret(secret_names)
+        if value:
+            os.environ[env_key] = value
+            if not str(cfg.get(cfg_key) or "").strip():
+                cfg[cfg_key] = value
 
 
 def _settings_fingerprint(cfg: dict) -> tuple:
@@ -574,8 +574,6 @@ def viewer_is_admin(cfg: dict) -> bool:
 
 cfg = apply_cloud_string_session(ensure_admin_token(hydrate_config(load_config())))
 is_admin = viewer_is_admin(cfg)
-if is_admin:
-    start_auto_sync(cfg)
 
 st.markdown("""
 <style>
@@ -1004,8 +1002,19 @@ if is_admin:
                 cfg["bot_token"] = bot_token_input.strip()
                 cfg["auto_reply_enabled"] = auto_reply_input
                 save_config(cfg)
+                publish_groq_env(cfg)
                 st.session_state["_settings_fp"] = _settings_fingerprint(cfg)
                 st.success("✨ تم حفظ إعدادات Groq والتيليجرام بنجاح!")
+            if st.button("🩺 اختبار مفتاح Groq", use_container_width=True, key="test_groq_key"):
+                trial_key = groq_key_input.strip() or str(cfg.get("groq_api_key") or "")
+                if trial_key:
+                    os.environ["GROQ_API_KEY"] = trial_key
+                publish_groq_env(cfg)
+                try:
+                    test_groq_key(trial_key or os.environ.get("GROQ_API_KEY") or "")
+                    st.success("✅ مفتاح Groq يعمل بنجاح")
+                except Exception as exc:
+                    st.error(describe_groq_error(exc))
 
         st.markdown("#### 💾 النسخ الاحتياطي لقاعدة المعرفة")
         db_path = Path(DB_NAME)
@@ -1252,12 +1261,18 @@ if is_admin:
                     _SYNC_STATE["fraction"] = 0.08
                     _SYNC_STATE["message"] = opening
 
-            if start_pull:
+            if not start_pull:
+                st.warning("توجد عملية سحب جارية. انتظر اكتمالها ثم أعد الضغط لسحب العدد المختار في الشريط.")
+            else:
+                publish_groq_env(cfg)
+                explicit_key = str(cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or "")
+                chosen_limit = int(limit_val)
+
                 def _pull_worker() -> None:
                     try:
-                        result = run_sync(int(limit_val), on_progress=_record_sync_progress)
+                        result = run_sync(chosen_limit, on_progress=_record_sync_progress, api_key=explicit_key)
                     except Exception as exc:
-                        result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
+                        result = {"ok": False, "saved": 0, "error": describe_groq_error(exc), "logs": []}
                     with _SYNC_GUARD:
                         _SYNC_STATE["result"] = result
                         _SYNC_STATE["done_at"] = time.time()
@@ -1265,53 +1280,57 @@ if is_admin:
 
                 threading.Thread(target=_pull_worker, daemon=True).start()
 
-            log_progress_box.progress(0.08, text=opening)
-            log_status_box.code(opening, language="text")
-            while True:
-                with _SYNC_GUARD:
-                    running = _SYNC_STATE["running"]
-                    lines = list(_SYNC_STATE["lines"])
-                    fraction = float(_SYNC_STATE["fraction"] or 0.0)
-                    message = str(_SYNC_STATE["message"] or "جاري السحب...")
-                    result = _SYNC_STATE["result"]
-                log_status_box.code("\n".join(lines) or message, language="text")
-                log_progress_box.progress(min(1.0, max(0.0, fraction)), text=message)
-                if not running:
-                    break
-                time.sleep(0.4)
-            result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
-            fresh = get_db_connection()
-            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-            fresh.close()
-            total_cards = len(fresh_df)
-            if result.get("ok"):
-                lines.append(
-                    f"اسم القروب: ({result.get('group') or 'القروب'}) | "
-                    f"فُحصت: {result.get('scanned', 0)} رسالة | "
-                    f"سلاسل النقاش: {result.get('threads', 0)} | "
-                    f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
-                    f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة | إجمالي القاعدة: {total_cards}."
-                )
-                log_progress_box.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
-            else:
-                lines.append(result.get("error") or "تعذر إكمال السحب.")
-                log_progress_box.progress(1.0, text="انتهى السحب")
-            lines = lines[-_SYNC_LINE_LIMIT:]
-            log_status_box.code("\n".join(lines), language="text")
-            st.session_state["sync_logs"] = lines
-            if result.get("ok"):
-                with metrics_box.container():
-                    _render_metrics(fresh_df)
-                shs_now = _model_count(fresh_df, "Jaecoo J8 SHS")
-                st.session_state["sync_notice"] = (
-                    f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
-                    f"فُحصت: {result.get('scanned', 0)} رسالة | "
-                    f"سلاسل النقاش: {result.get('threads', 0)} | "
-                    f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
-                    f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
-                    f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {shs_now}."
-                )
-                st.rerun()
+                log_progress_box.progress(0.08, text=opening)
+                log_status_box.code(opening, language="text")
+                while True:
+                    with _SYNC_GUARD:
+                        running = _SYNC_STATE["running"]
+                        lines = list(_SYNC_STATE["lines"])
+                        fraction = float(_SYNC_STATE["fraction"] or 0.0)
+                        message = str(_SYNC_STATE["message"] or "جاري السحب...")
+                        result = _SYNC_STATE["result"]
+                    log_status_box.code("\n".join(lines) or message, language="text")
+                    log_progress_box.progress(min(1.0, max(0.0, fraction)), text=message)
+                    if not running:
+                        break
+                    time.sleep(0.4)
+                result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
+                fresh = get_db_connection()
+                fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+                fresh.close()
+                total_cards = len(fresh_df)
+                if result.get("ok"):
+                    summary = (
+                        f"اسم القروب: ({result.get('group') or 'القروب'}) | "
+                        f"فُحصت: {result.get('scanned', 0)} رسالة | "
+                        f"سلاسل النقاش: {result.get('threads', 0)} | "
+                        f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
+                        f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة | إجمالي القاعدة: {total_cards}."
+                    )
+                    if lines and str(lines[-1]).startswith("اسم القروب:"):
+                        lines[-1] = summary
+                    else:
+                        lines.append(summary)
+                    log_progress_box.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
+                else:
+                    lines.append(result.get("error") or "تعذر إكمال السحب.")
+                    log_progress_box.progress(1.0, text="انتهى السحب")
+                lines = lines[-_SYNC_LINE_LIMIT:]
+                log_status_box.code("\n".join(lines), language="text")
+                st.session_state["sync_logs"] = lines
+                if result.get("ok"):
+                    with metrics_box.container():
+                        _render_metrics(fresh_df)
+                    shs_now = _model_count(fresh_df, "Jaecoo J8 SHS")
+                    st.session_state["sync_notice"] = (
+                        f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
+                        f"فُحصت: {result.get('scanned', 0)} رسالة | "
+                        f"سلاسل النقاش: {result.get('threads', 0)} | "
+                        f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
+                        f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
+                        f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {shs_now}."
+                    )
+                    st.rerun()
     with analyze_col:
         if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
             groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")

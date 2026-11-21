@@ -17,6 +17,8 @@ from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
     collect_groq_keys,
+    describe_groq_error,
+    is_key_or_quota_error,
     compress_image_to_b64,
     USEFUL_TOPIC_TERMS,
     card_passes_quality_gate,
@@ -82,7 +84,12 @@ def prepare_unlocked_session(src: str = PERSONAL_SESSION_FILE, dst: str = RUNTIM
 
 
 def _groq_key(cfg: dict) -> str:
-    return (cfg.get("groq_api_key") or cfg.get("gemini_api_key") or "").strip()
+    return (
+        os.environ.get("GROQ_API_KEY")
+        or cfg.get("groq_api_key")
+        or cfg.get("gemini_api_key")
+        or ""
+    ).strip()
 
 
 def _api_credentials(cfg: dict) -> tuple[int, str]:
@@ -624,7 +631,7 @@ async def _open_client(cfg: dict, logs: list):
     return None, "جلسة تيليجرام غير مفعّلة. افتح قسم تفعيل الجلسة وأدخل رقم الجوال."
 
 
-async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
+async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "") -> dict:
     logs = []
     result = {
         "ok": False, "saved": 0, "scanned": 0, "threads": 0, "skipped": 0,
@@ -632,7 +639,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
     }
     init_db()
     cfg = load_config()
-    groq_key = _groq_key(cfg) or (collect_groq_keys() or [""])[0]
+    groq_key = str(api_key or os.environ.get("GROQ_API_KEY") or _groq_key(cfg) or "").strip()
+    if not groq_key:
+        groq_key = (collect_groq_keys() or [""])[0]
     if not collect_groq_keys(groq_key):
         result["error"] = "مفتاح Groq API غير موجود. أدخله في الإعدادات ثم احفظ."
         _note(logs, result["error"], "error")
@@ -833,14 +842,14 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                         on_progress,
                     )
                 except Exception as exc:
-                    if _is_blocking_failure(exc):
+                    reason = describe_groq_error(exc)
+                    notice = f"النقاش {root_id}: تعذر تحليله عبر Groq — السبب: {reason}"
+                    _note(logs, notice, "error")
+                    _report(on_progress, notice, fraction)
+                    if is_key_or_quota_error(exc) or _is_blocking_failure(exc):
                         hold_checkpoint = True
-                        result["error"] = "توقفت الحصة أو الشبكة قبل حفظ هذه الدفعة. المؤشر لم يتقدم وستُستأنف الرسائل نفسها."
-                        _note(logs, result["error"], "error")
-                        _report(on_progress, result["error"], fraction)
+                        result["error"] = notice
                         break
-                    _note(logs, f"تخطي النقاش {root_id}: {exc}", "error")
-                    _report(on_progress, f"النقاش {root_id}: تعذر تحليله عبر Groq.", fraction)
                     continue
                 await asyncio.sleep(1.5)
                 if not _worth_archiving(card):
@@ -873,11 +882,6 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
 
         if not result.get("error"):
             result["ok"] = True
-            _report(
-                on_progress,
-                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
-                1.0,
-            )
             _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:
@@ -1021,9 +1025,10 @@ def _telegram_error_message(exc: Exception) -> str:
     return f"تعذر سحب الرسائل: {text}"
 
 
-def run_sync(limit: int = 50, on_progress=None) -> dict:
+def run_sync(limit: int = 50, on_progress=None, api_key: str = "") -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     init_db()
+    chosen_key = str(api_key or os.environ.get("GROQ_API_KEY") or "").strip()
     acquired = False
     try:
         acquired = _CLIENT_LOCK.acquire(blocking=False)
@@ -1038,7 +1043,9 @@ def run_sync(limit: int = 50, on_progress=None) -> dict:
             }
         _set_sync_active(True)
         set_app_setting("telegram_sync_attempt_at", str(time.time()))
-        return _run_on_fresh_loop(lambda: sync_and_analyze(limit=limit, on_progress=on_progress))
+        return _run_on_fresh_loop(
+            lambda: sync_and_analyze(limit=limit, on_progress=on_progress, api_key=chosen_key)
+        )
     finally:
         if acquired:
             try:

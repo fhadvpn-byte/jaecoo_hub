@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -554,9 +555,9 @@ def save_card(
 # 4. محرك Groq الذكي والسريع
 # ==========================================
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 _GROQ_COOLDOWN = {}
 _GROQ_COOLDOWN_SECONDS = 90
@@ -614,8 +615,37 @@ def should_analyze_thread(text: str, media_type: str = "text") -> bool:
     return is_car_related_thread(text, media_type)
 
 
+def _secret_groq_values() -> list[str]:
+    """يقرأ مفاتيح Groq من st.secrets فقط إذا كانت Streamlit محمّلة في العملية."""
+    if "streamlit" not in sys.modules:
+        return []
+    try:
+        import streamlit as st
+
+        secrets = st.secrets
+    except Exception:
+        return []
+    bags = [secrets]
+    try:
+        if "groq" in secrets:
+            bags.append(secrets["groq"])
+    except Exception:
+        pass
+    names = ("GROQ_API_KEY", "groq_api_key", "gemini_api_key", "GROQ_API_KEY_2", "groq_api_key_2", "GROQ_API_KEY_3", "groq_api_key_3")
+    found = []
+    for bag in bags:
+        for name in names:
+            try:
+                text = str(bag.get(name, "") or "").strip()
+            except Exception:
+                text = ""
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
 def collect_groq_keys(primary: str = "") -> list[str]:
-    """يجمع المفتاح الأساسي والمفاتيح الإضافية، ولكل مفتاح رصيده المستقل."""
+    """المفتاح الصريح ثم البيئة وst.secrets، وconfig.json في الأخير."""
     cfg = {}
     try:
         cfg = load_config()
@@ -624,18 +654,43 @@ def collect_groq_keys(primary: str = "") -> list[str]:
     keys = []
     for value in (
         primary,
+        os.environ.get("GROQ_API_KEY"),
+        os.environ.get("GROQ_API_KEY_2"),
+        os.environ.get("GROQ_API_KEY_3"),
+        *_secret_groq_values(),
         cfg.get("groq_api_key"),
         cfg.get("gemini_api_key"),
         cfg.get("groq_api_key_2"),
         cfg.get("groq_api_key_3"),
-        os.environ.get("GROQ_API_KEY"),
-        os.environ.get("GROQ_API_KEY_2"),
-        os.environ.get("GROQ_API_KEY_3"),
     ):
         text = str(value or "").strip()
         if text and text not in keys:
             keys.append(text)
     return keys
+
+
+def describe_groq_error(exc: Exception) -> str:
+    """سبب مختصر بلا مفتاح: الكود ثم نص السيرفر."""
+    text = re.sub(r"gsk_[A-Za-z0-9_\-]+", "[key]", str(exc or ""))
+    text = re.sub(r"(?i)(api[_ ]?key|authorization|bearer)\s*[:=]\s*\S+", r"\1 [key]", text)
+    text = " ".join(text.split())
+    code = ""
+    status = getattr(exc, "status_code", None)
+    if status:
+        code = str(status)
+    else:
+        match = re.search(r"\b(400|401|403|404|413|429|500|503)\b", text)
+        if match:
+            code = match.group(1)
+    label = code or exc.__class__.__name__
+    if len(text) > 180:
+        text = text[:180] + "…"
+    return f"{label} / {text}" if text else label
+
+
+def is_key_or_quota_error(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(token in text for token in ("401", "403", "invalid_api_key", "invalid api key", "429", "rate_limit", "rate limit", "quota"))
 
 
 def _rate_limit_cooldown(error: Exception) -> int:
@@ -645,11 +700,31 @@ def _rate_limit_cooldown(error: Exception) -> int:
     return _GROQ_COOLDOWN_SECONDS
 
 
+def _with_json_word(messages: list) -> list:
+    """Groq يرفض response_format إذا لم تظهر كلمة JSON الإنجليزية داخل الموجه."""
+    blob = " ".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
+    if "json" in blob.lower():
+        return messages
+    copied = [dict(item) for item in messages]
+    if copied and copied[0].get("role") == "system":
+        copied[0]["content"] = f"{copied[0].get('content') or ''}\nReturn valid JSON."
+        return copied
+    return [{"role": "system", "content": "Return valid JSON."}, *copied]
+
+
+def _groq_create(client, model_name: str, messages: list, temperature: float, use_format: bool):
+    kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
+    if use_format:
+        kwargs["response_format"] = {"type": "json_object"}
+    return client.chat.completions.create(**kwargs)
+
+
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يتخطى النموذج المضغوط فوراً وينتقل للمفتاح أو النموذج التالي دون نوم."""
+    """يتخطى النموذج المضغوط فوراً، ويعيد الطلب بلا JSON mode عند خطأ 400."""
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("مفتاح Groq API غير موجود")
+    payload = _with_json_word(messages) if json_mode else messages
     last_error = None
     now = time.time()
     for key in keys:
@@ -658,14 +733,18 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
             cooldown_until = _GROQ_COOLDOWN.get((key, model_name), 0)
             if cooldown_until > now:
                 continue
-            kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
-            if json_mode and "qwen3-32b" not in model_name.lower():
-                kwargs["response_format"] = {"type": "json_object"}
+            use_format = json_mode and "qwen" not in model_name.lower()
             try:
-                return client.chat.completions.create(**kwargs)
+                return _groq_create(client, model_name, payload, temperature, use_format)
             except Exception as exc:
                 last_error = exc
                 message = str(exc).lower()
+                if use_format and ("400" in message or "json" in message or "response_format" in message):
+                    try:
+                        return _groq_create(client, model_name, payload, temperature, False)
+                    except Exception as retry_exc:
+                        last_error = retry_exc
+                        message = str(retry_exc).lower()
                 if "429" in message or "rate_limit" in message:
                     pause = _rate_limit_cooldown(exc)
                     _GROQ_COOLDOWN[(key, model_name)] = time.time() + pause
@@ -673,6 +752,17 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
                         on_switch(f"تخطى {model_name.split('/')[-1]} لمدة {pause} ثانية وانتقل فوراً.")
                 continue
     raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
+
+
+def test_groq_key(api_key: str) -> str:
+    """طلب تجريبي من كلمتين للتأكد أن المفتاح يصل إلى Groq."""
+    completion = _groq_complete(
+        api_key,
+        [{"role": "user", "content": "رد تم"}],
+        temperature=0,
+        json_mode=False,
+    )
+    return str(completion.choices[0].message.content or "").strip()
 
 
 def text_mentions_shs(text: str) -> bool:
@@ -823,14 +913,27 @@ def _normalize_card_fields(data: dict) -> dict:
 
 
 def _strip_model_json(raw: str) -> str:
-    """يزيل تفكير النموذج وأي سياج حول كائن JSON."""
+    """يزيل تفكير النموذج وأي سياج ثم يأخذ أول كائن JSON."""
     text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        return text[start:end + 1]
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        return match.group(0)
     return text.strip()
+
+
+def _loads_model_json(raw: str) -> dict:
+    payload = _strip_model_json(raw)
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", payload)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("رد النموذج ليس كائن JSON")
+    return parsed
 
 
 def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None, on_switch=None) -> dict:
@@ -851,31 +954,38 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
 {thread_text}
 """
 
-    completion = _groq_complete(
-        api_key,
-        [
-            {
-                "role": "system",
-                "content": (
-                    "استخرج JSON فقط وبالعربية، ويُسمح بالمصطلحات التقنية الإنجليزية مثل AGM وCarPlay وTbox وOBD وAWD وSHS. "
-                    "بلا وسم think وبلا سياج json. "
-                    "problem_or_topic = المشكلة أو الموضوع بدقة. "
-                    "solution_or_summary = خلاصة الحلول وتجارب الأعضاء، وإن تعددت الآراء فاذكرها بوضوح. "
-                    "part_numbers_or_specs = أرقام القطع والمقاسات: بطارية، إطارات، لزوجة زيت، فيوز، تحديث، سعر صيانة، أو رابط منتج. "
-                    "is_worth_archiving = true لأي استفسار فني أو تجربة مالك أو حل عملي أو ملاحظة وكيل أو تأمين أو سعر أو استلام. "
-                    "is_verified_solution = true فقط إذا أكد عضو أن الحل نجح فعلياً، وإلا false. "
-                    "Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 إذا لم يُذكر J8 أو SHS. "
-                    "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا تحديد J7 أو J5. "
-                    "ممنوع إخراج nan."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        json_mode=True,
-        on_switch=on_switch,
-    )
-
-    data = _normalize_card_fields(json.loads(_strip_model_json(completion.choices[0].message.content)))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return valid JSON. استخرج JSON فقط وبالعربية، ويُسمح بالمصطلحات التقنية الإنجليزية مثل AGM وCarPlay وTbox وOBD وAWD وSHS. "
+                "بلا وسم think وبلا سياج json. "
+                "problem_or_topic = المشكلة أو الموضوع بدقة. "
+                "solution_or_summary = خلاصة الحلول وتجارب الأعضاء، وإن تعددت الآراء فاذكرها بوضوح. "
+                "part_numbers_or_specs = أرقام القطع والمقاسات: بطارية، إطارات، لزوجة زيت، فيوز، تحديث، سعر صيانة، أو رابط منتج. "
+                "is_worth_archiving = true لأي استفسار فني أو تجربة مالك أو حل عملي أو ملاحظة وكيل أو تأمين أو سعر أو استلام. "
+                "is_verified_solution = true فقط إذا أكد عضو أن الحل نجح فعلياً، وإلا false. "
+                "Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 إذا لم يُذكر J8 أو SHS. "
+                "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا تحديد J7 أو J5. "
+                "ممنوع إخراج nan."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    last_error = None
+    data = None
+    for json_mode in (True, False):
+        try:
+            completion = _groq_complete(api_key, messages, json_mode=json_mode, on_switch=on_switch)
+            data = _normalize_card_fields(_loads_model_json(completion.choices[0].message.content or ""))
+            break
+        except Exception as exc:
+            last_error = exc
+            if json_mode and not is_key_or_quota_error(exc):
+                continue
+            raise
+    if data is None:
+        raise last_error or RuntimeError("تعذر قراءة JSON من رد Groq")
     parts = str(data.get("part_numbers_or_specs") or "").strip()
     if parts.lower() in {"", "nan", "none", "null"}:
         data["part_numbers_or_specs"] = "غير محدد"
@@ -923,7 +1033,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     return force_j8_shs_model(data, thread_text)
 
 
-VISION_MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct"]
+VISION_MODELS = ["qwen/qwen3.8-27b"]
 WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
 
