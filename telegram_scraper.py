@@ -18,6 +18,7 @@ from database_and_ai import (
     analyze_thread_with_ai,
     collect_groq_keys,
     compress_image_to_b64,
+    card_passes_quality_gate,
     extract_urls,
     get_db_connection,
     init_db,
@@ -244,19 +245,7 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
 
 
 def _worth_archiving(card: dict) -> bool:
-    if not isinstance(card, dict):
-        return False
-    flag = card.get("is_worth_archiving")
-    if flag in (False, 0, "0", "false", "False", None):
-        return False
-    cleaned = {field: _clean_text(card.get(field)) for field in _REQUIRED_CARD_FIELDS}
-    blob = " ".join(cleaned.values())
-    specific = any(marker in blob for marker in ("ترصيص", "جدول", "SHS", "J8", "J7", "J5", "هايبرد", "هجين"))
-    if _clean_text(card.get("category")) == "نبض القروب والدردشة العامة" and not specific:
-        return False
-    if not cleaned["problem_or_topic"] or not cleaned["solution_or_summary"]:
-        return False
-    return _has_arabic(cleaned["problem_or_topic"]) and _has_arabic(cleaned["solution_or_summary"])
+    return card_passes_quality_gate(card)
 
 
 def _note(logs: list, message: str, level: str = "info") -> None:
@@ -382,20 +371,92 @@ def _reply_to_id(message) -> int | None:
     return int(reply_id) if reply_id else None
 
 
-def _group_reply_threads(messages: list) -> dict:
-    """يربط كل رسالة بالردود التي جاءت عليها داخل الدفعة."""
+def _sender_id(message) -> int:
+    return int(getattr(message, "sender_id", None) or 0)
+
+
+def _message_time(message):
+    return getattr(message, "date", None)
+
+
+def _grouped_id(message):
+    grouped = getattr(message, "grouped_id", None)
+    return grouped if grouped else None
+
+
+def _build_dialogue_threads(messages: list) -> dict:
+    """يجمع الردود وألبوم الوسائط ورسائل الكاتب المتتالية خلال 3 دقائق في سلسلة واحدة."""
     threads = {}
     message_to_root = {}
+    grouped_to_root = {}
+    previous = None
+    previous_root = None
     for message in sorted(messages, key=lambda item: item.id):
         reply_id = _reply_to_id(message)
+        grouped = _grouped_id(message)
+        root_id = None
         if reply_id and reply_id in message_to_root:
             root_id = message_to_root[reply_id]
-            threads[root_id].append(message)
-            message_to_root[message.id] = root_id
-        else:
-            threads[message.id] = [message]
-            message_to_root[message.id] = message.id
+        elif grouped and grouped in grouped_to_root:
+            root_id = grouped_to_root[grouped]
+        elif previous is not None and previous_root is not None and not reply_id:
+            moment = _message_time(message)
+            previous_moment = _message_time(previous)
+            same_sender = _sender_id(message) and _sender_id(message) == _sender_id(previous)
+            if same_sender and moment is not None and previous_moment is not None:
+                if abs((moment - previous_moment).total_seconds()) <= 180:
+                    root_id = previous_root
+        if root_id is None:
+            root_id = message.id
+        threads.setdefault(root_id, []).append(message)
+        message_to_root[message.id] = root_id
+        if grouped:
+            grouped_to_root[grouped] = root_id
+        previous = message
+        previous_root = root_id
     return threads
+
+
+def _group_reply_threads(messages: list) -> dict:
+    return _build_dialogue_threads(messages)
+
+
+_NOISE_PHRASES = (
+    "مبروك", "تهانينا", "تهاني", "السلام عليكم", "سلام عليكم", "صباح الخير", "مساء الخير",
+    "هلا والله", "هلا", "تصبحون على خير", "الله يسعدك", "تسلم", "يعطيك العافية",
+)
+
+
+def _thread_is_noise(messages: list) -> bool:
+    """يستبعد الترحيب والتهاني والدردشة القصيرة قبل استدعاء Groq."""
+    texts = []
+    has_link = False
+    has_media = False
+    has_technical_reply = False
+    for message in messages:
+        text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
+        texts.append(text)
+        if extract_urls(text):
+            has_link = True
+        if detect_msg_media_kind(message) != "text":
+            has_media = True
+        if _reply_to_id(message) and len(text) >= 25:
+            has_technical_reply = True
+    if has_link or has_media or has_technical_reply:
+        return False
+    combined = " ".join(part for part in texts if part).strip()
+    if len(combined) < 25:
+        return True
+    compact = combined.replace(" ", "")
+    return len(combined) <= 80 and any(phrase.replace(" ", "") in compact or phrase in combined for phrase in _NOISE_PHRASES)
+
+
+def _is_blocking_failure(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        token in text
+        for token in ("429", "rate_limit", "rate limit", "timeout", "connection", "network", "disconnected", "temporarily")
+    )
 
 
 def _should_analyze_message(message) -> bool:
@@ -615,9 +676,13 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
             ]
 
-            threads = _group_reply_threads(batch)
+            threads = _build_dialogue_threads(batch)
             thread_total = max(len(threads), 1)
+            hold_checkpoint = False
             for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
+                if _thread_is_noise(thread_messages):
+                    _report(on_progress, f"تخطي النقاش {root_id}: دردشة قصيرة بلا رابط أو رد فني.", _span(batch_base))
+                    continue
                 fraction = _span(batch_base + fetched * (0.45 + 0.55 * thread_index / thread_total))
                 blocks = []
                 raw_parts = []
@@ -638,6 +703,11 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                             on_progress,
                         )
                     except Exception as exc:
+                        if _is_blocking_failure(exc):
+                            hold_checkpoint = True
+                            result["error"] = "تعذر قراءة الرسائل بسبب انقطاع الشبكة. المؤشر لم يتقدم."
+                            _note(logs, result["error"], "error")
+                            break
                         _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
                         _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
                         continue
@@ -650,6 +720,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                         dominant_media = media_kind
                     if media_b64 and not best_thumb:
                         best_thumb = media_b64
+
+                if hold_checkpoint:
+                    break
 
                 thread_text = "\n\n".join(blocks).strip()
                 content = "\n".join(raw_parts)
@@ -670,6 +743,12 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                         on_progress,
                     )
                 except Exception as exc:
+                    if _is_blocking_failure(exc):
+                        hold_checkpoint = True
+                        result["error"] = "توقفت الحصة أو الشبكة قبل حفظ هذه الدفعة. المؤشر لم يتقدم وستُستأنف الرسائل نفسها."
+                        _note(logs, result["error"], "error")
+                        _report(on_progress, result["error"], fraction)
+                        break
                     _note(logs, f"تخطي النقاش {root_id}: {exc}", "error")
                     _report(on_progress, f"النقاش {root_id}: تعذر تحليله عبر Groq.", fraction)
                     continue
@@ -678,7 +757,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     _report(on_progress, f"النقاش {root_id}: لا يحتوي حلاً كافياً لحفظ بطاقة.", fraction)
                     continue
                 thread_url = f"https://t.me/c/{public_id}/{root_id}"
-                save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb)
+                if save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb) is False:
+                    _report(on_progress, f"النقاش {root_id}: البوابة رفضت البطاقة.", fraction)
+                    continue
                 result["saved"] += 1
                 _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
                 _report(
@@ -687,6 +768,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                     fraction,
                 )
 
+            if hold_checkpoint:
+                _report(on_progress, "بقيت نقطة السحب عند آخر دفعة ناجحة حتى لا تُفقد الرسائل.", _span(batch_base))
+                break
             update_last_synced_id(cursor_id, group_key)
             _report(
                 on_progress,
@@ -700,13 +784,14 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 break
             await asyncio.sleep(BATCH_PAUSE_SECONDS)
 
-        result["ok"] = True
-        _report(
-            on_progress,
-            f"اكتمل السحب. تم فحص {result['scanned']} رسالة وإضافة {result['saved']} بطاقة. آخر نقطة: {get_last_synced_id(group_key)}.",
-            1.0,
-        )
-        _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
+        if not result.get("error"):
+            result["ok"] = True
+            _report(
+                on_progress,
+                f"اكتمل السحب. تم فحص {result['scanned']} رسالة وإضافة {result['saved']} بطاقة. آخر نقطة: {get_last_synced_id(group_key)}.",
+                1.0,
+            )
+            _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:
         result["error"] = _telegram_error_message(exc)
@@ -794,6 +879,14 @@ async def _confirm_login(phone: str, code: str, phone_code_hash: str, temp_sessi
             pass
 
 
+def _run_on_fresh_loop(factory):
+    """يفتح event loop مستقلاً حتى لا يشارك عميل Telethon حلقة Streamlit."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(factory())).result()
+
+
 def _run_login(factory):
     acquired = False
     try:
@@ -801,13 +894,7 @@ def _run_login(factory):
         if not acquired:
             return {"ok": False, "error": "توجد محاولة اتصال جارية. انتظر ثواني ثم أعد المحاولة."}
         _set_sync_active(True)
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(factory())
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(lambda: asyncio.run(factory())).result()
+        return _run_on_fresh_loop(factory)
     finally:
         if acquired:
             try:
@@ -864,15 +951,7 @@ def run_sync(limit: int = 50, on_progress=None) -> dict:
             }
         _set_sync_active(True)
         set_app_setting("telegram_sync_attempt_at", str(time.time()))
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))
-
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(lambda: asyncio.run(sync_and_analyze(limit=limit, on_progress=on_progress))).result()
+        return _run_on_fresh_loop(lambda: sync_and_analyze(limit=limit, on_progress=on_progress))
     finally:
         if acquired:
             try:

@@ -1320,9 +1320,12 @@ if is_admin:
                         source_text, media_type, media_b64 = _prepare_lab_source(lab_text, lab_file, groq_key)
                         card = analyze_thread_with_ai(source_text or "حلل المرفق", groq_key)
                         msg_id = -int(time.time() * 1000)
-                        save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type, media_b64)
-                        st.session_state["sync_notice"] = f"تم حفظ البطاقة: {card.get('title')}"
-                        st.rerun()
+                        saved = save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type, media_b64)
+                        if not saved:
+                            st.warning("لم تُحفظ البطاقة لأن العنوان غير عربي أو المحتوى غير مفيد.")
+                        else:
+                            st.session_state["sync_notice"] = f"تم حفظ البطاقة: {card.get('title')}"
+                            st.rerun()
                     except Exception as e:
                         st.error(f"خطأ أثناء التحليل: {e}")
     with sample_col:
@@ -1383,9 +1386,11 @@ if is_admin:
                 msg_id = -int(time.time() * 1000)
                 manual_b64 = _image_preview(m_image.getvalue()) if m_image is not None else ""
                 manual_type = "image" if manual_b64 else "text"
-                save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob, manual_type, manual_b64)
-                st.session_state["sync_notice"] = "تمت إضافة البطاقة!"
-                st.rerun()
+                if save_card(card_manual, msg_id, "", "إضافة يدوية", m_prob, manual_type, manual_b64):
+                    st.session_state["sync_notice"] = "تمت إضافة البطاقة!"
+                    st.rerun()
+                else:
+                    st.warning("لم تُحفظ البطاقة. استخدم عنواناً عربياً واملأ الوصف والخلاصة.")
             else:
                 st.warning("أدخل عنوان البطاقة والخلاصة.")
 
@@ -1487,6 +1492,9 @@ selected_media = st.radio(
 )
 if selected_media != "all" and not filtered_df.empty and "media_type" in filtered_df.columns:
     filtered_df = filtered_df[filtered_df["media_type"].fillna("text") == selected_media]
+verified_only = st.checkbox("✅ الحلول المؤكدة فقط", key="verified_only_filter")
+if verified_only and not filtered_df.empty and "is_verified_solution" in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df["is_verified_solution"].fillna(0).astype(int).eq(1)]
 
 if filtered_df.empty:
     if is_admin:
@@ -1495,7 +1503,7 @@ if filtered_df.empty:
         st.info("لا توجد بطاقات مطابقة حالياً.")
 else:
     page_count = max(1, (len(filtered_df) + CARD_PAGE_SIZE - 1) // CARD_PAGE_SIZE)
-    filter_signature = (search_q.strip(), model_filter, selected_cat, selected_media)
+    filter_signature = (search_q.strip(), model_filter, selected_cat, selected_media, verified_only)
     if st.session_state.get("card_filter_sig") != filter_signature:
         st.session_state["card_filter_sig"] = filter_signature
         st.session_state["card_page"] = 1

@@ -179,6 +179,7 @@ SYSTEM_PROMPT = """
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     return conn
 
 def init_db():
@@ -493,7 +494,9 @@ def save_card(
     media_b64: str = "",
 ):
     """يحفظ البطاقة فوراً. الرسالة نفسها تُحدَّث في صفها، ولا تُستبدل بطاقة أخرى."""
-    card_data = force_j8_shs_model(dict(card_data or {}), raw_text or "")
+    card_data = merge_missing_links(force_j8_shs_model(dict(card_data or {}), raw_text or ""), raw_text or "")
+    if not card_passes_quality_gate(card_data):
+        return False
     params = (
         int(telegram_msg_id),
         thread_url,
@@ -545,14 +548,14 @@ def save_card(
             conn.commit()
         finally:
             conn.close()
+    return True
 
 # ==========================================
 # 4. محرك Groq الذكي والسريع
 # ==========================================
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
 ]
 CAR_THREAD_KEYWORDS = [
@@ -565,13 +568,12 @@ CAR_THREAD_KEYWORDS = [
     "هايبرد", "هجين", "الهجينة", "الكهربائية", "الشاحن", "محرك الشحن", "البطارية الكبيرة", "الفيش",
 ]
 SHS_MODEL_KEYWORDS = [
-    "shs", "hybrid", "phev", "هايبرد", "هجين", "الهجينة", "الهايبرد",
-    "محرك الشحن", "البطارية الكبيرة",
+    "shs", "هايبرد", "هجين", "بلق ان", "بلقن", "phev", "plug-in", "plugin", "شحن كهرباء", "شحن كهربائي",
 ]
 _MODEL_MARKERS = {
-    "Jaecoo J5": ("جي 5", "جيه 5", "جايكو 5", "جايكو ٥"),
-    "Jaecoo J7": ("جي 7", "جيه 7", "جايكو 7", "جايكو ٧"),
-    "Jaecoo J8": ("جي 8", "جيه 8", "جايكو 8", "جايكو ٨"),
+    "Jaecoo J5": ("جايكو 5", "جيكو 5", "جايكو ٥", "جي 5", "جيه 5"),
+    "Jaecoo J7": ("جايكو 7", "جيكو 7", "جايكو ٧", "جي 7", "جيه 7"),
+    "Jaecoo J8": ("جايكو 8", "جيكو 8", "جايكو ٨", "جي 8", "جيه 8"),
 }
 EXPERT_GUIDELINES_TOPICS = [
     "خطوات", "استلام", "الوكيل", "المعرض", "فحص", "تشييك", "قبل الخروج",
@@ -622,11 +624,12 @@ def collect_groq_keys(primary: str = "") -> list[str]:
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يجرّب المفاتيح والنماذج بالتتابع. عند 429 ينتقل فوراً دون انتظار تهدئة طويلة."""
+    """يبدّل مفاتيح Groq والنماذج عند 429 مع انتظار تراجعي قصير."""
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("مفتاح Groq API غير موجود")
     last_error = None
+    attempt = 0
     for key in keys:
         client = Groq(api_key=key)
         for model_name in GROQ_MODELS:
@@ -638,16 +641,20 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
             except Exception as exc:
                 last_error = exc
                 message = str(exc).lower()
-                if on_switch and ("429" in message or "rate_limit" in message):
-                    on_switch(f"تبديل فوري إلى النموذج البديل ({model_name.split('/')[-1]}) لمواصلة السحب بدون انتظار.")
                 if json_mode and "response_format" in message:
                     kwargs.pop("response_format", None)
                     try:
                         return client.chat.completions.create(**kwargs)
                     except Exception as retry_exc:
                         last_error = retry_exc
+                        message = str(retry_exc).lower()
+                if "429" in message or "rate_limit" in message:
+                    pause = min(8, 2 ** attempt)
+                    attempt += 1
+                    if on_switch:
+                        on_switch(f"ضغط Groq. تبديل المفتاح والنموذج بعد {pause} ثوانٍ.")
+                    time.sleep(pause)
                 continue
-    time.sleep(5)
     raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
 
 
@@ -682,27 +689,70 @@ def _card_blob(data: dict, source_text: str = "") -> str:
 
 
 def assign_jaecoo_model(data: dict, source_text: str = "") -> dict:
-    """يثبت الطراز من محتوى النقاش أو الصورة، ويبقي J5 وJ7 عند ذكرهما صراحة."""
+    """يثبت الطراز من نص السلسلة والبطاقة بالترتيب: SHS ثم J8 ثم J7 ثم J5."""
     if not isinstance(data, dict):
         return data
     blob = _card_blob(data, source_text)
-    lowered = blob.lower()
-    has_j5 = _mentions_model(blob, "Jaecoo J5")
-    has_j7 = _mentions_model(blob, "Jaecoo J7")
-    has_j8 = _mentions_model(blob, "Jaecoo J8")
-    shs_name = bool(re.search(r"(?<![a-z0-9])shs(?![a-z0-9])", lowered))
-    hybrid = text_mentions_shs(blob) or ("ترصيص" in blob and (shs_name or "هايبرد" in blob or "هجين" in blob))
-    other_only = (has_j5 or has_j7) and not has_j8 and not shs_name
-    if hybrid and not other_only:
+    if text_mentions_shs(blob):
         data["car_model"] = "Jaecoo J8 SHS"
-        return data
-    if has_j8 and not has_j5 and not has_j7:
+    elif _mentions_model(blob, "Jaecoo J8"):
         data["car_model"] = "Jaecoo J8"
-    elif has_j5 and not has_j7 and not has_j8:
-        data["car_model"] = "Jaecoo J5"
-    elif has_j7 and not has_j5 and not has_j8:
+    elif _mentions_model(blob, "Jaecoo J7"):
         data["car_model"] = "Jaecoo J7"
+    elif _mentions_model(blob, "Jaecoo J5"):
+        data["car_model"] = "Jaecoo J5"
     return data
+
+
+def _field_is_blank(value) -> bool:
+    return str(value or "").strip().lower() in {"", "nan", "none", "null"}
+
+
+def _title_is_english(title: str) -> bool:
+    text = str(title or "").strip()
+    if re.search(r"[\u0600-\u06FF]", text):
+        return False
+    return bool(re.search(r"[A-Za-z]", text))
+
+
+def card_passes_quality_gate(card: dict) -> bool:
+    """يرفض البطاقة التافهة والعنوان الإنجليزي والحقول الفارغة أو nan."""
+    if not isinstance(card, dict):
+        return False
+    if card.get("is_worth_archiving") in (False, 0, "0", "false", "False"):
+        return False
+    title = str(card.get("title") or "").strip()
+    problem = str(card.get("problem_or_topic") or "").strip()
+    solution = str(card.get("solution_or_summary") or "").strip()
+    if any(_field_is_blank(item) for item in (title, problem, solution)):
+        return False
+    if _title_is_english(title):
+        return False
+    return bool(re.search(r"[\u0600-\u06FF]", problem + solution))
+
+
+def merge_missing_links(card: dict, source_text: str) -> dict:
+    """يضيف روابط الرسالة إلى الحل أو القطع إذا أسقطها التلخيص."""
+    if not isinstance(card, dict):
+        return card
+    urls = []
+    for raw_url in extract_urls(source_text or ""):
+        url = raw_url.rstrip(".,:;!?،؛])")
+        if url and url not in urls:
+            urls.append(url)
+    if not urls:
+        return card
+    solution = str(card.get("solution_or_summary") or "")
+    parts = str(card.get("part_numbers_or_specs") or "")
+    missing = [url for url in urls if url not in solution and url not in parts]
+    if not missing:
+        return card
+    extra = " | ".join(missing)
+    if _field_is_blank(parts) or parts.strip() == "غير محدد":
+        card["part_numbers_or_specs"] = extra
+    else:
+        card["solution_or_summary"] = f"{solution}\n{extra}".strip()
+    return card
 
 
 def force_j8_shs_model(data: dict, source_text: str = "") -> dict:
@@ -757,8 +807,8 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                     "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
                     "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
                     "أي معلومة أو استفسار أو رد فني أو جدول صيانة أو تجربة ترصيص يعني is_worth_archiving = true. "
-                    "Jaecoo J5 وJaecoo J7 وJaecoo J8 تبقى لطرازها. "
-                    "Jaecoo J8 SHS فقط عند SHS أو الهايبرد أو الهجين أو البطارية الكبيرة أو ترصيص الهايبرد. "
+                    "Jaecoo J8 SHS عند SHS أو هايبرد أو هجين أو بلق ان أو PHEV أو شحن كهرباء. "
+                    "ثم Jaecoo J8 وJaecoo J7 وJaecoo J5 حسب ذكر الطراز. "
                     "ممنوع إخراج nan."
                 ),
             },
