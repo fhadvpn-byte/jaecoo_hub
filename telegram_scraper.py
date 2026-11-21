@@ -21,6 +21,7 @@ from database_and_ai import (
     collect_groq_keys,
     is_key_or_quota_error,
     compress_image_to_b64,
+    describe_groq_error,
     USEFUL_TOPIC_TERMS,
     card_passes_quality_gate,
     extract_urls,
@@ -55,8 +56,9 @@ _STOP_SYNC_EVENT = threading.Event()
 _SYNC_ROUND_ACTIVE = False
 SESSION_PULL_CAP = 10000
 BATCH_PAUSE_SECONDS = 2
-RATE_LIMIT_RETRIES = 4
-RATE_LIMIT_PAUSE_CAP = 20
+AI_REQUEST_PACING_SECONDS = 0.5
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_PAUSE_CAP = 25
 _REQUIRED_CARD_FIELDS = (
     "category",
     "car_model",
@@ -249,7 +251,9 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
             if document and getattr(document, "mime_type", None):
                 mime = document.mime_type
             try:
-                vision_text = analyze_image_bytes(groq_key, image_bytes, caption_for_ai, mime)
+                vision_text = await asyncio.to_thread(
+                    analyze_image_bytes, groq_key, image_bytes, caption_for_ai, mime
+                )
             except Exception:
                 vision_text = ""
         if vision_text:
@@ -261,7 +265,9 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
         try:
             audio_bytes = await tg_client.download_media(message, file=bytes)
             if audio_bytes:
-                spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=file_ext or ".ogg")
+                spoken_text = await asyncio.to_thread(
+                    transcribe_media_bytes, groq_key, audio_bytes, file_ext or ".ogg"
+                )
         except Exception:
             spoken_text = ""
         if spoken_text:
@@ -277,7 +283,9 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
         preview = _preview_b64(thumb_bytes)
         if thumb_bytes:
             try:
-                thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption_for_ai, "video/thumb")
+                thumb_desc = await asyncio.to_thread(
+                    analyze_image_bytes, groq_key, thumb_bytes, caption_for_ai, "video/thumb"
+                )
             except Exception:
                 thumb_desc = ""
             if thumb_desc:
@@ -287,7 +295,9 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
             try:
                 video_bytes = await tg_client.download_media(message, file=bytes)
                 if video_bytes:
-                    spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=file_ext or ".mp4")
+                    spoken_video = await asyncio.to_thread(
+                        transcribe_media_bytes, groq_key, video_bytes, file_ext or ".mp4"
+                    )
                     if spoken_video:
                         parts.append(f"[الكلام المنطوق داخل الفيديو]: {spoken_video}")
             except Exception:
@@ -433,18 +443,57 @@ def update_last_synced_id(msg_id: int, group_key: str = SYNC_GROUP_KEY) -> None:
         conn.close()
 
 
+def _advance_contiguous_checkpoint(
+    active_page: list,
+    resolved_ids: set[int],
+    prev_cursor: int,
+    group_key: str = SYNC_GROUP_KEY,
+) -> int:
+    """لا يرفع المؤشر إلا لآخر رسالة متصلة اكتملت معالجتها دون أي فشل تقني."""
+    safe_id = int(prev_cursor)
+    for msg in active_page:
+        mid = int(msg.id)
+        if mid in resolved_ids:
+            if mid > safe_id:
+                safe_id = mid
+        else:
+            break
+    if safe_id > int(prev_cursor):
+        update_last_synced_id(safe_id, group_key)
+    return safe_id
+
+
 def _rate_limit_wait_seconds(error: Exception) -> int:
-    match = re.search(r"try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s", str(error))
+    match = re.search(r"try again in (?:(\d+)m)?(\d+(?:\.\d+)?)s", str(error).lower())
     if not match:
-        return 25
+        return 18
     minutes = int(match.group(1) or 0)
     seconds = float(match.group(2) or 0)
-    return min(1800, int(minutes * 60 + seconds) + 3)
+    return min(120, int(minutes * 60 + seconds) + 2)
+
+
+def _is_daily_exhaustion(error: Exception) -> bool:
+    low = str(error or "").lower()
+    return any(
+        token in low
+        for token in ("استُنفدت حصة groq اليومية", "tokens per day", "requests per day", "tpd", "rpd", "per day")
+    )
 
 
 def _is_rate_limit(error: Exception) -> bool:
     text = str(error).lower()
-    return "429" in text or "rate_limit" in text
+    return "429" in text or "rate_limit" in text or "rate limit" in text
+
+
+def _is_ai_service_error(exc: Exception) -> bool:
+    """يميز أخطاء الشبكة والحصة والخدمة عن أخطاء تنسيق النص العابرة."""
+    if is_key_or_quota_error(exc) or _is_blocking_failure(exc) or isinstance(exc, RuntimeError):
+        return True
+    low = f"{exc.__class__.__name__} {exc}".lower()
+    return any(
+        token in low
+        for token in ("500", "502", "503", "504", "408", "تعذر", "api", "client", "connection", "timeout")
+    )
 
 
 def detect_msg_media_kind(message) -> str:
@@ -608,7 +657,7 @@ def _explain_sync_stop(result: dict) -> str:
     if error:
         low = error.lower()
         if any(token in low for token in ("401", "429", "quota", "rate limit", "rate_limit", "حصة", "مفتاح")):
-            return f"توقف السحب: خطأ مفتاح أو حصة Groq. {error}"
+            return f"توقف السحب لحماية الرسائل (خطأ مفتاح أو حصة Groq): {error}"
         if any(token in low for token in ("اتصال", "شبكة", "timeout", "connection", "disconnected", "network")):
             return f"توقف السحب: خطأ اتصال. {error}"
         return f"توقف السحب: {error}"
@@ -621,7 +670,7 @@ def _explain_sync_stop(result: dict) -> str:
     if int(result.get("scanned") or 0) == 0:
         return "لا توجد رسائل جديدة. انتهت رسائل القروب عند نقطة التوقف."
     return (
-        f"انتهى السحب دون حفظ بطاقات. فُحصت {result.get('scanned', 0)} رسالة، "
+        f"انتهى السحب دون حفظ بطاقات جديدة. فُحصت {result.get('scanned', 0)} رسالة، "
         f"سلاسل النقاش {result.get('threads', 0)}، واستُبعدت تحيات {result.get('skipped', 0)}."
     )
 
@@ -656,7 +705,7 @@ def _should_analyze_message(message) -> bool:
 
 
 async def _run_with_backoff(factory, on_progress):
-    """يتخطى ضغط Groq بتهدئة قصيرة ويعيد المحاولة داخل نفس جلسة السحب."""
+    """يعيد المحاولة عند ضغط الدقيقة العابر، ويتوقف فوراً إذا نفدت الحصة اليومية."""
     for attempt in range(RATE_LIMIT_RETRIES):
         try:
             value = factory()
@@ -664,12 +713,12 @@ async def _run_with_backoff(factory, on_progress):
                 return await value
             return value
         except Exception as exc:
-            if not _is_rate_limit(exc) or attempt + 1 >= RATE_LIMIT_RETRIES:
+            if _is_daily_exhaustion(exc) or not _is_rate_limit(exc) or attempt + 1 >= RATE_LIMIT_RETRIES:
                 raise
             pause = min(_rate_limit_wait_seconds(exc), RATE_LIMIT_PAUSE_CAP)
             _report(
                 on_progress,
-                f"ضغط Groq. تريث {pause} ثانية ثم متابعة السحب من نفس النقطة.",
+                f"ضغط مؤقت على Groq: تريث {pause} ثانية ثم متابعة السحب من نفس النقطة...",
                 0.45,
             )
             await asyncio.sleep(pause)
@@ -908,13 +957,14 @@ async def sync_and_analyze(
                 )
         _report(on_progress, start_note, 0.09)
         _report(on_progress, f"نقطة البداية الفعلية بعد الفحص: من الرسالة رقم {cursor_id}", 0.095)
-        _report(on_progress, "البطاقات السابقة تبقى محفوظة. نقطة آخر رسالة تُحفظ بعد كل نقاش.", 0.1)
+        _report(on_progress, "المؤشر محمي: لا يتقدم إلا للرسائل التي اكتمل تحليلها بنجاح.", 0.10)
         _note(logs, f"متابعة أرشفة {group_name} بعد الرسالة {cursor_id}. المطلوب {requested}.")
 
         sender_cache: dict[int, str] = {}
         pulled = 0
         batch_no = 0
         empty_date_pages = 0
+        consecutive_ai_errors = 0
         while pulled < requested:
             if _STOP_SYNC_EVENT.is_set():
                 result["stopped"] = True
@@ -924,6 +974,7 @@ async def sync_and_analyze(
             batch_no += 1
             this_limit = min(SYNC_CHAIN_BATCH, requested - pulled)
             batch_base = pulled
+            prev_cursor = cursor_id
             _report(
                 on_progress,
                 f"الدفعة {batch_no}: سحب {this_limit} رسالة من الأقدم إلى الأحدث. المفحوص {pulled} من {requested}.",
@@ -941,10 +992,10 @@ async def sync_and_analyze(
                 if pulled == 0 and not ignore_date_filter and saved_checkpoint > 0:
                     stall = (
                         f"المؤشر متوقف عند آخر رسالة رقم {saved_checkpoint} — "
-                        "اضغط زر (سحب القروب كاملاً من البداية) أو (إعادة الضبط للبدء من 1/1/2026)."
+                        "اضغط زر (إعادة الضبط للبدء من 1/1/2026) أو (سحب القروب كاملاً من البداية)."
                     )
                 elif pulled == 0:
-                    stall = "لا توجد رسائل جديدة. انتهت رسائل القروب عند نقطة التوقف."
+                    stall = "لا توجد رسائل جديدة بعد نقطة التوقف الحالية."
                 else:
                     stall = (
                         f"انتهت رسائل القروب. لا توجد رسائل أحدث. "
@@ -953,10 +1004,14 @@ async def sync_and_analyze(
                 result["hint"] = stall
                 _report(on_progress, stall, _span(pulled))
                 break
+            active_page = []
             raw_messages = []
+            resolved_page_ids: set[int] = set()
             fetched = 0
             for message in page:
+                active_page.append(message)
                 if not ignore_date_filter and not _message_is_after_start(message):
+                    resolved_page_ids.add(int(message.id))
                     continue
                 fetched += 1
                 pulled += 1
@@ -973,25 +1028,23 @@ async def sync_and_analyze(
                 )
                 raw_messages.append(message)
                 if pulled >= requested:
-                    cursor_id = message.id
                     break
-            else:
-                cursor_id = page[-1].id
+            next_cursor_id = int(active_page[-1].id)
             if not raw_messages:
-                update_last_synced_id(cursor_id, group_key)
+                cursor_id = _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                 empty_date_pages += 1
                 if empty_date_pages >= 50:
                     result["hint"] = "تجاوزنا صفحات ما قبل 1/1/2026 دون العثور على رسائل أحدث."
                     break
                 continue
             empty_date_pages = 0
-
             referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
-            batch = [
-                message for message in raw_messages
-                if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
-            ]
-
+            batch = []
+            for message in raw_messages:
+                if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids:
+                    batch.append(message)
+                else:
+                    resolved_page_ids.add(int(message.id))
             try:
                 batch = await _attach_missing_parents(client, target, batch)
             except Exception as exc:
@@ -1007,32 +1060,31 @@ async def sync_and_analyze(
             stopped_page = False
             _report(
                 on_progress,
-                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                _pull_digest(group_name, result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 _span(batch_base),
             )
-            prepared_threads = []
             ordered_threads = sorted(
                 threads.items(),
                 key=lambda item: min((getattr(message, "id", 0) or 0) for message in item[1]),
             )
+            prepared_threads = []
             for thread_index, (root_id, thread_messages) in enumerate(ordered_threads, start=1):
                 if _STOP_SYNC_EVENT.is_set():
                     stopped_page = True
                     break
-                checkpoint_id = max((getattr(message, "id", 0) or 0) for message in thread_messages)
+                thread_msg_ids = {int(getattr(m, "id", 0) or 0) for m in thread_messages}
                 if _thread_is_noise(thread_messages):
                     result["skipped"] += 1
-                    if not use_batch_ai:
-                        update_last_synced_id(checkpoint_id, group_key)
+                    resolved_page_ids.update(thread_msg_ids)
+                    _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                     _report(
                         on_progress,
-                        _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                        _pull_digest(group_name, result["scanned"], result["threads"], result["skipped"], result["saved"]),
                         _span(batch_base),
                     )
                     continue
                 fraction = _span(batch_base + fetched * (0.45 + 0.55 * thread_index / thread_total))
                 blocks = []
-                raw_parts = []
                 dominant_media = "text"
                 best_thumb = ""
                 author_name = "عضو"
@@ -1046,16 +1098,15 @@ async def sync_and_analyze(
                             on_progress,
                         )
                     except Exception as exc:
-                        if _is_blocking_failure(exc):
+                        if _is_blocking_failure(exc) or is_key_or_quota_error(exc):
                             hold_checkpoint = True
-                            result["error"] = "تعذر قراءة الرسائل بسبب انقطاع الشبكة. المؤشر لم يتقدم."
+                            result["error"] = f"تعذر قراءة الرسائل أو الوسائط: {describe_groq_error(exc)}"
                             _note(logs, result["error"], "error")
                             break
-                        _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
+                        _note(logs, f"تخطي مرفق الرسالة {message.id}: {exc}", "error")
                         _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
                         continue
                     if (parsed_text or "").strip():
-                        raw_parts.append(parsed_text.strip())
                         blocks.append(f"--- {role} (نوعها: {media_kind}) ---\n{parsed_text}")
                     if {"text": 0, "image": 1, "audio": 2, "video": 3}[media_kind] > {"text": 0, "image": 1, "audio": 2, "video": 3}[dominant_media]:
                         dominant_media = media_kind
@@ -1065,72 +1116,82 @@ async def sync_and_analyze(
                     break
                 thread_text = "\n\n".join(blocks).strip()
                 if not thread_text:
-                    if not use_batch_ai:
-                        update_last_synced_id(checkpoint_id, group_key)
+                    resolved_page_ids.update(thread_msg_ids)
+                    _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                     continue
+                thread_entry = {
+                    "root_id": root_id,
+                    "thread_msg_ids": thread_msg_ids,
+                    "thread_text": thread_text,
+                    "author_name": author_name,
+                    "dominant_media": dominant_media,
+                    "best_thumb": best_thumb,
+                    "fraction": fraction,
+                }
                 if use_batch_ai:
-                    prepared_threads.append({
-                        "root_id": root_id,
-                        "checkpoint_id": checkpoint_id,
-                        "thread_text": thread_text,
-                        "author_name": author_name,
-                        "dominant_media": dominant_media,
-                        "best_thumb": best_thumb,
-                        "fraction": fraction,
-                    })
-                    continue
-                _report(
-                    on_progress,
-                    f"الدفعة {batch_no}: تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
-                    fraction,
-                )
-                try:
-                    card = await _run_with_backoff(
-                        lambda thread_text=thread_text, fraction=fraction: analyze_thread_with_ai(
-                            thread_text,
-                            groq_key,
-                            on_switch=lambda note, fraction=fraction: _report(on_progress, note, fraction),
-                            group_name=group_name,
-                        ),
+                    prepared_threads.append(thread_entry)
+                else:
+                    _report(
                         on_progress,
+                        f"الدفعة {batch_no}: تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
+                        fraction,
                     )
-                except Exception as exc:
-                    detail = re.sub(r"gsk_[A-Za-z0-9_\-]+", "[key]", str(exc)).replace("\n", " ")
-                    notice = f"خطأ Groq في النقاش {root_id}: {type(exc).__name__}: {detail[:100]}"
-                    _note(logs, notice, "error")
-                    _report(on_progress, notice, fraction)
-                    if is_key_or_quota_error(exc):
-                        hold_checkpoint = True
-                        result["error"] = notice
-                        break
-                    update_last_synced_id(checkpoint_id, group_key)
-                    continue
-                reason = card_rejection_reason(card)
-                thread_url = _build_thread_url(public_username, public_id, root_id)
-                if reason or save_card(
-                    card,
-                    root_id,
-                    thread_url,
-                    author_name,
-                    thread_text,
-                    dominant_media,
-                    best_thumb,
-                    group_name=group_name,
-                ) is not True:
-                    rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
-                    notice = f"رفض النقاش {root_id}: {rejection}"
-                    _note(logs, notice, "error")
-                    _report(on_progress, notice, fraction)
-                    update_last_synced_id(checkpoint_id, group_key)
-                    continue
-                result["saved"] += 1
-                update_last_synced_id(checkpoint_id, group_key)
-                _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-                _report(
-                    on_progress,
-                    _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
-                    fraction,
-                )
+                    try:
+                        card = await _run_with_backoff(
+                            lambda thread_text=thread_text, fraction=fraction: asyncio.to_thread(
+                                analyze_thread_with_ai,
+                                thread_text,
+                                groq_key,
+                                None,
+                                None,
+                                lambda note, fraction=fraction: _report(on_progress, note, fraction),
+                                group_name,
+                            ),
+                            on_progress,
+                        )
+                        consecutive_ai_errors = 0
+                    except Exception as exc:
+                        consecutive_ai_errors += 1
+                        clean_err = describe_groq_error(exc)
+                        notice = f"خطأ Groq في النقاش {root_id}: {clean_err}"
+                        _note(logs, notice, "error")
+                        _report(on_progress, notice, fraction)
+                        if _is_ai_service_error(exc) or consecutive_ai_errors >= 3:
+                            hold_checkpoint = True
+                            result["error"] = notice
+                            break
+                        resolved_page_ids.update(thread_msg_ids)
+                        _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
+                        continue
+                    await asyncio.sleep(AI_REQUEST_PACING_SECONDS)
+                    reason = card_rejection_reason(card)
+                    thread_url = _build_thread_url(public_username, public_id, root_id)
+                    if reason or save_card(
+                        card,
+                        root_id,
+                        thread_url,
+                        author_name,
+                        thread_text,
+                        dominant_media,
+                        best_thumb,
+                        group_name=group_name,
+                    ) is not True:
+                        rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
+                        notice = f"استبعاد النقاش {root_id}: {rejection}"
+                        _note(logs, notice, "info")
+                        _report(on_progress, notice, fraction)
+                        resolved_page_ids.update(thread_msg_ids)
+                        _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
+                        continue
+                    result["saved"] += 1
+                    resolved_page_ids.update(thread_msg_ids)
+                    _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
+                    _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                    _report(
+                        on_progress,
+                        _pull_digest(group_name, result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                        fraction,
+                    )
             if use_batch_ai and prepared_threads and not hold_checkpoint and not stopped_page:
                 for start_idx in range(0, len(prepared_threads), AI_BATCH_SIZE):
                     if _STOP_SYNC_EVENT.is_set():
@@ -1144,29 +1205,42 @@ async def sync_and_analyze(
                         f"الدفعة {batch_no}: تحليل حزمة من {len(chunk)} نقاشات عبر Groq | بطاقات {result['saved']}",
                         chunk_fraction,
                     )
-                    batch_cards = await _run_with_backoff(
-                        lambda payload=payload: analyze_threads_batch_with_ai(payload, groq_key, group_name=group_name),
-                        on_progress,
-                    )
+                    try:
+                        batch_cards = await _run_with_backoff(
+                            lambda payload=payload, chunk_fraction=chunk_fraction: asyncio.to_thread(
+                                analyze_threads_batch_with_ai,
+                                payload,
+                                groq_key,
+                                group_name,
+                                lambda note, chunk_fraction=chunk_fraction: _report(on_progress, note, chunk_fraction),
+                            ),
+                            on_progress,
+                        )
+                    except Exception as exc:
+                        hold_checkpoint = True
+                        result["error"] = f"خطأ Groq أثناء التحليل المجمّع: {describe_groq_error(exc)}"
+                        _note(logs, result["error"], "error")
+                        break
                     cards_by_id = {
-                        int(card["thread_id"]): card
-                        for card in batch_cards
-                        if isinstance(card, dict) and card.get("thread_id") is not None
+                        int(c["thread_id"]): c
+                        for c in batch_cards
+                        if isinstance(c, dict) and c.get("thread_id") is not None
                     }
                     for item in chunk:
                         root_id = item["root_id"]
-                        checkpoint_id = item["checkpoint_id"]
                         card = cards_by_id.get(int(root_id)) or {}
                         if card.get("_error"):
-                            notice = f"خطأ Groq في النقاش {root_id}: {card.get('_error_type')}: {str(card.get('_error'))[:100]}"
+                            consecutive_ai_errors += 1
+                            raw_err = str(card.get("_error") or "")
+                            notice = f"خطأ Groq في النقاش {root_id}: {card.get('_error_type')}: {raw_err[:120]}"
                             _note(logs, notice, "error")
                             _report(on_progress, notice, chunk_fraction)
-                            if card.get("_key_failure"):
+                            if card.get("_key_failure") or card.get("_error_type") == "RuntimeError" or consecutive_ai_errors >= 2:
                                 hold_checkpoint = True
                                 result["error"] = notice
                                 break
-                            update_last_synced_id(checkpoint_id, group_key)
                             continue
+                        consecutive_ai_errors = 0
                         reason = card_rejection_reason(card)
                         thread_url = _build_thread_url(public_username, public_id, root_id)
                         if reason or save_card(
@@ -1179,29 +1253,41 @@ async def sync_and_analyze(
                             item["best_thumb"],
                             group_name=group_name,
                         ) is not True:
-                            rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
-                            notice = f"رفض النقاش {root_id}: {rejection}"
-                            _note(logs, notice, "error")
-                            _report(on_progress, notice, chunk_fraction)
-                            update_last_synced_id(checkpoint_id, group_key)
+                            resolved_page_ids.update(item["thread_msg_ids"])
+                            _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                             continue
                         result["saved"] += 1
-                        update_last_synced_id(checkpoint_id, group_key)
+                        resolved_page_ids.update(item["thread_msg_ids"])
+                        _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                         _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                    _report(
+                        on_progress,
+                        _pull_digest(group_name, result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                        chunk_fraction,
+                    )
                     if hold_checkpoint:
                         break
+                    await asyncio.sleep(AI_REQUEST_PACING_SECONDS * 2)
             if stopped_page:
+                _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
                 result["stopped"] = True
                 result["ok"] = True
                 _report(on_progress, "تم إيقاف السحب. التقدم محفوظ عند آخر نقاش اكتملت معالجته.", _span(batch_base))
                 break
             if hold_checkpoint:
-                _report(on_progress, "بقيت نقطة السحب عند آخر دفعة ناجحة حتى لا تُفقد الرسائل.", _span(batch_base))
+                safe_saved_at = _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
+                _report(
+                    on_progress,
+                    f"توقف آمن عند الرسالة #{safe_saved_at} لحماية الرسائل المتبقية من الضياع.",
+                    _span(batch_base),
+                )
                 break
-            update_last_synced_id(cursor_id, group_key)
+            cursor_id = _advance_contiguous_checkpoint(active_page, resolved_page_ids, prev_cursor, group_key)
+            if cursor_id < next_cursor_id and resolved_page_ids.issuperset(int(message.id) for message in active_page):
+                cursor_id = next_cursor_id
             _report(
                 on_progress,
-                _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                _pull_digest(group_name, result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 _span(pulled),
             )
             if pulled >= requested:
