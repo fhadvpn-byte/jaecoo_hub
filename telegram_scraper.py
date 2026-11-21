@@ -1092,6 +1092,7 @@ async def sync_and_analyze(
                             thread_text,
                             groq_key,
                             on_switch=lambda note, fraction=fraction: _report(on_progress, note, fraction),
+                            group_name=result.get("group") or "",
                         ),
                         on_progress,
                     )
@@ -1115,6 +1116,7 @@ async def sync_and_analyze(
                     thread_text,
                     dominant_media,
                     best_thumb,
+                    group_name=result.get("group") or "",
                 ) is not True:
                     rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
                     notice = f"رفض النقاش {root_id}: {rejection}"

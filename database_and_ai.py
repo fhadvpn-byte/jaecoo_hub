@@ -5,7 +5,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -418,6 +417,24 @@ def list_spare_parts(car_model: str) -> list[dict]:
     ]
 
 
+def get_cards_media_map(card_ids: list[int]) -> dict[int, str]:
+    """يجلب الصور المضغوطة لصفحة البطاقات المعروضة فقط لتخفيف استهلاك الذاكرة."""
+    clean_ids = [int(cid) for cid in (card_ids or []) if cid is not None]
+    if not clean_ids:
+        return {}
+    placeholders = ",".join("?" for _ in clean_ids)
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            f"SELECT id, media_b64 FROM knowledge_cards "
+            f"WHERE id IN ({placeholders}) AND media_b64 IS NOT NULL AND media_b64 != ''",
+            clean_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {int(row[0]): str(row[1]) for row in rows}
+
+
 def get_app_setting(key: str) -> str:
     try:
         conn = get_db_connection()
@@ -493,9 +510,11 @@ def save_card(
     raw_text: str,
     media_type: str = "text",
     media_b64: str = "",
+    group_name: str = "",
 ):
     """يحفظ البطاقة فوراً. الرسالة نفسها تُحدَّث في صفها، ولا تُستبدل بطاقة أخرى."""
-    card_data = merge_missing_links(force_j8_shs_model(dict(card_data or {}), raw_text or ""), raw_text or "")
+    prepared = _hint_model_from_group(dict(card_data or {}), raw_text or "", group_name)
+    card_data = merge_missing_links(prepared, raw_text or "")
     if _field_is_blank(card_data.get("problem_or_topic")) and not _field_is_blank(card_data.get("title")):
         card_data["problem_or_topic"] = card_data.get("title")
     if not card_passes_quality_gate(card_data):
@@ -560,10 +579,12 @@ GROQ_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
 ]
 _GROQ_COOLDOWN = {}
 _GROQ_COOLDOWN_SECONDS = 90
 _GROQ_DAILY_COOLDOWN_SECONDS = 600
+_GROQ_MISSING_MODEL_COOLDOWN = 3600
 USEFUL_TOPIC_TERMS = (
     "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "هجين", "phev", "مشكلة", "عطل", "صوت",
     "رجة", "نتعة", "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت",
@@ -572,9 +593,11 @@ USEFUL_TOPIC_TERMS = (
     "تجربة", "تجارب", "استلام", "ملاحظات", "فيوز", "لزوجة", "agm", "carplay", "tbox", "obd", "awd",
 )
 _LATIN_TECH_TOKENS = {"agm", "carplay", "tbox", "obd", "awd", "shs", "j8", "j7", "j5", "phev"}
-_SOLUTION_CONFIRMED = (
-    "انحلت", "انحل", "اشتغل", "نجحت", "زبط", "اختفت", "تم الإصلاح", "تم الحل",
-    "جربته ونفع", "بعد التغيير", "تأكد الحل",
+_NEGATION_PREFIX = r"(?:ما|لم|لن|لا|ولا|مو|مش|غير|بدون\s+ما|دون\s+أن)\s+"
+_CONFIRM_WORDS_PATTERN = (
+    r"انحلت|انحل|تنحل|اشتغل|اشتغلت|نجحت|نجح|زبط|زبطت|ضبط|ضبطت|"
+    r"اختفت|اختفى|راحت\s+المشكلة|انتهت\s+المشكلة|تم\s+الإصلاح|تم\s+الحل|"
+    r"جربته\s+ونفع|نفع\s+معي|تأكد\s+الحل"
 )
 CAR_THREAD_KEYWORDS = [
     "جايكو", "j8", "j7", "j5", "shs", "وكيل", "وكالة", "صيانة", "معتمد", "ضمان",
@@ -656,7 +679,7 @@ def clean_groq_key(value) -> str:
 
 
 def collect_groq_keys(primary: str = "") -> list[str]:
-    """يقرأ os.environ أولاً، ويتجاهل مفاتيح config.json التي لا تبدأ بـ gsk_."""
+    """يمنح الأولوية للمفتاح الممرر صراحةً، ثم البيئة وSecrets، ويتجاهل ما لا يبدأ بـ gsk_."""
     cfg = {}
     try:
         cfg = load_config()
@@ -664,7 +687,7 @@ def collect_groq_keys(primary: str = "") -> list[str]:
         cfg = {}
     keys = []
 
-    def _add(value, *, require_prefix: bool) -> None:
+    def _add(value, *, require_prefix: bool = True) -> None:
         text = clean_groq_key(value)
         if not text or text in keys:
             return
@@ -672,13 +695,13 @@ def collect_groq_keys(primary: str = "") -> list[str]:
             return
         keys.append(text)
 
+    _add(primary)
     for value in (
         os.environ.get("GROQ_API_KEY"),
         os.environ.get("GROQ_API_KEY_2"),
         os.environ.get("GROQ_API_KEY_3"),
     ):
-        _add(value, require_prefix=True)
-    _add(primary, require_prefix=True)
+        _add(value)
     for value in _secret_groq_values():
         _add(value, require_prefix=True)
     for value in (
@@ -722,6 +745,11 @@ def _rate_limit_cooldown(error: Exception) -> int:
     return _GROQ_COOLDOWN_SECONDS
 
 
+def _is_model_unavailable(message: str) -> bool:
+    low = (message or "").lower()
+    return any(token in low for token in ("404", "model_not_found", "decommissioned", "does not exist"))
+
+
 def _with_json_word(messages: list) -> list:
     """Groq يرفض response_format إذا لم تظهر كلمة JSON الإنجليزية داخل الموجه."""
     blob = " ".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
@@ -742,7 +770,7 @@ def _groq_create(client, model_name: str, messages: list, temperature: float, us
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يتخطى النموذج المضغوط فوراً، ويعيد الطلب بلا JSON mode عند خطأ 400."""
+    """يتخطى النموذج المضغوط أو غير المتاح فوراً، ويعيد الطلب بلا JSON mode عند خطأ 400."""
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("مفتاح Groq API غير موجود")
@@ -767,6 +795,11 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
                     except Exception as retry_exc:
                         last_error = retry_exc
                         message = str(retry_exc).lower()
+                if _is_model_unavailable(message):
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
+                    continue
+                if "401" in message or "invalid_api_key" in message or "invalid api key" in message:
+                    break
                 if "429" in message or "rate_limit" in message:
                     pause = _rate_limit_cooldown(exc)
                     _GROQ_COOLDOWN[(key, model_name)] = time.time() + pause
@@ -777,14 +810,31 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
 
 
 def test_groq_key(api_key: str) -> str:
-    """طلب تجريبي من كلمتين للتأكد أن المفتاح يصل إلى Groq."""
-    completion = _groq_complete(
-        api_key,
-        [{"role": "user", "content": "رد تم"}],
-        temperature=0,
-        json_mode=False,
-    )
-    return str(completion.choices[0].message.content or "").strip()
+    """يختبر المفتاح الممرر تحديداً دون القفز إلى مفاتيح احتياطية أخرى."""
+    cleaned = clean_groq_key(api_key)
+    if not cleaned:
+        keys = collect_groq_keys("")
+        cleaned = keys[0] if keys else ""
+    if not cleaned or not cleaned.startswith("gsk_"):
+        raise RuntimeError("أدخل مفتاح Groq صالحاً يبدأ بـ gsk_")
+    client = Groq(api_key=cleaned)
+    last_error = None
+    for model_name in GROQ_MODELS:
+        try:
+            completion = _groq_create(
+                client,
+                model_name,
+                [{"role": "user", "content": "رد تم"}],
+                temperature=0,
+                use_format=False,
+            )
+            return str(completion.choices[0].message.content or "").strip()
+        except Exception as exc:
+            last_error = exc
+            if _is_model_unavailable(str(exc)):
+                continue
+            raise
+    raise last_error or RuntimeError("تعذر اختبار المفتاح عبر نماذج Groq")
 
 
 def text_mentions_shs(text: str) -> bool:
@@ -937,6 +987,8 @@ def _normalize_card_fields(data: dict) -> dict:
     for source, target in aliases.items():
         if data.get(source) not in (None, "") and not data.get(target):
             data[target] = data[source]
+    if data.get("sub_system") == "المحرك والتيربو":
+        data["sub_system"] = "المحرك والتيربو والمنظومة الهجين SHS"
     return data
 
 
@@ -965,7 +1017,30 @@ def _loads_model_json(raw: str) -> dict:
     return parsed
 
 
-def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None, on_switch=None) -> dict:
+def _has_confirmed_solution_signal(thread_text: str) -> Optional[bool]:
+    """يفحص عبارات نجاح الحل مع استبعاد صيغ النفي مثل (ما انحلت / لم يشتغل)."""
+    raw = str(thread_text or "")
+    if not raw.strip():
+        return False
+    negated_pattern = rf"{_NEGATION_PREFIX}(?:{_CONFIRM_WORDS_PATTERN})"
+    has_negated = bool(re.search(negated_pattern, raw))
+    scrubbed = re.sub(negated_pattern, " ", raw)
+    has_positive = bool(re.search(rf"(?:{_CONFIRM_WORDS_PATTERN})", scrubbed))
+    if has_positive:
+        return True
+    if has_negated:
+        return False
+    return None
+
+
+def analyze_thread_with_ai(
+    thread_text: str,
+    api_key: str,
+    media_bytes=None,
+    mime_type=None,
+    on_switch=None,
+    group_name: str = "",
+) -> dict:
     schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
     dealer_hint = ""
     if is_dealer_or_maintenance_msg(thread_text):
@@ -1016,7 +1091,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             raise
     if data is None:
         raise last_error or RuntimeError("تعذر قراءة JSON من رد Groq")
-    return _hint_model_from_group(_polish_extracted_card(data, thread_text), thread_text, "")
+    return _hint_model_from_group(_polish_extracted_card(data, thread_text), thread_text, group_name)
 
 
 def _polish_extracted_card(data: dict, thread_text: str) -> dict:
@@ -1063,8 +1138,15 @@ def _polish_extracted_card(data: dict, thread_text: str) -> dict:
         data["solution_or_summary"] = problem_text.strip()
     if _has_useful_info(thread_text) or _has_useful_info(problem_text) or _has_useful_info(str(data.get("solution_or_summary") or "")):
         data["is_worth_archiving"] = True
-    confirmed = any(phrase in thread_text for phrase in _SOLUTION_CONFIRMED)
-    data["is_verified_solution"] = bool(confirmed)
+    signal = _has_confirmed_solution_signal(thread_text)
+    if signal is True:
+        data["is_verified_solution"] = True
+    elif signal is False:
+        data["is_verified_solution"] = False
+    else:
+        has_replies = "الرد رقم" in (thread_text or "")
+        is_unanswered_q = ("؟" in thread_text or "?" in thread_text) and not has_replies
+        data["is_verified_solution"] = False if is_unanswered_q else bool(data.get("is_verified_solution"))
     return data
 
 
@@ -1098,7 +1180,7 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
     def _fallback_one(item: dict) -> dict:
         thread_id = item.get("thread_id")
         try:
-            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key)
+            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key, group_name=group_name)
             return _prepare_batch_card(card, str(item.get("text") or ""), thread_id, group_name)
         except Exception as exc:
             return {
@@ -1166,7 +1248,7 @@ WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
 
 def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mime_type: str = "image/jpeg") -> str:
-    """يحلل صورة الطبلون أو القطعة أو الفاتورة ويعيد وصفاً عربياً."""
+    """يحلل صورة الطبلون أو القطعة أو الفاتورة مع التبديل بين مفاتيح ونماذج Groq."""
     payload = base64.b64encode(image_bytes).decode("utf-8")
     data_mime = "image/jpeg" if mime_type == "video/thumb" else (mime_type or "image/jpeg")
     if mime_type == "video/thumb":
@@ -1185,59 +1267,73 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("مفتاح Groq API غير موجود")
-    client = Groq(api_key=keys[0])
     last_error = None
-    for model_name in VISION_MODELS:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{data_mime};base64,{payload}"}},
-                    ],
-                }],
-                temperature=0.2,
-            )
-            return str(response.choices[0].message.content or "").strip()
-        except Exception as exc:
-            last_error = exc
-            continue
+    now = time.time()
+    for key in keys:
+        client = Groq(api_key=key)
+        for model_name in VISION_MODELS:
+            if _GROQ_COOLDOWN.get((key, model_name), 0) > now:
+                continue
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:{data_mime};base64,{payload}"}},
+                        ],
+                    }],
+                    temperature=0.2,
+                )
+                return str(response.choices[0].message.content or "").strip()
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc).lower()
+                if _is_model_unavailable(msg):
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
+                elif "429" in msg or "rate_limit" in msg:
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _rate_limit_cooldown(exc)
+                elif "401" in msg or "invalid_api_key" in msg:
+                    break
+                continue
     raise last_error or RuntimeError("تعذر تحليل الصورة")
 
 
 def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") -> str:
-    """يفرّغ المقطع الصوتي أو صوت الفيديو إلى نص عربي."""
+    """يفرّغ المقطع الصوتي أو صوت الفيديو من الذاكرة مباشرة مع دوران المفاتيح."""
     suffix = ext if ext.startswith(".") else f".{ext}"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(media_bytes)
-        tmp_path = tmp.name
-    try:
-        keys = collect_groq_keys(api_key)
-        if not keys:
-            raise RuntimeError("مفتاح Groq API غير موجود")
-        client = Groq(api_key=keys[0])
-        last_error = None
+    keys = collect_groq_keys(api_key)
+    if not keys:
+        raise RuntimeError("مفتاح Groq API غير موجود")
+    last_error = None
+    now = time.time()
+    for key in keys:
+        client = Groq(api_key=key)
         for model_name in WHISPER_MODELS:
+            if _GROQ_COOLDOWN.get((key, model_name), 0) > now:
+                continue
             try:
-                with open(tmp_path, "rb") as handle:
-                    transcription = client.audio.transcriptions.create(
-                        file=(f"media{suffix}", handle.read()),
-                        model=model_name,
-                        language="ar",
-                        response_format="text",
-                    )
+                transcription = client.audio.transcriptions.create(
+                    file=(f"media{suffix}", media_bytes),
+                    model=model_name,
+                    language="ar",
+                    response_format="text",
+                )
                 return str(transcription).strip()
             except Exception as exc:
                 last_error = exc
-                if "404" in str(exc) or "model_not_found" in str(exc):
+                msg = str(exc).lower()
+                if _is_model_unavailable(msg):
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
                     continue
+                if "429" in msg or "rate_limit" in msg:
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _rate_limit_cooldown(exc)
+                    continue
+                if "401" in msg or "invalid_api_key" in msg:
+                    break
                 raise
-        raise last_error
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    raise last_error or RuntimeError("تعذر تفريغ المقطع الصوتي")
 
 
 def find_matching_solution_in_db(question_text: str, api_key: str) -> Optional[str]:
