@@ -52,6 +52,7 @@ SYNC_GROUP_KEY = "jaecoo_2026"
 SYNC_CHAIN_BATCH = 100
 AI_BATCH_SIZE = 8
 _STOP_SYNC_EVENT = threading.Event()
+_SYNC_ROUND_ACTIVE = False
 SESSION_PULL_CAP = 10000
 BATCH_PAUSE_SECONDS = 2
 RATE_LIMIT_RETRIES = 4
@@ -213,6 +214,12 @@ def request_stop_sync() -> None:
 
 def clear_stop_sync() -> None:
     _STOP_SYNC_EVENT.clear()
+
+
+def _prepare_sync_round() -> None:
+    """يلغي علامة إيقاف عالقة قبل بدء جولة جديدة. الإيقاف أثناء جولة نشطة يبقى سارياً."""
+    if not _SYNC_ROUND_ACTIVE:
+        clear_stop_sync()
 
 
 async def _extract_message_content(tg_client, groq_key: str, message, skip_media: bool = False) -> tuple[str, str, str]:
@@ -475,10 +482,13 @@ def _wipe_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
 
 
 def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
-    """يمسح كل مؤشرات السحب من القاعدة والملفات والذاكرة حتى تبدأ الدفعة من الرسالة 1."""
-    request_stop_sync()
+    """يمسح مؤشرات sync_state و app_settings ويصفّرها إلى 0."""
+    if _SYNC_ROUND_ACTIVE:
+        request_stop_sync()
     _wipe_sync_checkpoint(group_key)
     force_release_client_lock()
+    if not _SYNC_ROUND_ACTIVE:
+        clear_stop_sync()
 
 
 def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
@@ -635,8 +645,22 @@ def _remaining_is_technical(text: str) -> bool:
     return any(term.lower() in lowered for term in USEFUL_TOPIC_TERMS)
 
 
+_PURE_COURTESY = {
+    "تسلم", "تسلمي", "مشكور", "مشكورة", "مشكورين", "شكرا", "شكراً",
+    "يسلمو", "يسلموا", "الله", "يعافيك", "يعافيكم", "هلا", "أهلا", "اهلا",
+    "مرحبا", "مرحباً", "حياك", "حياكم", "تمام", "اوك", "أوك", "ok",
+}
+
+
+def _is_pure_courtesy(text: str) -> bool:
+    tokens = re.findall(r"[0-9A-Za-z\u0600-\u06FF]+", text or "")
+    if not tokens:
+        return True
+    return all(token.lower() in _PURE_COURTESY or set(token) <= {"ه"} for token in tokens)
+
+
 def _thread_is_noise(messages: list) -> bool:
-    """يستبعد التحية القصيرة فقط. لا تُحذف المسافات حتى لا تُبتلع هل أحد أو استهلاك."""
+    """يستبعد التحية والمجاملة الفارغة فقط. قصر النص وحده لا يسقط السلسلة."""
     texts = []
     has_link = False
     has_media = False
@@ -647,12 +671,41 @@ def _thread_is_noise(messages: list) -> bool:
             has_link = True
         if detect_msg_media_kind(message) != "text":
             has_media = True
-    remaining = _strip_edge_greetings(" ".join(part for part in texts if part))
-    if "?" in remaining or "؟" in remaining or "هل" in remaining or _remaining_is_technical(remaining):
-        return False
     if has_link or has_media:
         return False
-    return len(remaining) < 15
+    combined = " ".join(part for part in texts if part)
+    if "?" in combined or "؟" in combined:
+        return False
+    remaining = _strip_edge_greetings(combined)
+    if not remaining.strip():
+        return True
+    if "هل" in remaining or _remaining_is_technical(remaining):
+        return False
+    return _is_pure_courtesy(remaining)
+
+
+def _explain_sync_stop(result: dict) -> str:
+    """سبب صريح عندما لا تُحفظ بطاقات أو يتوقف السحب قبل اكتمال الدفعة."""
+    error = str(result.get("error") or "").strip()
+    if error:
+        low = error.lower()
+        if any(token in low for token in ("401", "429", "quota", "rate limit", "rate_limit", "حصة", "مفتاح")):
+            return f"توقف السحب: خطأ مفتاح أو حصة Groq. {error}"
+        if any(token in low for token in ("اتصال", "شبكة", "timeout", "connection", "disconnected", "network")):
+            return f"توقف السحب: خطأ اتصال. {error}"
+        return f"توقف السحب: {error}"
+    if result.get("stopped"):
+        return "توقف السحب لأن زر الإيقاف ضُغط أثناء الجولة."
+    if result.get("hint"):
+        return str(result["hint"])
+    if int(result.get("saved") or 0) > 0:
+        return ""
+    if int(result.get("scanned") or 0) == 0:
+        return "لا توجد رسائل جديدة. انتهت رسائل القروب عند نقطة التوقف."
+    return (
+        f"انتهى السحب دون حفظ بطاقات. فُحصت {result.get('scanned', 0)} رسالة، "
+        f"سلاسل النقاش {result.get('threads', 0)}، واستُبعدت تحيات {result.get('skipped', 0)}."
+    )
 
 
 def _pull_digest(group: str, scanned: int, threads: int, skipped: int, saved: int) -> str:
@@ -672,11 +725,16 @@ def _is_blocking_failure(exc: Exception) -> bool:
 
 
 def _should_analyze_message(message) -> bool:
-    """يمرر كل رسالة نصية أو صورة أو فيديو أو صوت إلى التحليل."""
+    """يمرر كل رسالة فيها نص أو وسائط، مهما كان النص قصيراً."""
     if detect_msg_media_kind(message) != "text":
         return True
-    text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
-    return bool(text)
+    text = (
+        getattr(message, "message", None)
+        or getattr(message, "text", None)
+        or getattr(message, "raw_text", None)
+        or ""
+    )
+    return bool(str(text).strip())
 
 
 async def _run_with_backoff(factory, on_progress):
@@ -904,16 +962,20 @@ async def sync_and_analyze(
                 continue
             if not page or page[-1].id <= cursor_id:
                 saved_checkpoint = get_last_synced_id(group_key)
-                if not from_start and saved_checkpoint > 0:
+                if pulled == 0 and not from_start and saved_checkpoint > 0:
                     stall = (
                         f"المؤشر متوقف عند آخر رسالة رقم {saved_checkpoint} — "
                         "اضغط زر (سحب القروب كاملاً من البداية) لإعادة فحص كافة الرسائل"
                     )
-                    result["hint"] = stall
-                    _note(logs, stall, "error")
-                    _report(on_progress, stall, _span(pulled))
+                elif pulled == 0:
+                    stall = "لا توجد رسائل جديدة. انتهت رسائل القروب عند نقطة التوقف."
                 else:
-                    _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
+                    stall = (
+                        f"انتهت رسائل القروب. لا توجد رسائل أحدث. "
+                        f"فُحصت {result['scanned']} وحُفظت {result['saved']}."
+                    )
+                result["hint"] = stall
+                _report(on_progress, stall, _span(pulled))
                 break
             raw_messages = []
             fetched = 0
@@ -1086,16 +1148,23 @@ async def sync_and_analyze(
                 break
             await asyncio.sleep(BATCH_PAUSE_SECONDS)
 
-        if result.get("stopped") and not result.get("error"):
+        if not result.get("error"):
             result["ok"] = True
+        reason = _explain_sync_stop(result)
+        if reason:
+            result["hint"] = result.get("hint") or reason
+            _note(logs, reason, "error" if result.get("error") or int(result.get("saved") or 0) == 0 else "info")
+            _report(on_progress, reason, _span(pulled))
+        elif result.get("stopped"):
             _note(logs, f"توقف السحب بطلب المشرف. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
-        elif not result.get("error"):
-            result["ok"] = True
+        else:
             _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
     except Exception as exc:
         result["error"] = _telegram_error_message(exc)
-        _note(logs, result["error"], "error")
+        reason = _explain_sync_stop(result)
+        _note(logs, reason, "error")
+        _report(on_progress, reason, 1.0)
         return result
     finally:
         try:
@@ -1242,7 +1311,9 @@ def run_sync(
     force_from_start: bool = False,
 ) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
+    global _SYNC_ROUND_ACTIVE
     init_db()
+    _prepare_sync_round()
     chosen_key = str(api_key or os.environ.get("GROQ_API_KEY") or "").strip()
     media_skipped = bool(skip_media)
     start_over = bool(force_from_start)
@@ -1256,8 +1327,9 @@ def run_sync(
                 "scanned": 0,
                 "group": "",
                 "error": "توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام.",
-                "logs": [],
+                "logs": ["توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام."],
             }
+        _SYNC_ROUND_ACTIVE = True
         if start_over:
             clear_stop_sync()
             _wipe_sync_checkpoint(SYNC_GROUP_KEY)
@@ -1274,6 +1346,7 @@ def run_sync(
         )
     finally:
         if acquired:
+            _SYNC_ROUND_ACTIVE = False
             try:
                 _CLIENT_LOCK.release()
             except RuntimeError:
