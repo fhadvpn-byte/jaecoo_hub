@@ -1670,29 +1670,31 @@ else:
                 f'style="color:#bae6fd;border-color:rgba(56,189,248,0.45);text-decoration:none;">'
                 f'🔗 النقاش الأصلي</a>'
             )
-
+        tags_joined = "".join(
+            tag for tag in (
+                f'<span class="k-tag">🚙 {car_safe}</span>',
+                f'<span class="k-tag">⚙️ {sub_safe}</span>',
+                f'<span class="k-tag">📂 {cat_safe}</span>',
+                media_html,
+                verified_html,
+                thread_link_html,
+            ) if tag
+        )
         parts_html = (
             f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>'
             if parts_raw and parts_raw != "غير محدد"
             else ""
         )
-
-        st.markdown(f"""
-        <div class="k-card">
-            <div class="k-tags">
-                <span class="k-tag">🚙 {car_safe}</span>
-                <span class="k-tag">⚙️ {sub_safe}</span>
-                <span class="k-tag">📂 {cat_safe}</span>
-                {media_html}
-                {verified_html}
-                {thread_link_html}
-            </div>
-            <div class="k-title">{title_safe}</div>
-            <div class="k-section">🔹 <b>الوصف / المشكلة:</b> {prob_safe}</div>
-            <div class="k-section">⚡ <b>الخلاصة / الحل:</b> {sol_safe}</div>
-            {parts_html}
-        </div>
-        """, unsafe_allow_html=True)
+        card_html = (
+            f'<div class="k-card">'
+            f'<div class="k-tags">{tags_joined}</div>'
+            f'<div class="k-title">{title_safe.replace(chr(10), " ")}</div>'
+            f'<div class="k-section">🔹 <b>الوصف / المشكلة:</b> {prob_safe}</div>'
+            f'<div class="k-section">⚡ <b>الخلاصة / الحل:</b> {sol_safe}</div>'
+            f'{parts_html}'
+            f'</div>'
+        )
+        st.markdown(card_html, unsafe_allow_html=True)
         preview_bytes = _decode_card_image(page_media_map.get(card_id, ""))
         if preview_bytes:
             with st.expander("🖼️ عرض الصورة المرفقة مع البطاقة"):
