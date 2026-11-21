@@ -17,14 +17,13 @@ from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
     clean_groq_key,
-    collect_groq_keys,
     describe_groq_error,
     test_groq_key,
     compress_image_to_b64,
     DB_NAME,
     find_matching_solution_in_db,
     generate_daily_pulse_summary,
-    get_app_setting,
+    get_cards_media_map,
     get_db_connection,
     init_db,
     list_maintenance_rows,
@@ -46,7 +45,6 @@ from telegram_scraper import (
     run_sync,
 )
 
-AUTO_SYNC_LIMIT = 30
 JAECOO_MODELS = [
     "Jaecoo J8",
     "Jaecoo J8 SHS",
@@ -76,7 +74,7 @@ _SYNC_STATE = {
 
 
 def clean_database() -> None:
-    """يزيل nan والبطاقات الإنجليزية العشوائية عند فتح التطبيق."""
+    """يزيل nan والبطاقات الإنجليزية العشوائية ويوحّد مسمى النظام الفرعي عند فتح التطبيق."""
     conn = get_db_connection()
     try:
         conn.execute(
@@ -85,6 +83,13 @@ def clean_database() -> None:
             SET part_numbers_or_specs = 'غير محدد'
             WHERE part_numbers_or_specs IS NULL
                OR LOWER(TRIM(part_numbers_or_specs)) IN ('nan', 'none', '', 'null')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE knowledge_cards
+            SET sub_system = 'المحرك والتيربو والمنظومة الهجين SHS'
+            WHERE sub_system = 'المحرك والتيربو'
             """
         )
         conn.execute(
@@ -105,6 +110,25 @@ def clean_database() -> None:
             """
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_cards_dataframe() -> pd.DataFrame:
+    """يجلب بيانات البطاقات الخفيفة للتصفح السريع دون تحميل الصور الثقيلة لكل الأرشيف."""
+    conn = get_db_connection()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT
+                id, telegram_msg_id, thread_url, category, car_model, sub_system,
+                title, problem_or_topic, solution_or_summary, part_numbers_or_specs,
+                is_verified_solution, keywords, author_name, created_at, media_type
+            FROM knowledge_cards
+            ORDER BY id DESC
+            """,
+            conn,
+        )
     finally:
         conn.close()
 
@@ -224,7 +248,7 @@ def _telegram_login_needed(config: dict) -> bool:
         return True
     if telegram_session_status() == "invalid":
         return True
-    error = str((st.session_state.get("auto_sync_result") or {}).get("error") or "")
+    error = str(st.session_state.get("sync_error") or "")
     if any(part in error for part in ("أُلغيت جلسة", "غير صالحة", "غير مفعّلة", "authorization key")):
         return True
     has_session = bool(load_telegram_session() or str(config.get("tg_session") or "").strip())
@@ -290,40 +314,6 @@ def _record_sync_progress(message: str, fraction: float) -> None:
         _SYNC_STATE["fraction"] = fraction
         _SYNC_STATE["message"] = message
 
-
-def _auto_sync_worker():
-    try:
-        result = run_sync(AUTO_SYNC_LIMIT, on_progress=_record_sync_progress)
-    except Exception as exc:
-        result = {"ok": False, "saved": 0, "error": str(exc), "logs": []}
-    with _SYNC_GUARD:
-        _SYNC_STATE["result"] = result
-        _SYNC_STATE["done_at"] = time.time()
-        _SYNC_STATE["running"] = False
-
-
-def start_auto_sync(config: dict):
-    """لا يبدأ سحب الثلاثين رسالة حتى لا يحجب زر السحب اليدوي."""
-    return
-
-
-@st.fragment(run_every=timedelta(seconds=6))
-def auto_sync_status():
-    with _SYNC_GUARD:
-        running = _SYNC_STATE["running"]
-        result = _SYNC_STATE["result"]
-        done_at = _SYNC_STATE["done_at"]
-    if running:
-        st.info("جاري سحب رسائل القروب وتحليلها بمفتاح Groq. البطاقات الحالية ظاهرة أثناء التحديث.")
-        return
-    seen = st.session_state.get("seen_sync_done_at", 0)
-    if not result or done_at == seen:
-        return
-    st.session_state.seen_sync_done_at = done_at
-    st.session_state.auto_sync_result = result
-    error = str(result.get("error") or "")
-    if result.get("saved") or "أُلغيت جلسة" in error or "غير صالحة" in error or "غير مفعّلة" in error:
-        st.rerun()
 
 # ==========================================
 # 1. إعدادات الصفحة والتصميم (هوية حسم الذكية)
@@ -1061,15 +1051,6 @@ if is_admin:
 # ==========================================
 # 5. الواجهة الرئيسية وعرض البطاقات
 # ==========================================
-if is_admin:
-    auto_sync_status()
-    auto_result = st.session_state.get("auto_sync_result")
-    if auto_result and auto_result.get("ok"):
-        st.caption(
-            f"آخر تحديث تلقائي من {auto_result.get('group') or 'القروب'}: "
-            f"حُفظت {auto_result.get('saved', 0)} بطاقة."
-        )
-
 st.markdown("""
 <div class="hero-box">
     <div class="hub-badge">JAECOO AI DIAGNOSTICS HUB</div>
@@ -1159,9 +1140,7 @@ def _render_service_reference() -> None:
 
 _render_service_reference()
 
-conn = get_db_connection()
-df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", conn)
-conn.close()
+df = _load_cards_dataframe()
 
 def _model_count(frame: pd.DataFrame, model: str) -> int:
     if frame.empty or "car_model" not in frame.columns:
@@ -1211,13 +1190,18 @@ def _render_metrics(frame: pd.DataFrame) -> None:
 
 @st.fragment(run_every=timedelta(seconds=4))
 def _live_archive_metrics():
-    """يحدّث عدادات البطاقات كل 4 ثوانٍ أثناء السحب."""
+    """يحدّث عدادات البطاقات كل 4 ثوانٍ أثناء السحب باستعلام خفيف وسريع."""
     with _SYNC_GUARD:
         running = bool(_SYNC_STATE["running"])
     if running:
         live = get_db_connection()
-        frame = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", live)
-        live.close()
+        try:
+            frame = pd.read_sql_query(
+                "SELECT car_model, is_verified_solution, title FROM knowledge_cards ORDER BY id DESC",
+                live,
+            )
+        finally:
+            live.close()
     else:
         frame = df
     _render_metrics(frame)
@@ -1227,6 +1211,8 @@ _live_archive_metrics()
 
 if st.session_state.get("sync_notice"):
     st.success(st.session_state.pop("sync_notice"))
+if st.session_state.get("sync_error"):
+    st.error(st.session_state.get("sync_error"))
 
 if is_admin:
     with st.expander("🎙️📷 مختبر التحليل الذكي", expanded=False):
@@ -1246,20 +1232,29 @@ if is_admin:
         value=2000,
         step=500,
         key="public_pull_limit_forward",
-        help="يسحب حتى 10000 رسالة في الضغطة الواحدة على دفعات من 100. زر البداية يتجاهل المؤشر ويبدأ من الرسالة 1.",
+        help="يسحب حتى 10000 رسالة في الضغطة الواحدة على دفعات من 100.",
     )
-    st.caption("زر البداية يسحب القروب من الرسالة رقم 1 دون الاعتماد على المؤشر. التحليل فردي لكل سلسلة، والحد الأعلى 10000 رسالة.")
-    skip_media = st.checkbox(
-        "⚡ السحب الصاروخي السريع (تخطي تحميل الصور والصوتيات لتسريع السحب 10 أضعاف)",
-        value=True,
-        key="turbo_skip_media",
-    )
+    st.caption("زر (تحديث قاعدة الأرشيف) يبدأ من 1/1/2026 أو يكمل من آخر مؤشر. زر (من البداية) يسحب القروب كاملاً من الرسالة رقم 1.")
+    opt_col1, opt_col2 = st.columns(2)
+    with opt_col1:
+        skip_media = st.checkbox(
+            "⚡ السحب الصاروخي السريع (تخطي تحميل الوسائط مع حفظ تصنيفها)",
+            value=True,
+            key="turbo_skip_media",
+        )
+    with opt_col2:
+        use_batch_ai = st.checkbox(
+            "🧠 التحليل المجمّع (دمج كل 8 نقاشات في طلب واحد لتوفير حصة Groq)",
+            value=False,
+            key="batch_ai_toggle",
+        )
     if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_sync_2026"):
         reset_sync_checkpoint()
         with _SYNC_GUARD:
             _SYNC_STATE["running"] = False
             _SYNC_STATE["done_at"] = 0
-        st.success("تم تصفير المؤشر jaecoo_2026 وفك قفل الجلسة. السحب القادم يبدأ من 1/1/2026.")
+        st.session_state.pop("sync_error", None)
+        st.success("تم تصفير المؤشر وفك قفل الجلسة. ضغطة (تحديث قاعدة الأرشيف) القادمة ستبدأ مباشرة من 1/1/2026.")
     with st.expander("🛠️ عرض تفاصيل وسجلات السحب الحي (اضغط للإخفاء/الإظهار)", expanded=False):
         @st.fragment(run_every=timedelta(seconds=4))
         def _live_sync_log():
@@ -1281,10 +1276,13 @@ if is_admin:
             st.session_state["seen_manual_sync_done"] = done_at
             st.session_state["sync_logs"] = lines[-_SYNC_LINE_LIMIT:]
             fresh = get_db_connection()
-            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-            fresh.close()
+            try:
+                fresh_df = pd.read_sql_query("SELECT car_model FROM knowledge_cards", fresh)
+            finally:
+                fresh.close()
             total_cards = len(fresh_df)
             if result.get("ok"):
+                st.session_state.pop("sync_error", None)
                 stopped_note = "تم إيقاف السحب والاكتفاء بالمحفوظ. " if result.get("stopped") else ""
                 hint = f"{result.get('hint')} | " if result.get("hint") else ""
                 st.session_state["sync_notice"] = (
@@ -1296,6 +1294,8 @@ if is_admin:
                     f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
                     f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {_model_count(fresh_df, 'Jaecoo J8 SHS')}."
                 )
+            else:
+                st.session_state["sync_error"] = str(result.get("error") or "توقف السحب بسبب خطأ غير متوقع.")
             try:
                 st.rerun(scope="app")
             except TypeError:
@@ -1325,6 +1325,7 @@ if is_admin:
         if not start_pull:
             st.warning("توجد عملية سحب جارية. انتظر اكتمالها أو أوقفها.")
             return
+        st.session_state.pop("sync_error", None)
         if force_from_start:
             reset_sync_checkpoint()
         clear_stop_sync()
@@ -1333,6 +1334,7 @@ if is_admin:
         chosen_limit = int(limit_val)
         chosen_skip = bool(skip_media)
         chosen_force = bool(force_from_start)
+        chosen_batch = bool(use_batch_ai)
 
         def _pull_worker() -> None:
             try:
@@ -1342,6 +1344,7 @@ if is_admin:
                     api_key=explicit_key,
                     skip_media=chosen_skip,
                     force_from_start=chosen_force,
+                    use_batch_ai=chosen_batch,
                 )
             except Exception as exc:
                 result = {"ok": False, "saved": 0, "error": describe_groq_error(exc), "logs": []}
@@ -1372,10 +1375,24 @@ if is_admin:
             else:
                 with st.spinner("جاري التحليل..."):
                     try:
+                        group_hint = str(cfg.get("tg_group") or "")
                         source_text, media_type, media_b64 = _prepare_lab_source(lab_text, lab_file, groq_key)
-                        card = analyze_thread_with_ai(source_text or "حلل المرفق", groq_key)
+                        card = analyze_thread_with_ai(
+                            source_text or "حلل المرفق",
+                            groq_key,
+                            group_name=group_hint,
+                        )
                         msg_id = -int(time.time() * 1000)
-                        saved = save_card(card, msg_id, "", "مختبر التحليل", source_text or "مرفق وسائط", media_type, media_b64)
+                        saved = save_card(
+                            card,
+                            msg_id,
+                            "",
+                            "مختبر التحليل",
+                            source_text or "مرفق وسائط",
+                            media_type,
+                            media_b64,
+                            group_name=group_hint,
+                        )
                         if not saved:
                             st.warning("لم تُحفظ البطاقة لأن العنوان غير عربي أو المحتوى غير مفيد.")
                         else:
@@ -1409,7 +1426,7 @@ if is_admin:
         m_sub = st.selectbox("النظام الفرعي", [
             "الوكيل والمراكز المعتمدة",
             "جدول وتكاليف الصيانة الدورية",
-            "المحرك والتيربو",
+            "المحرك والتيربو والمنظومة الهجين SHS",
             "القير والدفع الرباعي AWD",
             "الكهرباء والبطارية والحساسات",
             "الشاشة والنظام الصوتي والربط",
@@ -1576,6 +1593,7 @@ else:
             st.session_state["card_page"] = page + 1
             st.rerun()
     page_frame = filtered_df.iloc[(page - 1) * CARD_PAGE_SIZE:page * CARD_PAGE_SIZE]
+    page_media_map = get_cards_media_map(page_frame["id"].tolist())
     for _, row in page_frame.iterrows():
         card_id = int(row["id"])
         title_safe = html.escape(_card_text(row.get("title")))
@@ -1592,6 +1610,22 @@ else:
             f'<span class="k-tag" style="color:{badge["color"]};border-color:{badge["color"]}">'
             f'{badge["icon"]} {html.escape(badge["label"])}</span>'
         )
+        is_verified = int(row.get("is_verified_solution") or 0) == 1
+        verified_html = (
+            '<span class="k-tag" style="color:#34d399;border-color:#10b981;background:rgba(16,185,129,0.14);">'
+            '✅ حل مؤكد</span>'
+            if is_verified
+            else ""
+        )
+        thread_url_raw = _card_text(row.get("thread_url"))
+        thread_link_html = ""
+        if thread_url_raw.startswith(("https://t.me/", "http://t.me/")):
+            safe_thread_url = html.escape(thread_url_raw, quote=True)
+            thread_link_html = (
+                f'<a href="{safe_thread_url}" target="_blank" class="k-tag" '
+                f'style="color:#bae6fd;border-color:rgba(56,189,248,0.45);text-decoration:none;">'
+                f'🔗 النقاش الأصلي</a>'
+            )
 
         parts_html = (
             f'<div class="k-section">🔧 <b>القطع والمواصفات الفنية:</b> {parts_safe}</div>'
@@ -1606,6 +1640,8 @@ else:
                 <span class="k-tag">⚙️ {sub_safe}</span>
                 <span class="k-tag">📂 {cat_safe}</span>
                 {media_html}
+                {verified_html}
+                {thread_link_html}
             </div>
             <div class="k-title">{title_safe}</div>
             <div class="k-section">🔹 <b>الوصف / المشكلة:</b> {prob_safe}</div>
@@ -1613,7 +1649,7 @@ else:
             {parts_html}
         </div>
         """, unsafe_allow_html=True)
-        preview_bytes = _decode_card_image(row.get("media_b64"))
+        preview_bytes = _decode_card_image(page_media_map.get(card_id, ""))
         if preview_bytes:
             with st.expander("🖼️ عرض الصورة المرفقة مع البطاقة"):
                 enlarge = st.toggle("تكبير الصورة", key=f"zoom_card_{card_id}")
