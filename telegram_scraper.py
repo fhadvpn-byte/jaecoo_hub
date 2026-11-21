@@ -17,7 +17,6 @@ from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
     collect_groq_keys,
-    describe_groq_error,
     is_key_or_quota_error,
     compress_image_to_b64,
     USEFUL_TOPIC_TERMS,
@@ -212,21 +211,34 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
     kind = detect_msg_media_kind(message)
     file_ext = getattr(getattr(message, "file", None), "ext", None) or ""
     if kind == "image":
-        image_bytes = await tg_client.download_media(message, file=bytes)
+        try:
+            image_bytes = await tg_client.download_media(message, file=bytes)
+        except Exception:
+            image_bytes = None
         preview = _preview_b64(image_bytes)
+        vision_text = ""
         if image_bytes:
             mime = "image/jpeg"
             document = getattr(message, "document", None)
             if document and getattr(document, "mime_type", None):
                 mime = document.mime_type
-            vision_text = analyze_image_bytes(groq_key, image_bytes, caption_for_ai, mime)
+            try:
+                vision_text = analyze_image_bytes(groq_key, image_bytes, caption_for_ai, mime)
+            except Exception:
+                vision_text = ""
+        if vision_text:
             return f"{vision_text}\nالنص والروابط: {caption}{url_note}".strip(), "image", preview
         return f"{caption}{url_note}".strip(), "image", preview
 
     if kind == "audio":
-        audio_bytes = await tg_client.download_media(message, file=bytes)
-        if audio_bytes:
-            spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=file_ext or ".ogg")
+        spoken_text = ""
+        try:
+            audio_bytes = await tg_client.download_media(message, file=bytes)
+            if audio_bytes:
+                spoken_text = transcribe_media_bytes(groq_key, audio_bytes, ext=file_ext or ".ogg")
+        except Exception:
+            spoken_text = ""
+        if spoken_text:
             return f"[مقطع صوتي مفرغ نصياً]: {spoken_text}\nتعليق: {caption}{url_note}".strip(), "audio", ""
         return f"{caption}{url_note}".strip(), "audio", ""
 
@@ -238,15 +250,22 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
             thumb_bytes = None
         preview = _preview_b64(thumb_bytes)
         if thumb_bytes:
-            thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption_for_ai, "video/thumb")
-            parts.append(f"[المشهد المرئي في الفيديو]: {thumb_desc}")
+            try:
+                thumb_desc = analyze_image_bytes(groq_key, thumb_bytes, caption_for_ai, "video/thumb")
+            except Exception:
+                thumb_desc = ""
+            if thumb_desc:
+                parts.append(f"[المشهد المرئي في الفيديو]: {thumb_desc}")
         file_size = getattr(getattr(message, "file", None), "size", 0) or 0
         if 0 < file_size <= 20 * 1024 * 1024:
-            video_bytes = await tg_client.download_media(message, file=bytes)
-            if video_bytes:
-                spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=file_ext or ".mp4")
-                if spoken_video:
-                    parts.append(f"[الكلام المنطوق داخل الفيديو]: {spoken_video}")
+            try:
+                video_bytes = await tg_client.download_media(message, file=bytes)
+                if video_bytes:
+                    spoken_video = transcribe_media_bytes(groq_key, video_bytes, ext=file_ext or ".mp4")
+                    if spoken_video:
+                        parts.append(f"[الكلام المنطوق داخل الفيديو]: {spoken_video}")
+            except Exception:
+                pass
         return "\n".join(part for part in parts if part.strip()), "video", preview
 
     return f"{caption}{url_note}".strip(), "text", ""
@@ -639,10 +658,8 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
     }
     init_db()
     cfg = load_config()
-    groq_key = str(api_key or os.environ.get("GROQ_API_KEY") or _groq_key(cfg) or "").strip()
+    groq_key = (collect_groq_keys(api_key) or [""])[0]
     if not groq_key:
-        groq_key = (collect_groq_keys() or [""])[0]
-    if not collect_groq_keys(groq_key):
         result["error"] = "مفتاح Groq API غير موجود. أدخله في الإعدادات ثم احفظ."
         _note(logs, result["error"], "error")
         return result
@@ -768,6 +785,8 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
             result["threads"] += len(threads)
             thread_total = max(len(threads), 1)
             hold_checkpoint = False
+            analysis_attempts = 0
+            key_failures = 0
             _report(
                 on_progress,
                 _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
@@ -833,6 +852,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                     fraction,
                 )
                 try:
+                    analysis_attempts += 1
                     card = await _run_with_backoff(
                         lambda thread_text=thread_text, fraction=fraction: analyze_thread_with_ai(
                             thread_text,
@@ -842,14 +862,12 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                         on_progress,
                     )
                 except Exception as exc:
-                    reason = describe_groq_error(exc)
-                    notice = f"النقاش {root_id}: تعذر تحليله عبر Groq — السبب: {reason}"
+                    detail = re.sub(r"gsk_[A-Za-z0-9_\-]+", "[key]", str(exc)).replace("\n", " ")
+                    notice = f"النقاش {root_id}: تعذر تحليله ({type(exc).__name__}: {detail[:100]})"
                     _note(logs, notice, "error")
                     _report(on_progress, notice, fraction)
-                    if is_key_or_quota_error(exc) or _is_blocking_failure(exc):
-                        hold_checkpoint = True
-                        result["error"] = notice
-                        break
+                    if is_key_or_quota_error(exc):
+                        key_failures += 1
                     continue
                 await asyncio.sleep(1.5)
                 if not _worth_archiving(card):
@@ -867,6 +885,9 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                     fraction,
                 )
 
+            if analysis_attempts and key_failures == analysis_attempts:
+                hold_checkpoint = True
+                result["error"] = "تعذر تحليل نقاشات هذه الدفعة بسبب مفتاح Groq أو حصته. المؤشر لم يتقدم."
             if hold_checkpoint:
                 _report(on_progress, "بقيت نقطة السحب عند آخر دفعة ناجحة حتى لا تُفقد الرسائل.", _span(batch_base))
                 break

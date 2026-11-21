@@ -1,6 +1,6 @@
 streamlit
 pandas
-groq
+groq>=0.11.0
 telethon
 pydantic
 pillow

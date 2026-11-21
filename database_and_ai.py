@@ -644,28 +644,48 @@ def _secret_groq_values() -> list[str]:
     return found
 
 
+def clean_groq_key(value) -> str:
+    """ينزع المسافات وعلامات التنصيص المحيطة بمفتاح Groq."""
+    text = str(value or "").strip()
+    quotes = "\"'`“”‘’"
+    while len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
+        text = text[1:-1].strip()
+    return text
+
+
 def collect_groq_keys(primary: str = "") -> list[str]:
-    """المفتاح الصريح ثم البيئة وst.secrets، وconfig.json في الأخير."""
+    """يقرأ os.environ أولاً، ويتجاهل مفاتيح config.json التي لا تبدأ بـ gsk_."""
     cfg = {}
     try:
         cfg = load_config()
     except Exception:
         cfg = {}
     keys = []
+
+    def _add(value, *, require_prefix: bool) -> None:
+        text = clean_groq_key(value)
+        if not text or text in keys:
+            return
+        if require_prefix and not text.startswith("gsk_"):
+            return
+        keys.append(text)
+
     for value in (
-        primary,
         os.environ.get("GROQ_API_KEY"),
         os.environ.get("GROQ_API_KEY_2"),
         os.environ.get("GROQ_API_KEY_3"),
-        *_secret_groq_values(),
+    ):
+        _add(value, require_prefix=True)
+    _add(primary, require_prefix=True)
+    for value in _secret_groq_values():
+        _add(value, require_prefix=True)
+    for value in (
         cfg.get("groq_api_key"),
         cfg.get("gemini_api_key"),
         cfg.get("groq_api_key_2"),
         cfg.get("groq_api_key_3"),
     ):
-        text = str(value or "").strip()
-        if text and text not in keys:
-            keys.append(text)
+        _add(value, require_prefix=True)
     return keys
 
 
@@ -1033,7 +1053,10 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
     return force_j8_shs_model(data, thread_text)
 
 
-VISION_MODELS = ["qwen/qwen3.8-27b"]
+VISION_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+]
 WHISPER_MODELS = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
 
@@ -1054,7 +1077,10 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
             "بطارية 12 فولت وشاحن الجوال لا يعنيان Jaecoo J8 SHS. "
             f"تعليق العضو المرفق مع الصورة: {caption}"
         )
-    client = Groq(api_key=api_key)
+    keys = collect_groq_keys(api_key)
+    if not keys:
+        raise RuntimeError("مفتاح Groq API غير موجود")
+    client = Groq(api_key=keys[0])
     last_error = None
     for model_name in VISION_MODELS:
         try:
@@ -1072,10 +1098,8 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
             return str(response.choices[0].message.content or "").strip()
         except Exception as exc:
             last_error = exc
-            if "404" in str(exc) or "model_not_found" in str(exc):
-                continue
-            raise
-    raise last_error
+            continue
+    raise last_error or RuntimeError("تعذر تحليل الصورة")
 
 
 def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") -> str:
@@ -1085,7 +1109,10 @@ def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") 
         tmp.write(media_bytes)
         tmp_path = tmp.name
     try:
-        client = Groq(api_key=api_key)
+        keys = collect_groq_keys(api_key)
+        if not keys:
+            raise RuntimeError("مفتاح Groq API غير موجود")
+        client = Groq(api_key=keys[0])
         last_error = None
         for model_name in WHISPER_MODELS:
             try:

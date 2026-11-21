@@ -16,6 +16,7 @@ import streamlit as st
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    clean_groq_key,
     collect_groq_keys,
     describe_groq_error,
     test_groq_key,
@@ -472,9 +473,12 @@ def hydrate_config(cfg: dict) -> dict:
     """يعيد قراءة config.json و st.secrets في كل تحميل ويحفظ المفاتيح الناقصة."""
     changed = False
     for key, names in _SETTING_SOURCES.items():
-        current = str(cfg.get(key) or "").strip()
+        current = clean_groq_key(cfg.get(key)) if key.startswith("groq_") else str(cfg.get(key) or "").strip()
         saved = _read_saved(cfg, names)
         secret = _read_secret(names)
+        if key.startswith("groq_"):
+            saved = clean_groq_key(saved)
+            secret = clean_groq_key(secret)
         chosen = secret or saved or current
         if chosen and chosen != current:
             cfg[key] = chosen
@@ -490,18 +494,19 @@ def hydrate_config(cfg: dict) -> dict:
 
 
 def publish_groq_env(cfg: dict) -> None:
-    """ينسخ مفاتيح Groq إلى البيئة قبل أي Thread لأن st.secrets لا يصل داخل الخيط."""
+    """يقرأ مفاتيح Groq من st.secrets في الخيط الرئيسي ويضعها في os.environ."""
     mapping = (
         ("groq_api_key", "GROQ_API_KEY", ("GROQ_API_KEY", "groq_api_key", "gemini_api_key")),
         ("groq_api_key_2", "GROQ_API_KEY_2", ("GROQ_API_KEY_2", "groq_api_key_2")),
         ("groq_api_key_3", "GROQ_API_KEY_3", ("GROQ_API_KEY_3", "groq_api_key_3")),
     )
     for cfg_key, env_key, secret_names in mapping:
-        value = str(cfg.get(cfg_key) or "").strip() or _read_secret(secret_names)
-        if value:
+        secret = clean_groq_key(_read_secret(secret_names))
+        saved = clean_groq_key(cfg.get(cfg_key))
+        value = secret or saved
+        if value.startswith("gsk_"):
             os.environ[env_key] = value
-            if not str(cfg.get(cfg_key) or "").strip():
-                cfg[cfg_key] = value
+            cfg[cfg_key] = value
 
 
 def _settings_fingerprint(cfg: dict) -> tuple:
@@ -1265,7 +1270,7 @@ if is_admin:
                 st.warning("توجد عملية سحب جارية. انتظر اكتمالها ثم أعد الضغط لسحب العدد المختار في الشريط.")
             else:
                 publish_groq_env(cfg)
-                explicit_key = str(cfg.get("groq_api_key") or os.environ.get("GROQ_API_KEY") or "")
+                explicit_key = os.environ.get("GROQ_API_KEY") or ""
                 chosen_limit = int(limit_val)
 
                 def _pull_worker() -> None:
