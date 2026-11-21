@@ -88,6 +88,20 @@ class KnowledgeCardSchema(BaseModel):
     keywords: str = Field(description="كلمات مفتاحية عربية مفصولة بفاصلة")
 
 
+COMPACT_SCHEMA_GUIDE = """{
+  "is_worth_archiving": true,
+  "category": "أحد الأقسام: الأعطال والتشخيص | الإصلاحات والحلول المؤكدة | بنك القطع البديلة والمطابقات | الأنظمة الذكية والشاشات | الصيانة الدورية والوكالات | الإكسسوارات والتجهيزات | تجارب القيادة والأداء الفعلي | نبض القروب والدردشة العامة",
+  "car_model": "أحد الطرازات: Jaecoo J8 | Jaecoo J8 SHS | Jaecoo J7 | Jaecoo J5 | جميع الطرازات / عام",
+  "sub_system": "أحد الأنظمة: الوكيل والمراكز المعتمدة | جدول وتكاليف الصيانة الدورية | المحرك والتيربو والمنظومة الهجين SHS | القير والدفع الرباعي AWD | الكهرباء والبطارية والحساسات | الشاشة والنظام الصوتي والربط | التكييف والتبريد | العضلات والفرامل والتعليق | الهيكل الخارجي والمقصورة | الإكسسوارات ومنتجات AliExpress | تقييم العملية والمميزات والعيوب | عام",
+  "title": "عنوان عربي فصيح من 5 إلى 10 كلمات",
+  "problem_or_topic": "وصف المشكلة أو الاستفسار أو الموضوع بالعربية",
+  "solution_or_summary": "خلاصة الحلول وتجارب الأعضاء أو ملخص الاستفسار بالعربية",
+  "part_numbers_or_specs": "أرقام القطع أو اللزوجة أو السعر أو الرابط، أو غير محدد",
+  "is_verified_solution": false,
+  "keywords": "كلمات مفتاحية عربية مفصولة بفاصلة"
+}"""
+
+
 DEALER_MAINTENANCE_KEYWORDS = [
     "وكيل", "الوكيل", "وكالة", "الوكالة", "صيانة دورية", "الصيانة الدورية",
     "مركز معتمد", "مراكز معتمدة", "الوكيل المعتمد", "ضمان", "الضمان",
@@ -133,44 +147,15 @@ def is_owner_experience_msg(text: str) -> bool:
 SYSTEM_PROMPT = """
 أنت خبير فني ومستشار لملاك سيارات جايكو (Jaecoo).
 استخرج بطاقة معرفية بالعربية الفصحى في أربعة مجالات:
-
-المجال الأول: منتجات وإكسسوارات علي إكسبريس والتجهيزات.
-- أي رابط aliexpress.com أو s.click.aliexpress أو صورة إكسسوار (كفر مفتاح، دعاسات، شاحن، داش كام، حماية شاشة، ستائر، منظم، فلاتر) يعني is_worth_archiving = true.
-- category = الإكسسوارات والتجهيزات.
-- sub_system = الإكسسوارات ومنتجات AliExpress.
-- problem_or_topic = اسم الإكسسوار والغرض منه لسيارة جايكو.
-- solution_or_summary = المواصفات وانطباع العضو، مع إبقاء رابط الشراء كما هو.
-- part_numbers_or_specs = الرابط المباشر أو اسم القطعة.
-
-المجال الثاني: الاعتمادية والعملية والمميزات والعيوب من تجارب الملاك.
-- إذا دار النقاش عن عملية السيارة أو مميزاتها أو عيوبها أو تجربة بعد ممشى أو العزل أو التكييف أو الصرفية أو رساوة الخط، اجعل is_worth_archiving = true.
-- category = تجارب القيادة والأداء الفعلي.
-- sub_system = تقييم العملية والمميزات والعيوب.
-- problem_or_topic = محور التقييم.
-- solution_or_summary = أولاً العملية والاعتمادية، ثم أبرز المميزات، ثم أبرز العيوب.
-
-المجال الثالث: الوكيل والصيانة الدورية المعتمدة.
-- الوكيل الرسمي، الفروع، المدن، الضمان، المراكز المعتمدة، وتكاليف صيانة 5000 و10000 و20000 كم.
-- category = الصيانة الدورية والوكالات.
-- sub_system = الوكيل والمراكز المعتمدة أو جدول وتكاليف الصيانة الدورية.
-- part_numbers_or_specs = الزيت أو الفلتر أو اسم الفرع، وإلا فاكتب غير محدد.
-
-المجال الرابع: الأعطال والحلول والشاشات والقطع البديلة.
-- صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو رقم القطعة أو جدول الصيانة يذهب إلى solution_or_summary.
-
+1. منتجات وإكسسوارات علي إكسبريس والتجهيزات: أي رابط aliexpress أو صورة إكسسوار -> category = الإكسسوارات والتجهيزات، sub_system = الإكسسوارات ومنتجات AliExpress، مع إبقاء الرابط في الحل أو القطع.
+2. تجارب القيادة والعملية والمميزات والعيوب والعزل والصرفية: category = تجارب القيادة والأداء الفعلي، sub_system = تقييم العملية والمميزات والعيوب.
+3. الوكيل والصيانة الدورية والضمان وتكاليف الصيانات: category = الصيانة الدورية والوكالات.
+4. الأعطال والحلول والشاشات والقطع البديلة: المشكلة في problem_or_topic، والحل أو خلاصة الردود في solution_or_summary (وإن لم يرد حل بعد فلخّص الاستفسار ولا ترفض البطاقة).
 شروط صارمة:
-1. الحقول النصية بالعربية الفصحى فقط. يُسمح بروابط الإنترنت وأرقام القطع وأسماء الطرازات.
-2. ممنوع الجمل الإنجليزية وممنوع nan.
-3. استخرج بالعربية كل عطل أو تجربة مالك أو رقم قطعة أو سعر صيانة ورد في السلسلة. أي استفسار فني أو تجربة مالك أو حل عملي يعني is_worth_archiving = true. الاستفسار يذهب إلى problem_or_topic، والرد أو الرقم أو السعر إلى solution_or_summary. إذا لم يظهر رد بعد، لخّص الاستفسار في الحل ولا ترفض البطاقة.
-4. التحيات والدردشة الفارغة بلا معلومة وبلا استفسار وبلا وسائط تعني is_worth_archiving = false.
-5. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
-6. صنّف car_model من نص النقاش أو وصف الصورة:
-- Jaecoo J5 عند ذكر J5 أو جي 5 أو جيكو ٥، ما لم تُذكر كلمة SHS.
-- Jaecoo J7 عند ذكر J7 أو جايكو 7 أو جيكو ٧، حتى لو كان هايبرد أو PHEV، ما لم يُذكر J8 أو SHS.
+- العربية الفصحى فقط مع السماح بروابط الإنترنت وأرقام القطع والمصطلحات مثل AGM وCarPlay وTbox وOBD وAWD وSHS. ممنوع nan.
+- التحيات والدردشة الفارغة بلا معلومة ولا استفسار تعني is_worth_archiving = false.
+- Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 ما لم يُذكر J8 أو SHS.
 - Jaecoo J8 SHS عند ذكر SHS، أو هايبرد مع J8، أو هايبرد دون تحديد J7 أو J5.
-- Jaecoo J8 عند ذكر J8 بلا إشارة هجينة.
-- جميع الطرازات / عام إذا لم يتضح الطراز.
-لا تنقل هايبرد J7 أو J5 إلى Jaecoo J8 SHS.
 """
 
 # ==========================================
@@ -573,16 +558,20 @@ def save_card(
     return True
 
 # ==========================================
-# 4. محرك Groq الذكي والسريع
+# 4. محرك Groq الذكي مع إدارة الحصص الدقيقة
 # ==========================================
 GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
 ]
-_GROQ_COOLDOWN = {}
-_GROQ_COOLDOWN_SECONDS = 90
+_GROQ_COOLDOWN: dict[tuple[str, str], float] = {}
+_GROQ_LAST_ERROR: dict[tuple[str, str], Exception] = {}
+_GROQ_UNAVAILABLE: set[tuple[str, str]] = set()
 _GROQ_DAILY_COOLDOWN_SECONDS = 600
 _GROQ_MISSING_MODEL_COOLDOWN = 3600
 USEFUL_TOPIC_TERMS = (
@@ -599,15 +588,6 @@ _CONFIRM_WORDS_PATTERN = (
     r"اختفت|اختفى|راحت\s+المشكلة|انتهت\s+المشكلة|تم\s+الإصلاح|تم\s+الحل|"
     r"جربته\s+ونفع|نفع\s+معي|تأكد\s+الحل"
 )
-CAR_THREAD_KEYWORDS = [
-    "جايكو", "j8", "j7", "j5", "shs", "وكيل", "وكالة", "صيانة", "معتمد", "ضمان",
-    "عطل", "مشكلة", "حل", "قطعة", "قطع", "سعر", "زيت", "فلتر", "بطارية", "شاشة",
-    "حساس", "قير", "مكينة", "تيربو", "مكيف", "تكييف", "عزل", "عملية", "عمليه",
-    "مميزات", "عيوب", "تجربة", "تجربتي", "علي اكسبرس", "aliexpress", "http",
-    "فرع", "تحديث", "برمجة", "كاربلاي", "اندرويد", "صوت", "طقطقة", "رجة", "حرارة",
-    "فرامل", "فحمات", "مساعدات", "كفرات", "بنزين", "صرفية", "دبل", "رادار", "كاميرا",
-    "هايبرد", "هجين", "الهجينة", "الكهربائية", "الشاحن", "محرك الشحن", "البطارية الكبيرة", "الفيش",
-]
 SHS_MODEL_KEYWORDS = [
     "shs", "هايبرد", "هجين", "بلق ان", "بلقن", "phev", "plug-in", "plugin", "شحن كهرباء", "شحن كهربائي",
 ]
@@ -616,14 +596,6 @@ _MODEL_MARKERS = {
     "Jaecoo J7": ("جايكو 7", "جيكو 7", "جايكو ٧", "جيكو ٧", "جي 7", "جي ٧", "جيه 7"),
     "Jaecoo J8": ("جايكو 8", "جيكو 8", "جايكو ٨", "جيكو ٨", "جي 8", "جي ٨", "جيه 8"),
 }
-EXPERT_GUIDELINES_TOPICS = [
-    "خطوات", "استلام", "الوكيل", "المعرض", "فحص", "تشييك", "قبل الخروج",
-    "دليل", "نصائح", "تعليمات", "ملاحظات", "الترخيص", "اللوحات", "التأمين",
-    "تلميع", "حماية", "تظليل", "عزل", "ممشى", "تمرين", "الاطارات", "الإطارات",
-    "الكاوتشوك", "تشيك",
-]
-
-
 def has_analyzable_text(text: str) -> bool:
     """أي نص غير فارغ يذهب إلى الذكاء الاصطناعي."""
     return bool((text or "").strip())
@@ -735,19 +707,40 @@ def describe_groq_error(exc: Exception) -> str:
 
 def is_key_or_quota_error(exc: Exception) -> bool:
     text = f"{exc.__class__.__name__} {exc}".lower()
-    return any(token in text for token in ("401", "403", "invalid_api_key", "invalid api key", "429", "rate_limit", "rate limit", "quota"))
+    return any(
+        token in text
+        for token in (
+            "401", "403", "invalid_api_key", "invalid api key",
+            "429", "rate_limit", "rate limit", "quota", "حصة groq",
+        )
+    )
 
 
-def _rate_limit_cooldown(error: Exception) -> int:
-    text = str(error).lower()
-    if any(token in text for token in ("tpd", "tokens per day", "per day", "daily", "quota")):
-        return _GROQ_DAILY_COOLDOWN_SECONDS
-    return _GROQ_COOLDOWN_SECONDS
+def _parse_groq_wait_seconds(error: Exception) -> int:
+    """يقرأ زمن التهدئة الفعلي من رسالة Groq بدلاً من الحجز الطويل الثابت."""
+    raw = str(error or "")
+    low = raw.lower()
+    match = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s", low)
+    parsed = 0
+    if match:
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        parsed = int(hours * 3600 + minutes * 60 + seconds) + 2
+    is_daily = any(token in low for token in ("tokens per day", "tpd", "requests per day", "rpd", "per day"))
+    if is_daily:
+        return max(parsed, _GROQ_DAILY_COOLDOWN_SECONDS)
+    if parsed > 0:
+        return min(parsed, 900)
+    return 22
 
 
 def _is_model_unavailable(message: str) -> bool:
     low = (message or "").lower()
-    return any(token in low for token in ("404", "model_not_found", "decommissioned", "does not exist"))
+    return any(
+        token in low
+        for token in ("404", "model_not_found", "decommissioned", "does not exist", "not supported")
+    )
 
 
 def _with_json_word(messages: list) -> list:
@@ -770,43 +763,74 @@ def _groq_create(client, model_name: str, messages: list, temperature: float, us
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يتخطى النموذج المضغوط أو غير المتاح فوراً، ويعيد الطلب بلا JSON mode عند خطأ 400."""
+    """يدور بين المفاتيح والنماذج السبعة، وينتظر تلقائياً إذا امتلأت حصة الدقيقة المؤقتة."""
     keys = collect_groq_keys(api_key)
     if not keys:
-        raise RuntimeError("مفتاح Groq API غير موجود")
+        raise RuntimeError("401 مفتاح Groq API غير موجود")
     payload = _with_json_word(messages) if json_mode else messages
     last_error = None
-    now = time.time()
-    for key in keys:
-        client = Groq(api_key=key)
-        for model_name in GROQ_MODELS:
-            cooldown_until = _GROQ_COOLDOWN.get((key, model_name), 0)
-            if cooldown_until > now:
-                continue
-            use_format = json_mode and "qwen" not in model_name.lower()
-            try:
-                return _groq_create(client, model_name, payload, temperature, use_format)
-            except Exception as exc:
-                last_error = exc
-                message = str(exc).lower()
-                if use_format and ("400" in message or "json" in message or "response_format" in message):
-                    try:
-                        return _groq_create(client, model_name, payload, temperature, False)
-                    except Exception as retry_exc:
-                        last_error = retry_exc
-                        message = str(retry_exc).lower()
-                if _is_model_unavailable(message):
-                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
+    for _wait_round in range(3):
+        now = time.time()
+        for key in keys:
+            client = Groq(api_key=key)
+            for model_name in GROQ_MODELS:
+                pair = (key, model_name)
+                if _GROQ_COOLDOWN.get(pair, 0) > now:
                     continue
-                if "401" in message or "invalid_api_key" in message or "invalid api key" in message:
-                    break
-                if "429" in message or "rate_limit" in message:
-                    pause = _rate_limit_cooldown(exc)
-                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + pause
-                    if on_switch:
-                        on_switch(f"تخطى {model_name.split('/')[-1]} لمدة {pause} ثانية وانتقل فوراً.")
-                continue
-    raise last_error or RuntimeError("تعذر التحليل عبر نماذج Groq")
+                use_format = json_mode and not any(tag in model_name.lower() for tag in ("qwen", "llama-4"))
+                try:
+                    return _groq_create(client, model_name, payload, temperature, use_format)
+                except Exception as exc:
+                    last_error = exc
+                    _GROQ_LAST_ERROR[pair] = exc
+                    message = str(exc).lower()
+                    if use_format and ("400" in message or "json" in message or "response_format" in message):
+                        try:
+                            return _groq_create(client, model_name, payload, temperature, False)
+                        except Exception as retry_exc:
+                            last_error = retry_exc
+                            _GROQ_LAST_ERROR[pair] = retry_exc
+                            message = str(retry_exc).lower()
+                    if _is_model_unavailable(message):
+                        _GROQ_UNAVAILABLE.add(pair)
+                        _GROQ_COOLDOWN[pair] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
+                        continue
+                    if "401" in message or "invalid_api_key" in message or "invalid api key" in message:
+                        break
+                    if "429" in message or "rate_limit" in message or "rate limit" in message:
+                        pause = _parse_groq_wait_seconds(last_error)
+                        _GROQ_COOLDOWN[pair] = time.time() + pause
+                        if on_switch:
+                            on_switch(f"ضغط على {model_name.split('/')[-1]} (تهدئة {pause}ث) — التبديل للبديل...")
+                    continue
+        now = time.time()
+        active_waits = [
+            (_GROQ_COOLDOWN[pair] - now, pair)
+            for pair in [
+                (key, model) for key in keys for model in GROQ_MODELS
+                if (key, model) not in _GROQ_UNAVAILABLE and _GROQ_COOLDOWN.get((key, model), 0) > now
+            ]
+        ]
+        if not active_waits:
+            break
+        min_wait, nearest_pair = min(active_waits, key=lambda item: item[0])
+        if min_wait <= 95:
+            sleep_sec = max(1, int(min_wait) + 1)
+            if on_switch:
+                on_switch(f"امتلاء حصة الدقيقة مؤقتاً: انتظار {sleep_sec} ثانية ثم استئناف التحليل تلقائياً...")
+            time.sleep(sleep_sec)
+            continue
+        stored = _GROQ_LAST_ERROR.get(nearest_pair) or last_error
+        detail = describe_groq_error(stored) if stored else ""
+        raise RuntimeError(
+            f"429 استُنفدت حصة Groq اليومية لجميع النماذج المتاحة (أقرب تحديث بعد {max(1, int(min_wait // 60))} دقيقة). {detail}"
+        )
+    if last_error is not None:
+        raise last_error
+    fallback_err = next(iter(_GROQ_LAST_ERROR.values()), None)
+    if fallback_err is not None:
+        raise fallback_err
+    raise RuntimeError("429 تعذر الوصول إلى نماذج Groq حالياً")
 
 
 def test_groq_key(api_key: str) -> str:
@@ -899,14 +923,6 @@ def assign_jaecoo_model(data: dict, source_text: str = "") -> dict:
 
 def _field_is_blank(value) -> bool:
     return str(value or "").strip().lower() in {"", "nan", "none", "null"}
-
-
-def _title_is_english(title: str) -> bool:
-    text = str(title or "").strip()
-    if re.search(r"[\u0600-\u06FF]", text):
-        return False
-    tokens = re.findall(r"[A-Za-z0-9]+", text)
-    return any(token.lower() not in _LATIN_TECH_TOKENS for token in tokens)
 
 
 def _has_useful_info(text: str) -> bool:
@@ -1041,38 +1057,22 @@ def analyze_thread_with_ai(
     on_switch=None,
     group_name: str = "",
 ) -> dict:
-    schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
-    dealer_hint = ""
-    if is_dealer_or_maintenance_msg(thread_text):
-        dealer_hint = """
-تنبيه هام: هذه الرسالة تتضمن معلومات عن الوكيل أو الصيانة الدورية المعتمدة.
-اجعل is_worth_archiving = true وصنّفها في قسم الصيانة الدورية والوكالات.
-"""
-    prompt = f"""
-{SYSTEM_PROMPT}
-{dealer_hint}
-يرجى تحليل النص التالي واستخراج النتيجة بصيغة JSON مطابقة تماماً لهذا المخطط (Schema):
-{schema_json_str}
-
+    dealer_hint = (
+        "\nتنبيه: هذه الرسالة تتعلق بالوكيل أو الصيانة الدورية؛ اجعل is_worth_archiving = true."
+        if is_dealer_or_maintenance_msg(thread_text)
+        else ""
+    )
+    prompt = f"""{SYSTEM_PROMPT}{dealer_hint}
+أخرج JSON مطابقاً لهذا القالب حصراً:
+{COMPACT_SCHEMA_GUIDE}
 النص المراد تحليله:
-{thread_text}
-"""
-
+{thread_text}"""
     messages = [
         {
             "role": "system",
             "content": (
-                "Return valid JSON. استخرج JSON فقط وبالعربية، ويُسمح بالمصطلحات التقنية الإنجليزية مثل AGM وCarPlay وTbox وOBD وAWD وSHS. "
-                "بلا وسم think وبلا سياج json. "
-                "problem_or_topic = المشكلة أو الموضوع بدقة. "
-                "solution_or_summary = خلاصة الحلول وتجارب الأعضاء، وإن تعددت الآراء فاذكرها بوضوح. "
-                "part_numbers_or_specs = أرقام القطع والمقاسات: بطارية، إطارات، لزوجة زيت، فيوز، تحديث، سعر صيانة، أو رابط منتج. "
-                "استخرج كل عطل أو تجربة مالك أو رقم قطعة أو سعر صيانة ورد في السلسلة بالعربية. "
-                "is_worth_archiving = true لأي استفسار فني أو تجربة مالك أو حل عملي أو ملاحظة وكيل أو تأمين أو سعر أو استلام. "
-                "is_verified_solution = true فقط إذا أكد عضو أن الحل نجح فعلياً، وإلا false. "
-                "Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 إذا لم يُذكر J8 أو SHS. "
-                "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا تحديد J7 أو J5. "
-                "ممنوع إخراج nan."
+                "Return valid JSON only. أخرج كائن JSON فقط بالعربية دون أي شرح خارجي أو وسم think. "
+                "is_verified_solution = true فقط إذا أكد عضو نجاح الحل فعلياً."
             ),
         },
         {"role": "user", "content": prompt},
@@ -1171,8 +1171,7 @@ def _prepare_batch_card(raw: dict, thread_text: str, thread_id, group_name: str)
     return card
 
 
-def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, group_name: str = "") -> list[dict]:
-    """يحلّل حتى 8 نقاشات في طلب Groq واحد، ويعود للتحليل الفردي إذا فشل الطلب."""
+def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, group_name: str = "", on_switch=None) -> list[dict]:
     payload = [item for item in (threads_payload or []) if str(item.get("text") or "").strip()][:8]
     if not payload:
         return []
@@ -1180,7 +1179,7 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
     def _fallback_one(item: dict) -> dict:
         thread_id = item.get("thread_id")
         try:
-            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key, group_name=group_name)
+            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key, on_switch=on_switch, group_name=group_name)
             return _prepare_batch_card(card, str(item.get("text") or ""), thread_id, group_name)
         except Exception as exc:
             return {
@@ -1205,8 +1204,7 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
                 '{"cards": [{"thread_id": 0, "is_worth_archiving": true, "car_model": "", "category": "", '
                 '"sub_system": "", "title": "", "problem_or_topic": "", "solution_or_summary": "", '
                 '"part_numbers_or_specs": "", "is_verified_solution": false, "keywords": ""}]} '
-                "بطاقة واحدة لكل THREAD، وانسخ thread_id كما هو. العربية مطلوبة مع المصطلحات التقنية الإنجليزية. "
-                "اذكر الآراء المتعددة بوضوح. is_verified_solution=true فقط إذا أكد عضو نجاح الحل. "
+                "بطاقة واحدة لكل THREAD مع نسخ thread_id كما هو وبالعربية الفصحى. "
                 "Jaecoo J7 مع هايبرد تبقى J7 إذا لم يُذكر J8 أو SHS. "
                 "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا J7 وJ5."
             ),
@@ -1214,12 +1212,19 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
         {"role": "user", "content": f"حلّل النقاشات التالية وأعد JSON:\n{packed}"},
     ]
     try:
-        completion = _groq_complete(api_key, messages, json_mode=True)
+        completion = _groq_complete(api_key, messages, json_mode=True, on_switch=on_switch)
         parsed = _loads_model_json(completion.choices[0].message.content or "")
         raw_cards = parsed.get("cards") if isinstance(parsed, dict) else None
         if not isinstance(raw_cards, list):
             return _fallback_all()
-    except Exception:
+    except Exception as batch_exc:
+        if is_key_or_quota_error(batch_exc):
+            return [{
+                "thread_id": item.get("thread_id"),
+                "_error_type": type(batch_exc).__name__,
+                "_error": str(batch_exc),
+                "_key_failure": True,
+            } for item in payload]
         return _fallback_all()
 
     by_id = {}
@@ -1266,7 +1271,7 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
         )
     keys = collect_groq_keys(api_key)
     if not keys:
-        raise RuntimeError("مفتاح Groq API غير موجود")
+        raise RuntimeError("401 مفتاح Groq API غير موجود")
     last_error = None
     now = time.time()
     for key in keys:
@@ -1293,7 +1298,7 @@ def analyze_image_bytes(api_key: str, image_bytes: bytes, caption: str = "", mim
                 if _is_model_unavailable(msg):
                     _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
                 elif "429" in msg or "rate_limit" in msg:
-                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _rate_limit_cooldown(exc)
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _parse_groq_wait_seconds(exc)
                 elif "401" in msg or "invalid_api_key" in msg:
                     break
                 continue
@@ -1305,7 +1310,7 @@ def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") 
     suffix = ext if ext.startswith(".") else f".{ext}"
     keys = collect_groq_keys(api_key)
     if not keys:
-        raise RuntimeError("مفتاح Groq API غير موجود")
+        raise RuntimeError("401 مفتاح Groq API غير موجود")
     last_error = None
     now = time.time()
     for key in keys:
@@ -1328,7 +1333,7 @@ def transcribe_media_bytes(api_key: str, media_bytes: bytes, ext: str = ".ogg") 
                     _GROQ_COOLDOWN[(key, model_name)] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
                     continue
                 if "429" in msg or "rate_limit" in msg:
-                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _rate_limit_cooldown(exc)
+                    _GROQ_COOLDOWN[(key, model_name)] = time.time() + _parse_groq_wait_seconds(exc)
                     continue
                 if "401" in msg or "invalid_api_key" in msg:
                     break
