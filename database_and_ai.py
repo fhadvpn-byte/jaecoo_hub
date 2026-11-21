@@ -1006,6 +1006,11 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             raise
     if data is None:
         raise last_error or RuntimeError("تعذر قراءة JSON من رد Groq")
+    return _hint_model_from_group(_polish_extracted_card(data, thread_text), thread_text, "")
+
+
+def _polish_extracted_card(data: dict, thread_text: str) -> dict:
+    data = _normalize_card_fields(data)
     parts = str(data.get("part_numbers_or_specs") or "").strip()
     if parts.lower() in {"", "nan", "none", "null"}:
         data["part_numbers_or_specs"] = "غير محدد"
@@ -1050,7 +1055,97 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         data["is_worth_archiving"] = True
     confirmed = any(phrase in thread_text for phrase in _SOLUTION_CONFIRMED)
     data["is_verified_solution"] = bool(confirmed)
-    return force_j8_shs_model(data, thread_text)
+    return data
+
+
+def _hint_model_from_group(card: dict, thread_text: str, group_name: str = "") -> dict:
+    """إذا كان القروب يخص J8 ولم يُذكر J5 أو J7 أو J8 في النقاش، تُنسب البطاقة إلى J8."""
+    card = assign_jaecoo_model(card, thread_text)
+    blob = _card_blob(card, thread_text)
+    named = any(_mentions_model(blob, model) for model in ("Jaecoo J5", "Jaecoo J7", "Jaecoo J8"))
+    if named or not _mentions_model(group_name or "", "Jaecoo J8"):
+        return card
+    current = str(card.get("car_model") or "").strip()
+    if current not in {"", "جميع الطرازات / عام"}:
+        return card
+    card["car_model"] = "Jaecoo J8 SHS" if (_mentions_hybrid(blob) or _mentions_shs_name(blob)) else "Jaecoo J8"
+    return card
+
+
+def _prepare_batch_card(raw: dict, thread_text: str, thread_id, group_name: str) -> dict:
+    card = _hint_model_from_group(_polish_extracted_card(raw, thread_text), thread_text, group_name)
+    card = merge_missing_links(card, thread_text)
+    card["thread_id"] = thread_id
+    return card
+
+
+def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, group_name: str = "") -> list[dict]:
+    """يحلّل حتى 8 نقاشات في طلب Groq واحد، ويعود للتحليل الفردي إذا فشل الطلب."""
+    payload = [item for item in (threads_payload or []) if str(item.get("text") or "").strip()][:8]
+    if not payload:
+        return []
+
+    def _fallback_one(item: dict) -> dict:
+        thread_id = item.get("thread_id")
+        try:
+            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key)
+            return _prepare_batch_card(card, str(item.get("text") or ""), thread_id, group_name)
+        except Exception as exc:
+            return {
+                "thread_id": thread_id,
+                "_error_type": type(exc).__name__,
+                "_error": str(exc),
+                "_key_failure": is_key_or_quota_error(exc),
+            }
+
+    def _fallback_all() -> list[dict]:
+        return [_fallback_one(item) for item in payload]
+
+    packed = "\n\n".join(
+        f"### THREAD {item.get('thread_id')}\n{item.get('text')}"
+        for item in payload
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return valid JSON only. أعد كائناً واحداً بالصيغة "
+                '{"cards": [{"thread_id": 0, "is_worth_archiving": true, "car_model": "", "category": "", '
+                '"sub_system": "", "title": "", "problem_or_topic": "", "solution_or_summary": "", '
+                '"part_numbers_or_specs": "", "is_verified_solution": false, "keywords": ""}]} '
+                "بطاقة واحدة لكل THREAD، وانسخ thread_id كما هو. العربية مطلوبة مع المصطلحات التقنية الإنجليزية. "
+                "اذكر الآراء المتعددة بوضوح. is_verified_solution=true فقط إذا أكد عضو نجاح الحل. "
+                "Jaecoo J7 مع هايبرد تبقى J7 إذا لم يُذكر J8 أو SHS. "
+                "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا J7 وJ5."
+            ),
+        },
+        {"role": "user", "content": f"حلّل النقاشات التالية وأعد JSON:\n{packed}"},
+    ]
+    try:
+        completion = _groq_complete(api_key, messages, json_mode=True)
+        parsed = _loads_model_json(completion.choices[0].message.content or "")
+        raw_cards = parsed.get("cards") if isinstance(parsed, dict) else None
+        if not isinstance(raw_cards, list):
+            return _fallback_all()
+    except Exception:
+        return _fallback_all()
+
+    by_id = {}
+    for raw in raw_cards:
+        if isinstance(raw, dict) and raw.get("thread_id") is not None:
+            by_id[str(raw.get("thread_id"))] = raw
+    results = []
+    for item in payload:
+        thread_id = item.get("thread_id")
+        raw = by_id.get(str(thread_id))
+        if not isinstance(raw, dict):
+            results.append(_fallback_one(item))
+            continue
+        try:
+            results.append(_prepare_batch_card(raw, str(item.get("text") or ""), thread_id, group_name))
+        except Exception:
+            results.append(_fallback_one(item))
+    return results
 
 
 VISION_MODELS = [

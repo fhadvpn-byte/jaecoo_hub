@@ -16,6 +16,7 @@ from telethon.sessions import StringSession
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    analyze_threads_batch_with_ai,
     collect_groq_keys,
     is_key_or_quota_error,
     compress_image_to_b64,
@@ -48,6 +49,8 @@ DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
 START_SYNC_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SYNC_GROUP_KEY = "jaecoo_2026"
 SYNC_CHAIN_BATCH = 100
+AI_BATCH_SIZE = 8
+_STOP_SYNC_EVENT = threading.Event()
 SESSION_PULL_CAP = 10000
 BATCH_PAUSE_SECONDS = 2
 RATE_LIMIT_RETRIES = 4
@@ -203,12 +206,25 @@ def _message_is_after_start(message) -> bool:
     return msg_date >= START_SYNC_DATE
 
 
-async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[str, str, str]:
+def request_stop_sync() -> None:
+    _STOP_SYNC_EVENT.set()
+
+
+def clear_stop_sync() -> None:
+    _STOP_SYNC_EVENT.clear()
+
+
+async def _extract_message_content(tg_client, groq_key: str, message, skip_media: bool = False) -> tuple[str, str, str]:
     """يعيد النص ونوع الوسيط ونسخة الصورة المضغوطة."""
     caption = (message.message or message.text or "").strip()
     url_note = _url_note(caption)
     caption_for_ai = f"{caption}{url_note}".strip()
     kind = detect_msg_media_kind(message)
+    if skip_media:
+        labels = {"image": "تعليق صورة", "audio": "تعليق مقطع صوتي", "video": "تعليق فيديو"}
+        label = labels.get(kind, "")
+        text = f"{label}: {caption}{url_note}".strip() if label else f"{caption}{url_note}".strip()
+        return text, "text", ""
     file_ext = getattr(getattr(message, "file", None), "ext", None) or ""
     if kind == "image":
         try:
@@ -650,7 +666,7 @@ async def _open_client(cfg: dict, logs: list):
     return None, "جلسة تيليجرام غير مفعّلة. افتح قسم تفعيل الجلسة وأدخل رقم الجوال."
 
 
-async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "") -> dict:
+async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "", skip_media: bool = False) -> dict:
     logs = []
     result = {
         "ok": False, "saved": 0, "scanned": 0, "threads": 0, "skipped": 0,
@@ -722,12 +738,17 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         _report(on_progress, start_note, 0.08)
-        _report(on_progress, "البطاقات السابقة تبقى محفوظة. نقطة آخر رسالة تُحفظ بعد كل دفعة.", 0.1)
+        _report(on_progress, "البطاقات السابقة تبقى محفوظة. نقطة آخر رسالة تُحفظ بعد كل مجموعة من 8 نقاشات.", 0.1)
         _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {cursor_id}. المطلوب {requested}.")
 
         pulled = 0
         batch_no = 0
         while pulled < requested:
+            if _STOP_SYNC_EVENT.is_set():
+                result["stopped"] = True
+                result["ok"] = True
+                _report(on_progress, "تم إيقاف السحب. التقدم محفوظ عند آخر نقاش اكتملت معالجته.", _span(pulled))
+                break
             batch_no += 1
             this_limit = min(SYNC_CHAIN_BATCH, requested - pulled)
             batch_base = pulled
@@ -785,16 +806,95 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
             result["threads"] += len(threads)
             thread_total = max(len(threads), 1)
             hold_checkpoint = False
-            analysis_attempts = 0
-            key_failures = 0
+            stopped_page = False
             _report(
                 on_progress,
                 _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 _span(batch_base),
             )
-            for thread_index, (root_id, thread_messages) in enumerate(threads.items(), start=1):
+            ordered_threads = sorted(
+                threads.items(),
+                key=lambda item: min((getattr(message, "id", 0) or 0) for message in item[1]),
+            )
+            ready_group = []
+
+            async def _flush_ready_group() -> bool:
+                if not ready_group:
+                    return False
+                fraction = _span(batch_base + fetched * 0.7)
+                payload = [{"thread_id": item["root_id"], "text": item["thread_text"]} for item in ready_group]
+                _report(
+                    on_progress,
+                    f"الدفعة {batch_no}: تحليل {len(payload)} نقاشات دفعة واحدة عبر Groq | بطاقات {result['saved']}",
+                    fraction,
+                )
+                try:
+                    cards = await _run_with_backoff(
+                        lambda payload=payload: analyze_threads_batch_with_ai(payload, groq_key, result["group"]),
+                        on_progress,
+                    )
+                except Exception as exc:
+                    cards = [{
+                        "thread_id": item["root_id"],
+                        "_error_type": type(exc).__name__,
+                        "_error": str(exc),
+                        "_key_failure": is_key_or_quota_error(exc),
+                    } for item in ready_group]
+                by_ready = {item["root_id"]: item for item in ready_group}
+                key_failures = 0
+                handled = 0
+                for card in cards:
+                    root_id = card.get("thread_id")
+                    prepared = by_ready.get(root_id)
+                    if prepared is None:
+                        try:
+                            prepared = by_ready.get(int(root_id))
+                            root_id = int(root_id)
+                        except (TypeError, ValueError):
+                            prepared = None
+                    if prepared is None:
+                        continue
+                    handled += 1
+                    if card.get("_error"):
+                        detail = re.sub(r"gsk_[A-Za-z0-9_\-]+", "[key]", str(card.get("_error") or "")).replace("\n", " ")
+                        notice = f"النقاش {root_id}: تعذر تحليله ({card.get('_error_type')}: {detail[:100]})"
+                        _note(logs, notice, "error")
+                        _report(on_progress, notice, fraction)
+                        if card.get("_key_failure"):
+                            key_failures += 1
+                        continue
+                    if save_card(
+                        card,
+                        root_id,
+                        f"https://t.me/c/{public_id}/{root_id}",
+                        prepared["author_name"],
+                        prepared["thread_text"],
+                        prepared["dominant_media"],
+                        prepared["best_thumb"],
+                    ) is not True:
+                        _report(on_progress, f"النقاش {root_id}: البوابة رفضت البطاقة.", fraction)
+                        continue
+                    result["saved"] += 1
+                    _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                    _report(
+                        on_progress,
+                        _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
+                        fraction,
+                    )
+                if handled and key_failures == handled:
+                    return True
+                update_last_synced_id(max(item["checkpoint_id"] for item in ready_group), group_key)
+                ready_group.clear()
+                return False
+
+            for thread_index, (root_id, thread_messages) in enumerate(ordered_threads, start=1):
+                if _STOP_SYNC_EVENT.is_set():
+                    stopped_page = True
+                    break
+                checkpoint_id = max((getattr(message, "id", 0) or 0) for message in thread_messages)
                 if _thread_is_noise(thread_messages):
                     result["skipped"] += 1
+                    update_last_synced_id(checkpoint_id, group_key)
                     _report(
                         on_progress,
                         _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
@@ -817,7 +917,7 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                             author_name = "عضو"
                     try:
                         parsed_text, media_kind, media_b64 = await _run_with_backoff(
-                            lambda message=message: _extract_message_content(client, groq_key, message),
+                            lambda message=message: _extract_message_content(client, groq_key, message, skip_media),
                             on_progress,
                         )
                     except Exception as exc:
@@ -829,8 +929,6 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                         _note(logs, f"تخطي الرسالة {message.id}: {exc}", "error")
                         _report(on_progress, f"الرسالة {message.id}: تعذر قراءة وسائطها.", fraction)
                         continue
-                    if media_kind != "text":
-                        await asyncio.sleep(1.5)
                     if (parsed_text or "").strip():
                         raw_parts.append(parsed_text.strip())
                         blocks.append(f"--- {role} (نوعها: {media_kind}) ---\n{parsed_text}")
@@ -838,56 +936,35 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                         dominant_media = media_kind
                     if media_b64 and not best_thumb:
                         best_thumb = media_b64
-
                 if hold_checkpoint:
                     break
-
                 thread_text = "\n\n".join(blocks).strip()
-                content = "\n".join(raw_parts)
-                if not (content or "").strip() and dominant_media == "text":
+                if not thread_text.strip() and dominant_media == "text":
+                    update_last_synced_id(checkpoint_id, group_key)
                     continue
-                _report(
-                    on_progress,
-                    f"الدفعة {batch_no}: تحليل النقاش رقم {root_id} عبر Groq | بطاقات {result['saved']}",
-                    fraction,
-                )
-                try:
-                    analysis_attempts += 1
-                    card = await _run_with_backoff(
-                        lambda thread_text=thread_text, fraction=fraction: analyze_thread_with_ai(
-                            thread_text,
-                            groq_key,
-                            on_switch=lambda note, fraction=fraction: _report(on_progress, note, fraction),
-                        ),
-                        on_progress,
-                    )
-                except Exception as exc:
-                    detail = re.sub(r"gsk_[A-Za-z0-9_\-]+", "[key]", str(exc)).replace("\n", " ")
-                    notice = f"النقاش {root_id}: تعذر تحليله ({type(exc).__name__}: {detail[:100]})"
-                    _note(logs, notice, "error")
-                    _report(on_progress, notice, fraction)
-                    if is_key_or_quota_error(exc):
-                        key_failures += 1
-                    continue
-                await asyncio.sleep(1.5)
-                if not _worth_archiving(card):
-                    _report(on_progress, f"النقاش {root_id}: لا يحتوي حلاً كافياً لحفظ بطاقة.", fraction)
-                    continue
-                thread_url = f"https://t.me/c/{public_id}/{root_id}"
-                if save_card(card, root_id, thread_url, author_name, thread_text, dominant_media, best_thumb) is False:
-                    _report(on_progress, f"النقاش {root_id}: البوابة رفضت البطاقة.", fraction)
-                    continue
-                result["saved"] += 1
-                _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
-                _report(
-                    on_progress,
-                    _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
-                    fraction,
-                )
+                ready_group.append({
+                    "root_id": root_id,
+                    "thread_text": thread_text,
+                    "author_name": author_name,
+                    "dominant_media": dominant_media,
+                    "best_thumb": best_thumb,
+                    "checkpoint_id": checkpoint_id,
+                })
+                if len(ready_group) >= AI_BATCH_SIZE:
+                    if await _flush_ready_group():
+                        hold_checkpoint = True
+                        result["error"] = "تعذر تحليل نقاشات هذه الدفعة بسبب مفتاح Groq أو حصته. المؤشر لم يتقدم."
+                        break
 
-            if analysis_attempts and key_failures == analysis_attempts:
-                hold_checkpoint = True
-                result["error"] = "تعذر تحليل نقاشات هذه الدفعة بسبب مفتاح Groq أو حصته. المؤشر لم يتقدم."
+            if ready_group and not hold_checkpoint and not stopped_page:
+                if await _flush_ready_group():
+                    hold_checkpoint = True
+                    result["error"] = "تعذر تحليل نقاشات هذه الدفعة بسبب مفتاح Groq أو حصته. المؤشر لم يتقدم."
+            if stopped_page:
+                result["stopped"] = True
+                result["ok"] = True
+                _report(on_progress, "تم إيقاف السحب. التقدم محفوظ عند آخر نقاش اكتملت معالجته.", _span(batch_base))
+                break
             if hold_checkpoint:
                 _report(on_progress, "بقيت نقطة السحب عند آخر دفعة ناجحة حتى لا تُفقد الرسائل.", _span(batch_base))
                 break
@@ -901,7 +978,10 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "")
                 break
             await asyncio.sleep(BATCH_PAUSE_SECONDS)
 
-        if not result.get("error"):
+        if result.get("stopped") and not result.get("error"):
+            result["ok"] = True
+            _note(logs, f"توقف السحب بطلب المشرف. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
+        elif not result.get("error"):
             result["ok"] = True
             _note(logs, f"اكتمل السحب. الرسائل المفحوصة: {result['scanned']}، البطاقات المحفوظة: {result['saved']}")
         return result
@@ -1046,10 +1126,11 @@ def _telegram_error_message(exc: Exception) -> str:
     return f"تعذر سحب الرسائل: {text}"
 
 
-def run_sync(limit: int = 50, on_progress=None, api_key: str = "") -> dict:
+def run_sync(limit: int = 50, on_progress=None, api_key: str = "", skip_media: bool = False) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     init_db()
     chosen_key = str(api_key or os.environ.get("GROQ_API_KEY") or "").strip()
+    media_skipped = bool(skip_media)
     acquired = False
     try:
         acquired = _CLIENT_LOCK.acquire(blocking=False)
@@ -1065,7 +1146,12 @@ def run_sync(limit: int = 50, on_progress=None, api_key: str = "") -> dict:
         _set_sync_active(True)
         set_app_setting("telegram_sync_attempt_at", str(time.time()))
         return _run_on_fresh_loop(
-            lambda: sync_and_analyze(limit=limit, on_progress=on_progress, api_key=chosen_key)
+            lambda: sync_and_analyze(
+                limit=limit,
+                on_progress=on_progress,
+                api_key=chosen_key,
+                skip_media=media_skipped,
+            )
         )
     finally:
         if acquired:

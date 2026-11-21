@@ -40,6 +40,8 @@ from telegram_scraper import (
     PERSONAL_SESSION_FILE,
     confirm_telegram_login,
     request_telegram_code,
+    clear_stop_sync,
+    request_stop_sync,
     reset_sync_checkpoint,
     run_sync,
 )
@@ -229,8 +231,8 @@ def _telegram_login_needed(config: dict) -> bool:
     return not has_session
 
 
-def render_telegram_login(config: dict) -> None:
-    with st.expander("🔑 تفعيل أو تجديد جلسة تيليجرام مباشرة", expanded=True):
+def render_telegram_login(config: dict, expanded: bool = False) -> None:
+    with st.expander("🔑 تفعيل أو تجديد جلسة تيليجرام مباشرة", expanded=expanded):
         st.caption("أدخل رقم الجوال بالصيغة الدولية. يصل رمز التحقق داخل تطبيق تيليجرام.")
         phone = st.text_input("رقم الجوال", key="tg_phone", placeholder="+9665xxxxxxx")
         if st.button("إرسال رمز التحقق", key="tg_send_code"):
@@ -354,11 +356,12 @@ def hide_streamlit_cloud_badges() -> None:
                 height: 0 !important;
                 min-height: 0 !important;
             }
+            section[data-testid="stSidebar"],
+            [data-testid="stSidebarResizeHandle"],
             [data-testid="collapsedControl"],
             [data-testid="stExpandSidebarButton"] {
-                display: flex !important;
-                visibility: visible !important;
-                z-index: 1000000;
+                display: none !important;
+                visibility: hidden !important;
             }
         </style>
         """,
@@ -967,9 +970,7 @@ def seed_sample_data():
 # 4. القائمة الجانبية (مركز التحكم والربط)
 # ==========================================
 if is_admin:
-    with st.sidebar:
-        st.markdown("### 💠 مركز التحكم والربط")
-
+    with st.expander("💠 مركز التحكم والإعدادات والنسخ الاحتياطي (للمشرف)", expanded=False):
         keys_ready = bool(str(cfg.get("groq_api_key") or "").strip() and str(cfg.get("tg_api_id") or "").strip())
         if keys_ready:
             st.caption("مفاتيح Groq وTelegram محمّلة من الإعدادات المحفوظة.")
@@ -1025,7 +1026,7 @@ if is_admin:
         db_path = Path(DB_NAME)
         if db_path.exists():
             st.download_button(
-                "تنزيل قاعدة البيانات (.db)",
+                "📥 تنزيل نسخة احتياطية كاملة من قاعدة البيانات (.db)",
                 data=db_path.read_bytes(),
                 file_name="jaecoo_knowledge.db",
                 mime="application/octet-stream",
@@ -1045,8 +1046,8 @@ if is_admin:
             use_container_width=True,
             key="download_cards_json",
         )
-        restore_file = st.file_uploader("استعادة قاعدة البيانات", type=["db"], key="restore_db_file")
-        if st.button("استعادة النسخة المرفوعة", use_container_width=True, key="restore_db_button"):
+        restore_file = st.file_uploader("📤 استعادة ملف قاعدة البيانات (.db)", type=["db"], key="restore_db_file")
+        if st.button("📤 استعادة ملف قاعدة البيانات (.db)", use_container_width=True, key="restore_db_button"):
             if restore_file is None:
                 st.warning("اختر ملف قاعدة البيانات أولاً.")
             else:
@@ -1186,7 +1187,7 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         _render_stat_card("إجمالي البطاقات", total_cards, "🔹")
     with col_verified:
         _render_stat_card("الحلول المؤكدة", verified_cards, "✅")
-    col_j8, col_j8_shs, col_j7, col_j5 = st.columns(4)
+    col_j8, col_j8_shs, col_j7, col_j5, col_all = st.columns(5)
     with col_j8:
         _render_stat_card("بطاقات Jaecoo J8", _model_count(frame, "Jaecoo J8"), "🚙")
     with col_j8_shs:
@@ -1195,6 +1196,8 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         _render_stat_card("بطاقات Jaecoo J7", _model_count(frame, "Jaecoo J7"), "🚘")
     with col_j5:
         _render_stat_card("بطاقات Jaecoo J5", _model_count(frame, "Jaecoo J5"), "🚗")
+    with col_all:
+        _render_stat_card("جميع الطرازات / عام", _model_count(frame, "جميع الطرازات / عام"), "🌐")
     shs_count = _model_count(frame, "Jaecoo J8 SHS")
     if frame.empty or "car_model" not in frame.columns or shs_count == 0:
         st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: 0.")
@@ -1206,9 +1209,21 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         latest = "، ".join(title for title in shs_titles if str(title).strip())
         st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: {shs_count}. أحدثها: {latest}")
 
-metrics_box = st.empty()
-with metrics_box.container():
-    _render_metrics(df)
+@st.fragment(run_every=timedelta(seconds=4))
+def _live_archive_metrics():
+    """يحدّث عدادات البطاقات كل 4 ثوانٍ أثناء السحب."""
+    with _SYNC_GUARD:
+        running = bool(_SYNC_STATE["running"])
+    if running:
+        live = get_db_connection()
+        frame = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", live)
+        live.close()
+    else:
+        frame = df
+    _render_metrics(frame)
+
+
+_live_archive_metrics()
 
 if st.session_state.get("sync_notice"):
     st.success(st.session_state.pop("sync_notice"))
@@ -1222,8 +1237,7 @@ if is_admin:
             key="public_lab_file",
         )
 
-    if _telegram_login_needed(cfg):
-        render_telegram_login(cfg)
+    render_telegram_login(cfg, expanded=_telegram_login_needed(cfg))
 
     limit_val = st.slider(
         "عدد الرسائل في السحبة الواحدة",
@@ -1234,7 +1248,12 @@ if is_admin:
         key="public_pull_limit_forward",
         help="يسحب حتى 10000 رسالة في الضغطة الواحدة، من 1/1/2026 نحو الأحدث، على دفعات من 100.",
     )
-    st.caption("السحب يتجه من 1/1/2026 أو أقدم رسالة متاحة نحو الأحدث. الحد الأعلى 10000 رسالة، وكل دفعة 100 رسالة مع حفظ آخر نقطة.")
+    st.caption("السحب يتجه من 1/1/2026 أو أقدم رسالة متاحة نحو الأحدث. الحد الأعلى 10000 رسالة، وكل مجموعة 8 نقاشات تُحفظ فور تحليلها.")
+    skip_media = st.checkbox(
+        "⚡ السحب الصاروخي السريع (تخطي تحميل الصور والصوتيات لتسريع السحب 10 أضعاف)",
+        value=True,
+        key="turbo_skip_media",
+    )
     if st.button("🔄 إعادة الضبط للبدء من 1/1/2026", key="reset_sync_2026"):
         reset_sync_checkpoint()
         with _SYNC_GUARD:
@@ -1242,13 +1261,47 @@ if is_admin:
             _SYNC_STATE["done_at"] = 0
         st.success("تم تصفير المؤشر jaecoo_2026 وفك قفل الجلسة. السحب القادم يبدأ من 1/1/2026.")
     with st.expander("🛠️ عرض تفاصيل وسجلات السحب الحي (اضغط للإخفاء/الإظهار)", expanded=False):
-        log_container = st.container(height=140)
-        with log_container:
-            log_status_box = st.empty()
-            log_progress_box = st.empty()
-            if st.session_state.get("sync_logs"):
-                log_status_box.code("\n".join(st.session_state["sync_logs"]), language="text")
-    pull_col, analyze_col, sample_col = st.columns(3)
+        @st.fragment(run_every=timedelta(seconds=4))
+        def _live_sync_log():
+            with _SYNC_GUARD:
+                running = bool(_SYNC_STATE["running"])
+                lines = list(_SYNC_STATE["lines"])
+                fraction = float(_SYNC_STATE["fraction"] or 0.0)
+                message = str(_SYNC_STATE["message"] or "")
+                result = _SYNC_STATE["result"]
+                done_at = _SYNC_STATE["done_at"]
+            shown = lines or list(st.session_state.get("sync_logs") or [])
+            if shown:
+                st.code("\n".join(shown[-_SYNC_LINE_LIMIT:]), language="text")
+            if running:
+                st.progress(min(1.0, max(0.0, fraction)), text=message or "جاري السحب...")
+                return
+            if not result or done_at == st.session_state.get("seen_manual_sync_done"):
+                return
+            st.session_state["seen_manual_sync_done"] = done_at
+            st.session_state["sync_logs"] = lines[-_SYNC_LINE_LIMIT:]
+            fresh = get_db_connection()
+            fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
+            fresh.close()
+            total_cards = len(fresh_df)
+            if result.get("ok"):
+                stopped_note = "تم إيقاف السحب والاكتفاء بالمحفوظ. " if result.get("stopped") else ""
+                st.session_state["sync_notice"] = (
+                    f"{stopped_note}"
+                    f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
+                    f"فُحصت: {result.get('scanned', 0)} رسالة | "
+                    f"سلاسل النقاش: {result.get('threads', 0)} | "
+                    f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
+                    f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
+                    f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {_model_count(fresh_df, 'Jaecoo J8 SHS')}."
+                )
+            try:
+                st.rerun(scope="app")
+            except TypeError:
+                st.rerun()
+
+        _live_sync_log()
+    pull_col, stop_col, analyze_col, sample_col = st.columns(4)
     with pull_col:
         if st.button("🔄 تحديث قاعدة الأرشيف بالذكاء الاصطناعي", use_container_width=True, key="public_pull"):
             opening = (
@@ -1267,15 +1320,22 @@ if is_admin:
                     _SYNC_STATE["message"] = opening
 
             if not start_pull:
-                st.warning("توجد عملية سحب جارية. انتظر اكتمالها ثم أعد الضغط لسحب العدد المختار في الشريط.")
+                st.warning("توجد عملية سحب جارية. انتظر اكتمالها أو أوقفها.")
             else:
+                clear_stop_sync()
                 publish_groq_env(cfg)
                 explicit_key = os.environ.get("GROQ_API_KEY") or ""
                 chosen_limit = int(limit_val)
+                chosen_skip = bool(skip_media)
 
                 def _pull_worker() -> None:
                     try:
-                        result = run_sync(chosen_limit, on_progress=_record_sync_progress, api_key=explicit_key)
+                        result = run_sync(
+                            chosen_limit,
+                            on_progress=_record_sync_progress,
+                            api_key=explicit_key,
+                            skip_media=chosen_skip,
+                        )
                     except Exception as exc:
                         result = {"ok": False, "saved": 0, "error": describe_groq_error(exc), "logs": []}
                     with _SYNC_GUARD:
@@ -1284,58 +1344,10 @@ if is_admin:
                         _SYNC_STATE["running"] = False
 
                 threading.Thread(target=_pull_worker, daemon=True).start()
-
-                log_progress_box.progress(0.08, text=opening)
-                log_status_box.code(opening, language="text")
-                while True:
-                    with _SYNC_GUARD:
-                        running = _SYNC_STATE["running"]
-                        lines = list(_SYNC_STATE["lines"])
-                        fraction = float(_SYNC_STATE["fraction"] or 0.0)
-                        message = str(_SYNC_STATE["message"] or "جاري السحب...")
-                        result = _SYNC_STATE["result"]
-                    log_status_box.code("\n".join(lines) or message, language="text")
-                    log_progress_box.progress(min(1.0, max(0.0, fraction)), text=message)
-                    if not running:
-                        break
-                    time.sleep(0.4)
-                result = result or {"ok": False, "error": "تعذر إكمال السحب.", "saved": 0}
-                fresh = get_db_connection()
-                fresh_df = pd.read_sql_query("SELECT * FROM knowledge_cards ORDER BY id DESC", fresh)
-                fresh.close()
-                total_cards = len(fresh_df)
-                if result.get("ok"):
-                    summary = (
-                        f"اسم القروب: ({result.get('group') or 'القروب'}) | "
-                        f"فُحصت: {result.get('scanned', 0)} رسالة | "
-                        f"سلاسل النقاش: {result.get('threads', 0)} | "
-                        f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
-                        f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة | إجمالي القاعدة: {total_cards}."
-                    )
-                    if lines and str(lines[-1]).startswith("اسم القروب:"):
-                        lines[-1] = summary
-                    else:
-                        lines.append(summary)
-                    log_progress_box.progress(1.0, text=f"اكتمل السحب. إجمالي البطاقات: {total_cards}")
-                else:
-                    lines.append(result.get("error") or "تعذر إكمال السحب.")
-                    log_progress_box.progress(1.0, text="انتهى السحب")
-                lines = lines[-_SYNC_LINE_LIMIT:]
-                log_status_box.code("\n".join(lines), language="text")
-                st.session_state["sync_logs"] = lines
-                if result.get("ok"):
-                    with metrics_box.container():
-                        _render_metrics(fresh_df)
-                    shs_now = _model_count(fresh_df, "Jaecoo J8 SHS")
-                    st.session_state["sync_notice"] = (
-                        f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
-                        f"فُحصت: {result.get('scanned', 0)} رسالة | "
-                        f"سلاسل النقاش: {result.get('threads', 0)} | "
-                        f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
-                        f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
-                        f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {shs_now}."
-                    )
-                    st.rerun()
+    with stop_col:
+        if st.button("⏹️ إيقاف السحب والاكتفاء بما حُفظ", use_container_width=True, key="stop_pull"):
+            request_stop_sync()
+            st.warning("سيتوقف السحب بعد المجموعة الحالية، وتُحفظ نقطة آخر نقاش اكتمل.")
     with analyze_col:
         if st.button("بدء التحليل", use_container_width=True, key="public_analyze"):
             groq_key = cfg.get("groq_api_key") or cfg.get("gemini_api_key")
