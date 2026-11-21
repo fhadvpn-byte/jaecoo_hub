@@ -1246,9 +1246,9 @@ if is_admin:
         value=2000,
         step=500,
         key="public_pull_limit_forward",
-        help="يسحب حتى 10000 رسالة في الضغطة الواحدة، من 1/1/2026 نحو الأحدث، على دفعات من 100.",
+        help="يسحب حتى 10000 رسالة في الضغطة الواحدة على دفعات من 100. زر البداية يتجاهل المؤشر ويبدأ من الرسالة 1.",
     )
-    st.caption("السحب يتجه من 1/1/2026 أو أقدم رسالة متاحة نحو الأحدث. الحد الأعلى 10000 رسالة، وكل نقاش يُحلَّل ويُحفظ فور اكتماله.")
+    st.caption("زر البداية يسحب القروب من الرسالة رقم 1 دون الاعتماد على المؤشر. التحليل فردي لكل سلسلة، والحد الأعلى 10000 رسالة.")
     skip_media = st.checkbox(
         "⚡ السحب الصاروخي السريع (تخطي تحميل الصور والصوتيات لتسريع السحب 10 أضعاف)",
         value=True,
@@ -1286,8 +1286,9 @@ if is_admin:
             total_cards = len(fresh_df)
             if result.get("ok"):
                 stopped_note = "تم إيقاف السحب والاكتفاء بالمحفوظ. " if result.get("stopped") else ""
+                hint = f"{result.get('hint')} | " if result.get("hint") else ""
                 st.session_state["sync_notice"] = (
-                    f"{stopped_note}"
+                    f"{hint}{stopped_note}"
                     f"اسم القروب: ({result.get('group') or 'التلجرام'}) | "
                     f"فُحصت: {result.get('scanned', 0)} رسالة | "
                     f"سلاسل النقاش: {result.get('threads', 0)} | "
@@ -1301,49 +1302,62 @@ if is_admin:
                 st.rerun()
 
         _live_sync_log()
-    pull_col, stop_col, analyze_col, sample_col = st.columns(4)
-    with pull_col:
-        if st.button("🔄 تحديث قاعدة الأرشيف بالذكاء الاصطناعي", use_container_width=True, key="public_pull"):
-            opening = (
+
+    def _launch_pull(force_from_start: bool) -> None:
+        opening = (
+            "جاري سحب القروب من الرسالة رقم 1..."
+            if force_from_start
+            else (
                 "جاري الاتصال بملف الجلسة المحلي..."
                 if os.path.exists(PERSONAL_SESSION_FILE)
                 else "جاري الاتصال بجلسة الحساب..."
             )
-            start_pull = False
+        )
+        start_pull = False
+        with _SYNC_GUARD:
+            if not _SYNC_STATE["running"]:
+                start_pull = True
+                _SYNC_STATE["running"] = True
+                _SYNC_STATE["result"] = None
+                _SYNC_STATE["lines"] = [opening]
+                _SYNC_STATE["fraction"] = 0.08
+                _SYNC_STATE["message"] = opening
+        if not start_pull:
+            st.warning("توجد عملية سحب جارية. انتظر اكتمالها أو أوقفها.")
+            return
+        if force_from_start:
+            reset_sync_checkpoint()
+        clear_stop_sync()
+        publish_groq_env(cfg)
+        explicit_key = os.environ.get("GROQ_API_KEY") or ""
+        chosen_limit = int(limit_val)
+        chosen_skip = bool(skip_media)
+        chosen_force = bool(force_from_start)
+
+        def _pull_worker() -> None:
+            try:
+                result = run_sync(
+                    chosen_limit,
+                    on_progress=_record_sync_progress,
+                    api_key=explicit_key,
+                    skip_media=chosen_skip,
+                    force_from_start=chosen_force,
+                )
+            except Exception as exc:
+                result = {"ok": False, "saved": 0, "error": describe_groq_error(exc), "logs": []}
             with _SYNC_GUARD:
-                if not _SYNC_STATE["running"]:
-                    start_pull = True
-                    _SYNC_STATE["running"] = True
-                    _SYNC_STATE["result"] = None
-                    _SYNC_STATE["lines"] = [opening]
-                    _SYNC_STATE["fraction"] = 0.08
-                    _SYNC_STATE["message"] = opening
+                _SYNC_STATE["result"] = result
+                _SYNC_STATE["done_at"] = time.time()
+                _SYNC_STATE["running"] = False
 
-            if not start_pull:
-                st.warning("توجد عملية سحب جارية. انتظر اكتمالها أو أوقفها.")
-            else:
-                clear_stop_sync()
-                publish_groq_env(cfg)
-                explicit_key = os.environ.get("GROQ_API_KEY") or ""
-                chosen_limit = int(limit_val)
-                chosen_skip = bool(skip_media)
+        threading.Thread(target=_pull_worker, daemon=True).start()
 
-                def _pull_worker() -> None:
-                    try:
-                        result = run_sync(
-                            chosen_limit,
-                            on_progress=_record_sync_progress,
-                            api_key=explicit_key,
-                            skip_media=chosen_skip,
-                        )
-                    except Exception as exc:
-                        result = {"ok": False, "saved": 0, "error": describe_groq_error(exc), "logs": []}
-                    with _SYNC_GUARD:
-                        _SYNC_STATE["result"] = result
-                        _SYNC_STATE["done_at"] = time.time()
-                        _SYNC_STATE["running"] = False
-
-                threading.Thread(target=_pull_worker, daemon=True).start()
+    if st.button("🚀 سحب القروب كاملاً من البداية الآن (من رسالة 1)", use_container_width=True, key="force_pull_from_start"):
+        _launch_pull(True)
+    pull_col, stop_col, analyze_col, sample_col = st.columns(4)
+    with pull_col:
+        if st.button("🔄 تحديث قاعدة الأرشيف بالذكاء الاصطناعي", use_container_width=True, key="public_pull"):
+            _launch_pull(False)
     with stop_col:
         if st.button("⏹️ إيقاف السحب والاكتفاء بما حُفظ", use_container_width=True, key="stop_pull"):
             request_stop_sync()

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -347,11 +348,108 @@ def force_release_client_lock() -> None:
         pass
 
 
-def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
-    """يمسح كل مؤشرات السحب حتى تبدأ الدفعة التالية من 1/1/2026 لا من آخر رسالة."""
-    request_stop_sync()
+_CHECKPOINT_KEY = re.compile(r"sync|checkpoint|offset|last_msg|jaecoo", re.IGNORECASE)
+
+
+def _scrub_checkpoint_files() -> None:
+    """يحذف مفاتيح التوقف من ملفات الإعدادات دون المساس بجلسة تيليجرام أو مفاتيح Groq."""
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    removed = [key for key in list(cfg) if _CHECKPOINT_KEY.search(str(key))]
+    if removed:
+        for key in removed:
+            cfg.pop(key, None)
+        try:
+            save_config(cfg)
+        except Exception:
+            pass
+    skip_dirs = {".git", ".cursor", "__pycache__", ".venv", "venv", "node_modules"}
+    for folder, dirs, files in os.walk(PROJECT_DIR):
+        dirs[:] = [name for name in dirs if name not in skip_dirs and not name.startswith(".")]
+        for name in files:
+            lower = name.lower()
+            if "session" in lower:
+                continue
+            path = os.path.join(folder, name)
+            if lower.endswith(".json"):
+                _scrub_json_checkpoint(path)
+            elif lower.endswith(".txt"):
+                _scrub_text_checkpoint(path)
+
+
+def _scrub_json_checkpoint(path: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return
+    if not _drop_checkpoint_keys(data):
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _drop_checkpoint_keys(value) -> bool:
+    changed = False
+    if isinstance(value, dict):
+        for key in list(value):
+            if _CHECKPOINT_KEY.search(str(key)):
+                value.pop(key, None)
+                changed = True
+            elif _drop_checkpoint_keys(value[key]):
+                changed = True
+    elif isinstance(value, list):
+        for item in value:
+            if _drop_checkpoint_keys(item):
+                changed = True
+    return changed
+
+
+def _scrub_text_checkpoint(path: str) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return
+    changed = False
+    updated = []
+    for line in lines:
+        match = re.match(r"^(\s*)([A-Za-z0-9_\-]+)(\s*[:=]\s*)(-?\d+)(\s*)$", line)
+        if match and _CHECKPOINT_KEY.search(match.group(2)) and match.group(4) != "0":
+            updated.append(f"{match.group(1)}{match.group(2)}{match.group(3)}0{match.group(5)}")
+            changed = True
+        else:
+            updated.append(line)
+    if not changed:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(updated)
+    except Exception:
+        pass
+
+
+def _wipe_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
+    """يصفّر كل جداول وملفات ومفاتيح المؤشر دون إيقاف سحب جديد."""
     conn = get_db_connection()
     try:
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        for (table,) in tables:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(table)):
+                continue
+            columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            for column in columns:
+                column_name = str(column[1])
+                if not _CHECKPOINT_KEY.search(column_name):
+                    continue
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column_name):
+                    continue
+                conn.execute(f"UPDATE {table} SET {column_name} = 0")
         conn.execute("DELETE FROM sync_state")
         conn.execute(
             """
@@ -373,6 +471,13 @@ def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
         conn.commit()
     finally:
         conn.close()
+    _scrub_checkpoint_files()
+
+
+def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
+    """يمسح كل مؤشرات السحب من القاعدة والملفات والذاكرة حتى تبدأ الدفعة من الرسالة 1."""
+    request_stop_sync()
+    _wipe_sync_checkpoint(group_key)
     force_release_client_lock()
 
 
@@ -596,17 +701,6 @@ async def _run_with_backoff(factory, on_progress):
             await asyncio.sleep(pause)
 
 
-async def _resume_floor_id(client, target, last_id: int) -> int:
-    """يبدأ من آخر نقطة محفوظة، أو من الرسالة السابقة لتاريخ 1/1/2026، أو من أقدم رسالة."""
-    if last_id > 0:
-        return last_id
-    anchor = None
-    async for message in client.iter_messages(target, offset_date=START_SYNC_DATE, limit=1):
-        anchor = message
-        break
-    return int(getattr(anchor, "id", 0) or 0)
-
-
 async def _attach_missing_parents(client, entity, messages: list) -> list:
     """يجلب أسئلة الدفعة السابقة التي رُد عليها داخل الدفعة الحالية."""
     present = {int(message.id) for message in messages}
@@ -634,10 +728,15 @@ async def _attach_missing_parents(client, entity, messages: list) -> list:
 
 
 async def _forward_page(client, target, after_id: int, page_size: int) -> list:
-    """يجلب صفحة تصاعدية: من الأقدم إلى الأحدث، وكل رسالة أحدث من after_id."""
+    """يجلب صفحة تصاعدية من الرسالة التالية لـ after_id. لا يُستخدم offset_date مع reverse."""
     page = []
-    async for message in client.iter_messages(target, min_id=after_id, reverse=True, limit=page_size):
-        if int(message.id) <= after_id:
+    async for message in client.iter_messages(
+        target,
+        min_id=int(after_id),
+        reverse=True,
+        limit=page_size,
+    ):
+        if int(message.id) <= int(after_id):
             continue
         page.append(message)
     page.sort(key=lambda item: item.id)
@@ -691,7 +790,13 @@ async def _open_client(cfg: dict, logs: list):
     return None, "جلسة تيليجرام غير مفعّلة. افتح قسم تفعيل الجلسة وأدخل رقم الجوال."
 
 
-async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "", skip_media: bool = False) -> dict:
+async def sync_and_analyze(
+    limit: int = 50,
+    on_progress=None,
+    api_key: str = "",
+    skip_media: bool = False,
+    force_from_start: bool = False,
+) -> dict:
     logs = []
     result = {
         "ok": False, "saved": 0, "scanned": 0, "threads": 0, "skipped": 0,
@@ -750,16 +855,19 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "",
         def _span(done_units: float) -> float:
             return min(0.98, 0.08 + 0.90 * (done_units / requested))
 
-        last_id = get_last_synced_id(group_key)
-        cursor_id = await _resume_floor_id(client, target, last_id)
-        if last_id > 0:
+        if force_from_start:
+            _wipe_sync_checkpoint(group_key)
+        last_id = 0 if force_from_start else get_last_synced_id(group_key)
+        from_start = bool(force_from_start) or last_id <= 0
+        cursor_id = 0 if from_start else last_id
+        if from_start:
             start_note = (
-                f"يكمل السحب تصاعدياً من الرسالة رقم {last_id + 1} نحو الأحدث. "
+                f"يبدأ السحب من الرسالة رقم 1 نحو الأحدث بلا offset_date. "
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         else:
             start_note = (
-                f"يبدأ السحب تصاعدياً من 1/1/2026 أو أقدم رسالة متاحة في القروب نحو الأحدث. "
+                f"يكمل السحب تصاعدياً من الرسالة رقم {last_id + 1} نحو الأحدث. "
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         _report(on_progress, start_note, 0.08)
@@ -791,14 +899,24 @@ async def sync_and_analyze(limit: int = 50, on_progress=None, api_key: str = "",
                 await asyncio.sleep(pause)
                 continue
             if not page or page[-1].id <= cursor_id:
-                _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
+                saved_checkpoint = get_last_synced_id(group_key)
+                if not from_start and saved_checkpoint > 0:
+                    stall = (
+                        f"المؤشر متوقف عند آخر رسالة رقم {saved_checkpoint} — "
+                        "اضغط زر (سحب القروب كاملاً من البداية) لإعادة فحص كافة الرسائل"
+                    )
+                    result["hint"] = stall
+                    _note(logs, stall, "error")
+                    _report(on_progress, stall, _span(pulled))
+                else:
+                    _report(on_progress, "لا توجد رسائل أحدث بعد نقطة التوقف.", _span(pulled))
                 break
             raw_messages = []
             fetched = 0
             for message in page:
                 fetched += 1
                 pulled += 1
-                if not _message_is_after_start(message):
+                if not from_start and not _message_is_after_start(message):
                     continue
                 result["scanned"] += 1
                 fraction = _span(batch_base + fetched * 0.45)
@@ -1112,11 +1230,18 @@ def _telegram_error_message(exc: Exception) -> str:
     return f"تعذر سحب الرسائل: {text}"
 
 
-def run_sync(limit: int = 50, on_progress=None, api_key: str = "", skip_media: bool = False) -> dict:
+def run_sync(
+    limit: int = 50,
+    on_progress=None,
+    api_key: str = "",
+    skip_media: bool = False,
+    force_from_start: bool = False,
+) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     init_db()
     chosen_key = str(api_key or os.environ.get("GROQ_API_KEY") or "").strip()
     media_skipped = bool(skip_media)
+    start_over = bool(force_from_start)
     acquired = False
     try:
         acquired = _CLIENT_LOCK.acquire(blocking=False)
@@ -1129,6 +1254,9 @@ def run_sync(limit: int = 50, on_progress=None, api_key: str = "", skip_media: b
                 "error": "توجد عملية سحب جارية حالياً. انتظر حتى تُغلق جلسة تيليجرام.",
                 "logs": [],
             }
+        if start_over:
+            clear_stop_sync()
+            _wipe_sync_checkpoint(SYNC_GROUP_KEY)
         _set_sync_active(True)
         set_app_setting("telegram_sync_attempt_at", str(time.time()))
         return _run_on_fresh_loop(
@@ -1137,6 +1265,7 @@ def run_sync(limit: int = 50, on_progress=None, api_key: str = "", skip_media: b
                 on_progress=on_progress,
                 api_key=chosen_key,
                 skip_media=media_skipped,
+                force_from_start=start_over,
             )
         )
     finally:
