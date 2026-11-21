@@ -715,15 +715,33 @@ def _title_is_english(title: str) -> bool:
     return bool(re.search(r"[A-Za-z]", text))
 
 
-def card_passes_quality_gate(card: dict) -> bool:
-    """يرفض البطاقة التافهة والعنوان الإنجليزي والحقول الفارغة أو nan."""
-    if not isinstance(card, dict):
+def _has_useful_info(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    if _field_is_blank(cleaned):
         return False
-    if card.get("is_worth_archiving") in (False, 0, "0", "false", "False"):
+    if "?" in cleaned or "؟" in cleaned:
+        return True
+    lowered = cleaned.lower()
+    markers = (
+        "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "مشكلة", "عطل", "صوت", "رجة", "نتعة",
+        "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت", "صيانة", "ضمان",
+        "وكالة", "تحديث", "كفر", "بنزين", "صرفية", "استهلاك", "حساس", "لمبة", "كود", "تأمين", "قطع",
+        "سعر", "كم", "كيف", "وين", "حل", "جرب",
+    )
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def card_passes_quality_gate(card: dict) -> bool:
+    """None لا يرفض البطاقة. الرفض الصريح لا يسقط بطاقة عنوانها أو حلها مفيد."""
+    if not isinstance(card, dict):
         return False
     title = str(card.get("title") or "").strip()
     problem = str(card.get("problem_or_topic") or "").strip()
     solution = str(card.get("solution_or_summary") or "").strip()
+    flag = card.get("is_worth_archiving")
+    explicit_false = flag in (False, 0, "0", "false", "False")
+    if explicit_false and not (_has_useful_info(title) or _has_useful_info(solution)):
+        return False
     if any(_field_is_blank(item) for item in (title, problem, solution)):
         return False
     if _title_is_english(title):
@@ -778,6 +796,17 @@ def _normalize_card_fields(data: dict) -> dict:
     return data
 
 
+def _strip_model_json(raw: str) -> str:
+    """يزيل تفكير النموذج وأي سياج حول كائن JSON."""
+    text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+    return text.strip()
+
+
 def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mime_type=None, on_switch=None) -> dict:
     schema_json_str = json.dumps(KnowledgeCardSchema.model_json_schema(), ensure_ascii=False)
     dealer_hint = ""
@@ -802,11 +831,12 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
             {
                 "role": "system",
                 "content": (
-                    "استخرج JSON فقط وبالعربية الفصحى. "
+                    "استخرج JSON فقط وبالعربية الخالصة، بلا وسم think وبلا شرح خارج الكائن. "
+                    "استخرج كل عطل وتجربة ورقم قطعة وسعر صيانة ورد في السلسلة. "
+                    "أي استفسار فني أو تجربة مالك أو حل عملي يعني is_worth_archiving = true. "
                     "احفظ روابط علي إكسبريس والإكسسوارات، وتجارب العملية والمميزات والعيوب، وبيانات الوكيل والصيانة. "
                     "صورة أو صوت أو فيديو العطل يذهب إلى problem_or_topic، وشرح الحل أو المنتج يذهب إلى solution_or_summary. "
                     "أبقِ رابط الشراء كما هو داخل solution_or_summary أو part_numbers_or_specs. "
-                    "أي معلومة أو استفسار أو رد فني أو جدول صيانة أو تجربة ترصيص يعني is_worth_archiving = true. "
                     "Jaecoo J8 SHS عند SHS أو هايبرد أو هجين أو بلق ان أو PHEV أو شحن كهرباء. "
                     "ثم Jaecoo J8 وJaecoo J7 وJaecoo J5 حسب ذكر الطراز. "
                     "ممنوع إخراج nan."
@@ -818,7 +848,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         on_switch=on_switch,
     )
 
-    data = _normalize_card_fields(json.loads(completion.choices[0].message.content))
+    data = _normalize_card_fields(json.loads(_strip_model_json(completion.choices[0].message.content)))
     parts = str(data.get("part_numbers_or_specs") or "").strip()
     if parts.lower() in {"", "nan", "none", "null"}:
         data["part_numbers_or_specs"] = "غير محدد"
@@ -857,8 +887,10 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
         and not text_mentions_shs("\n".join((thread_text, problem_text, solution_text, parts)))
     ):
         data["is_worth_archiving"] = False
-    if not solution_text.strip() and problem_text.strip():
+    if not str(data.get("solution_or_summary") or "").strip() and problem_text.strip():
         data["solution_or_summary"] = problem_text.strip()
+    if _has_useful_info(thread_text) or _has_useful_info(problem_text) or _has_useful_info(str(data.get("solution_or_summary") or "")):
+        data["is_worth_archiving"] = True
     return force_j8_shs_model(data, thread_text)
 
 

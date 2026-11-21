@@ -245,6 +245,7 @@ async def _extract_message_content(tg_client, groq_key: str, message) -> tuple[s
 
 
 def _worth_archiving(card: dict) -> bool:
+    """None لا يرفض البطاقة. الرفض الصريح يتم داخل بوابة الجودة إذا خلا العنوان والحل."""
     return card_passes_quality_gate(card)
 
 
@@ -385,7 +386,7 @@ def _grouped_id(message):
 
 
 def _build_dialogue_threads(messages: list) -> dict:
-    """يجمع الردود وألبوم الوسائط ورسائل الكاتب المتتالية خلال 3 دقائق في سلسلة واحدة."""
+    """يجمع الردود وألبوم الوسائط ورسائل الكاتب المتتالية خلال 3 دقائق، وكل رسالة تُضاف مرة واحدة."""
     threads = {}
     message_to_root = {}
     grouped_to_root = {}
@@ -394,7 +395,7 @@ def _build_dialogue_threads(messages: list) -> dict:
     for message in sorted(messages, key=lambda item: item.id):
         reply_id = _reply_to_id(message)
         grouped = _grouped_id(message)
-        root_id = None
+        root_id = message.id
         if reply_id and reply_id in message_to_root:
             root_id = message_to_root[reply_id]
         elif grouped and grouped in grouped_to_root:
@@ -406,8 +407,6 @@ def _build_dialogue_threads(messages: list) -> dict:
             if same_sender and moment is not None and previous_moment is not None:
                 if abs((moment - previous_moment).total_seconds()) <= 180:
                     root_id = previous_root
-        if root_id is None:
-            root_id = message.id
         threads.setdefault(root_id, []).append(message)
         message_to_root[message.id] = root_id
         if grouped:
@@ -417,22 +416,62 @@ def _build_dialogue_threads(messages: list) -> dict:
     return threads
 
 
-def _group_reply_threads(messages: list) -> dict:
-    return _build_dialogue_threads(messages)
-
-
-_NOISE_PHRASES = (
-    "مبروك", "تهانينا", "تهاني", "السلام عليكم", "سلام عليكم", "صباح الخير", "مساء الخير",
-    "هلا والله", "هلا", "تصبحون على خير", "الله يسعدك", "تسلم", "يعطيك العافية",
+_EDGE_GREETINGS = (
+    "السلام عليكم ورحمة الله وبركاته",
+    "السلام عليكم ورحمة الله",
+    "السلام عليكم",
+    "سلام عليكم",
+    "صباح الخير",
+    "مساء الخير",
+    "يعطيكم العافية",
+    "يعطيك العافية",
+    "يا شباب",
+    "هلا والله",
+    "تصبحون على خير",
+    "مبروك",
+    "تهانينا",
+    "ياشباب",
+    "هلا",
+)
+_USEFUL_TOPIC_TERMS = (
+    "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "مشكلة", "عطل", "صوت", "رجة", "نتعة",
+    "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت", "صيانة", "ضمان",
+    "وكالة", "تحديث", "كفر", "بنزين", "صرفية", "استهلاك", "حساس", "لمبة", "كود", "تأمين", "قطع",
+    "سعر", "كم", "كيف", "وين", "حل", "جرب",
 )
 
 
+def _strip_edge_greetings(text: str) -> str:
+    """ينزع التحية والمجاملة من طرفي النص فقط حتى لا تُبتلع كلمات مثل هل واستهلاك."""
+    cleaned = (text or "").strip()
+    phrases = sorted(_EDGE_GREETINGS, key=len, reverse=True)
+    changed = True
+    while cleaned and changed:
+        changed = False
+        for phrase in phrases:
+            if cleaned.startswith(phrase):
+                cleaned = cleaned[len(phrase):].strip(" \n\t،,.:;!-ـ")
+                changed = True
+                break
+            if cleaned.endswith(phrase):
+                cleaned = cleaned[: -len(phrase)].strip(" \n\t،,.:;!-ـ")
+                changed = True
+                break
+    return cleaned
+
+
+def _remaining_is_technical(text: str) -> bool:
+    if "?" in text or "؟" in text:
+        return True
+    lowered = text.lower()
+    return any(term.lower() in lowered for term in _USEFUL_TOPIC_TERMS)
+
+
 def _thread_is_noise(messages: list) -> bool:
-    """يستبعد الترحيب والتهاني والدردشة القصيرة قبل استدعاء Groq."""
+    """يستبعد التحية الفارغة فقط، ويبقي السؤال والمصطلح الفني مهما قصرا."""
     texts = []
     has_link = False
     has_media = False
-    has_technical_reply = False
     for message in messages:
         text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
         texts.append(text)
@@ -440,15 +479,12 @@ def _thread_is_noise(messages: list) -> bool:
             has_link = True
         if detect_msg_media_kind(message) != "text":
             has_media = True
-        if _reply_to_id(message) and len(text) >= 25:
-            has_technical_reply = True
-    if has_link or has_media or has_technical_reply:
+    if has_link or has_media:
         return False
-    combined = " ".join(part for part in texts if part).strip()
-    if len(combined) < 25:
-        return True
-    compact = combined.replace(" ", "")
-    return len(combined) <= 80 and any(phrase.replace(" ", "") in compact or phrase in combined for phrase in _NOISE_PHRASES)
+    remaining = _strip_edge_greetings(" ".join(part for part in texts if part))
+    if _remaining_is_technical(remaining):
+        return False
+    return len(remaining) < 15
 
 
 def _is_blocking_failure(exc: Exception) -> bool:
@@ -496,6 +532,32 @@ async def _resume_floor_id(client, target, last_id: int) -> int:
         anchor = message
         break
     return int(getattr(anchor, "id", 0) or 0)
+
+
+async def _attach_missing_parents(client, entity, messages: list) -> list:
+    """يجلب أسئلة الدفعة السابقة التي رُد عليها داخل الدفعة الحالية."""
+    present = {int(message.id) for message in messages}
+    missing = []
+    for message in messages:
+        reply_id = _reply_to_id(message)
+        if reply_id and reply_id not in present and reply_id not in missing:
+            missing.append(reply_id)
+    if not missing:
+        return messages
+    fetched = await client.get_messages(entity, ids=missing)
+    if fetched is None:
+        return messages
+    if not isinstance(fetched, (list, tuple)):
+        fetched = [fetched]
+    merged = list(messages)
+    for item in fetched:
+        if item is None or not getattr(item, "id", None):
+            continue
+        item_id = int(item.id)
+        if item_id not in present:
+            merged.append(item)
+            present.add(item_id)
+    return merged
 
 
 async def _forward_page(client, target, after_id: int, page_size: int) -> list:
@@ -676,6 +738,14 @@ async def sync_and_analyze(limit: int = 50, on_progress=None) -> dict:
                 if _should_analyze_message(message) or _reply_to_id(message) or message.id in referenced_ids
             ]
 
+            try:
+                batch = await _attach_missing_parents(client, target, batch)
+            except Exception as exc:
+                if _is_blocking_failure(exc):
+                    result["error"] = "تعذر جلب الرسائل الأصلية بسبب انقطاع الشبكة. المؤشر لم يتقدم."
+                    _note(logs, result["error"], "error")
+                    break
+                _note(logs, f"تعذر جلب بعض الرسائل الأصلية: {exc}", "error")
             threads = _build_dialogue_threads(batch)
             thread_total = max(len(threads), 1)
             hold_checkpoint = False
