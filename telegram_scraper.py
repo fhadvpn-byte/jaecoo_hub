@@ -289,7 +289,7 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
 
 
 def _worth_archiving(card: dict) -> bool:
-    """None لا يرفض البطاقة. الرفض الصريح يتم داخل بوابة الجودة إذا خلا العنوان والحل."""
+    """None لا يرفض البطاقة. الرفض فقط إذا صرّح النموذج بـ False وخلا العنوان والحل من الفائدة."""
     return card_passes_quality_gate(card)
 
 
@@ -559,16 +559,21 @@ def _grouped_id(message):
 
 
 def _build_dialogue_threads(messages: list) -> dict:
-    """يجمع الردود وألبوم الوسائط ورسائل الكاتب المتتالية خلال 3 دقائق، وكل رسالة تُضاف مرة واحدة."""
+    """يجمع الرد على سؤاله وألبوم الوسائط ورسائل الكاتب خلال 3 دقائق. كل رسالة تُدرج مرة واحدة."""
     threads = {}
     message_to_root = {}
     grouped_to_root = {}
+    seen_ids = set()
     previous = None
     previous_root = None
-    for message in sorted(messages, key=lambda item: item.id):
+    for message in sorted(messages, key=lambda item: int(item.id)):
+        message_id = int(message.id)
+        if message_id in seen_ids:
+            continue
+        seen_ids.add(message_id)
         reply_id = _reply_to_id(message)
         grouped = _grouped_id(message)
-        root_id = message.id
+        root_id = message_id
         if reply_id and reply_id in message_to_root:
             root_id = message_to_root[reply_id]
         elif grouped and grouped in grouped_to_root:
@@ -581,7 +586,7 @@ def _build_dialogue_threads(messages: list) -> dict:
                 if abs((moment - previous_moment).total_seconds()) <= 180:
                     root_id = previous_root
         threads.setdefault(root_id, []).append(message)
-        message_to_root[message.id] = root_id
+        message_to_root[message_id] = root_id
         if grouped:
             grouped_to_root[grouped] = root_id
         previous = message
@@ -599,12 +604,8 @@ _EDGE_GREETINGS = (
     "يعطيكم العافية",
     "يعطيك العافية",
     "يا شباب",
-    "هلا والله",
-    "تصبحون على خير",
-    "مبروك",
-    "تهانينا",
     "ياشباب",
-    "هلا",
+    "تصبحون على خير",
 )
 
 
@@ -635,11 +636,10 @@ def _remaining_is_technical(text: str) -> bool:
 
 
 def _thread_is_noise(messages: list) -> bool:
-    """يتخطى التحية المجردة فقط. السؤال والرد والرابط والوسائط والمصطلح الفني تبقى."""
+    """يستبعد التحية القصيرة فقط. لا تُحذف المسافات حتى لا تُبتلع هل أحد أو استهلاك."""
     texts = []
     has_link = False
     has_media = False
-    has_reply = False
     for message in messages:
         text = (getattr(message, "message", None) or getattr(message, "text", None) or "").strip()
         texts.append(text)
@@ -647,12 +647,10 @@ def _thread_is_noise(messages: list) -> bool:
             has_link = True
         if detect_msg_media_kind(message) != "text":
             has_media = True
-        if _reply_to_id(message):
-            has_reply = True
-    if has_link or has_media or has_reply:
-        return False
     remaining = _strip_edge_greetings(" ".join(part for part in texts if part))
-    if _remaining_is_technical(remaining):
+    if "?" in remaining or "؟" in remaining or "هل" in remaining or _remaining_is_technical(remaining):
+        return False
+    if has_link or has_media:
         return False
     return len(remaining) < 15
 
@@ -702,28 +700,34 @@ async def _run_with_backoff(factory, on_progress):
 
 
 async def _attach_missing_parents(client, entity, messages: list) -> list:
-    """يجلب أسئلة الدفعة السابقة التي رُد عليها داخل الدفعة الحالية."""
-    present = {int(message.id) for message in messages}
-    missing = []
-    for message in messages:
-        reply_id = _reply_to_id(message)
-        if reply_id and reply_id not in present and reply_id not in missing:
-            missing.append(reply_id)
-    if not missing:
-        return messages
-    fetched = await client.get_messages(entity, ids=missing)
-    if fetched is None:
-        return messages
-    if not isinstance(fetched, (list, tuple)):
-        fetched = [fetched]
+    """يجلب أسئلة الدفعات السابقة دفعة واحدة حتى يبقى الحل مربوطاً بسؤاله."""
     merged = list(messages)
-    for item in fetched:
-        if item is None or not getattr(item, "id", None):
-            continue
-        item_id = int(item.id)
-        if item_id not in present:
+    present = {int(message.id) for message in merged}
+    for _ in range(4):
+        missing_reply_ids = []
+        for message in merged:
+            reply_id = _reply_to_id(message)
+            if reply_id and reply_id not in present and reply_id not in missing_reply_ids:
+                missing_reply_ids.append(reply_id)
+        if not missing_reply_ids:
+            break
+        fetched = await client.get_messages(entity, ids=missing_reply_ids)
+        if fetched is None:
+            break
+        if not isinstance(fetched, (list, tuple)):
+            fetched = [fetched]
+        added = False
+        for item in fetched:
+            if item is None or not getattr(item, "id", None):
+                continue
+            item_id = int(item.id)
+            if item_id in present:
+                continue
             merged.append(item)
             present.add(item_id)
+            added = True
+        if not added:
+            break
     return merged
 
 

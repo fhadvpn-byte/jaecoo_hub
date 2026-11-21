@@ -162,7 +162,7 @@ SYSTEM_PROMPT = """
 شروط صارمة:
 1. الحقول النصية بالعربية الفصحى فقط. يُسمح بروابط الإنترنت وأرقام القطع وأسماء الطرازات.
 2. ممنوع الجمل الإنجليزية وممنوع nan.
-3. كل رسالة فيها معلومة أو استفسار أو رد فني تعني is_worth_archiving = true. الاستفسار يذهب إلى problem_or_topic، والرد أو المعلومة إلى solution_or_summary. إذا لم يظهر رد بعد، لخّص الاستفسار في الحل ولا ترفض البطاقة.
+3. استخرج بالعربية كل عطل أو تجربة مالك أو رقم قطعة أو سعر صيانة ورد في السلسلة. أي استفسار فني أو تجربة مالك أو حل عملي يعني is_worth_archiving = true. الاستفسار يذهب إلى problem_or_topic، والرد أو الرقم أو السعر إلى solution_or_summary. إذا لم يظهر رد بعد، لخّص الاستفسار في الحل ولا ترفض البطاقة.
 4. التحيات والدردشة الفارغة بلا معلومة وبلا استفسار وبلا وسائط تعني is_worth_archiving = false.
 5. car_model أحد: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
 6. صنّف car_model من نص النقاش أو وصف الصورة:
@@ -568,7 +568,7 @@ USEFUL_TOPIC_TERMS = (
     "جايكو", "جيكو", "j8", "j7", "j5", "shs", "هايبرد", "هجين", "phev", "مشكلة", "عطل", "صوت",
     "رجة", "نتعة", "حرارة", "بطارية", "شاشة", "تكييف", "دبل", "قير", "فرامل", "فحمات", "زيت",
     "صيانة", "ضمان", "وكالة", "وكيل", "تحديث", "كفر", "إطارات", "بنزين", "صرفية", "استهلاك",
-    "حساس", "لمبة", "كود", "تأمين", "قطع", "سعر", "أسعار", "كم", "كيف", "وين", "حل", "جرب",
+    "حساس", "لمبة", "كود", "تأمين", "قطع", "سعر", "أسعار", "كم", "كيف", "وين", "حل", "جرب", "هل",
     "تجربة", "تجارب", "استلام", "ملاحظات", "فيوز", "لزوجة", "agm", "carplay", "tbox", "obd", "awd",
 )
 _LATIN_TECH_TOKENS = {"agm", "carplay", "tbox", "obd", "awd", "shs", "j8", "j7", "j5", "phev"}
@@ -886,7 +886,7 @@ def card_rejection_reason(card: dict) -> str:
         return "الحل فارغ"
     if not re.search(r"[\u0600-\u06FF]", title + problem + solution):
         return "لا يوجد نص عربي في العنوان أو الحل"
-    flag = card.get("is_worth_archiving")
+    flag = card.get("is_worth_archiving", None)
     explicit_false = flag in (False, 0, "0", "false", "False")
     if explicit_false and not _has_useful_info("\n".join((title, problem, solution))):
         return "صُنفت دردشة فارغة بلا فائدة فنية أو تجربة مالك"
@@ -941,8 +941,9 @@ def _normalize_card_fields(data: dict) -> dict:
 
 
 def _strip_model_json(raw: str) -> str:
-    """يزيل تفكير النموذج وأي سياج ثم يأخذ أول كائن JSON."""
+    """يزيل وسم think المغلق والمفتوح ثم يأخذ أول كائن JSON."""
     text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>[\s\S]*?(?=\{)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
     match = re.search(r"\{[\s\S]*\}", text)
     if match:
@@ -991,6 +992,7 @@ def analyze_thread_with_ai(thread_text: str, api_key: str, media_bytes=None, mim
                 "problem_or_topic = المشكلة أو الموضوع بدقة. "
                 "solution_or_summary = خلاصة الحلول وتجارب الأعضاء، وإن تعددت الآراء فاذكرها بوضوح. "
                 "part_numbers_or_specs = أرقام القطع والمقاسات: بطارية، إطارات، لزوجة زيت، فيوز، تحديث، سعر صيانة، أو رابط منتج. "
+                "استخرج كل عطل أو تجربة مالك أو رقم قطعة أو سعر صيانة ورد في السلسلة بالعربية. "
                 "is_worth_archiving = true لأي استفسار فني أو تجربة مالك أو حل عملي أو ملاحظة وكيل أو تأمين أو سعر أو استلام. "
                 "is_verified_solution = true فقط إذا أكد عضو أن الحل نجح فعلياً، وإلا false. "
                 "Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 إذا لم يُذكر J8 أو SHS. "
