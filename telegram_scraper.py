@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import json
 import logging
 import os
 import re
@@ -17,6 +16,7 @@ from telethon.sessions import StringSession
 from database_and_ai import (
     analyze_image_bytes,
     analyze_thread_with_ai,
+    analyze_threads_batch_with_ai,
     card_rejection_reason,
     collect_groq_keys,
     is_key_or_quota_error,
@@ -229,10 +229,12 @@ async def _extract_message_content(tg_client, groq_key: str, message, skip_media
     caption_for_ai = f"{caption}{url_note}".strip()
     kind = detect_msg_media_kind(message)
     if skip_media:
-        labels = {"image": "تعليق صورة", "audio": "تعليق مقطع صوتي", "video": "تعليق فيديو"}
-        label = labels.get(kind, "")
-        text = f"{label}: {caption}{url_note}".strip() if label else f"{caption}{url_note}".strip()
-        return text, "text", ""
+        if not caption_for_ai:
+            return "", kind, ""
+        labels = {"image": "[مرفق صورة]", "audio": "[مرفق صوتي]", "video": "[مرفق فيديو]"}
+        prefix = labels.get(kind, "")
+        text = f"{prefix} {caption_for_ai}".strip() if prefix else caption_for_ai
+        return text, kind, ""
     file_ext = getattr(getattr(message, "file", None), "ext", None) or ""
     if kind == "image":
         try:
@@ -323,7 +325,7 @@ async def _connect_saved_client(client: TelegramClient, logs: list, message: str
     return True
 
 
-def get_last_synced_id(group_key: str = "main_group") -> int:
+def get_last_synced_id(group_key: str = SYNC_GROUP_KEY) -> int:
     conn = get_db_connection()
     try:
         row = conn.execute(
@@ -355,118 +357,24 @@ def force_release_client_lock() -> None:
         pass
 
 
-_CHECKPOINT_KEY = re.compile(r"sync|checkpoint|offset|last_msg|jaecoo", re.IGNORECASE)
-
-
-def _scrub_checkpoint_files() -> None:
-    """يحذف مفاتيح التوقف من ملفات الإعدادات دون المساس بجلسة تيليجرام أو مفاتيح Groq."""
-    try:
-        cfg = load_config()
-    except Exception:
-        cfg = {}
-    removed = [key for key in list(cfg) if _CHECKPOINT_KEY.search(str(key))]
-    if removed:
-        for key in removed:
-            cfg.pop(key, None)
-        try:
-            save_config(cfg)
-        except Exception:
-            pass
-    skip_dirs = {".git", ".cursor", "__pycache__", ".venv", "venv", "node_modules"}
-    for folder, dirs, files in os.walk(PROJECT_DIR):
-        dirs[:] = [name for name in dirs if name not in skip_dirs and not name.startswith(".")]
-        for name in files:
-            lower = name.lower()
-            if "session" in lower:
-                continue
-            path = os.path.join(folder, name)
-            if lower.endswith(".json"):
-                _scrub_json_checkpoint(path)
-            elif lower.endswith(".txt"):
-                _scrub_text_checkpoint(path)
-
-
-def _scrub_json_checkpoint(path: str) -> None:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except Exception:
-        return
-    if not _drop_checkpoint_keys(data):
-        return
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _drop_checkpoint_keys(value) -> bool:
-    changed = False
-    if isinstance(value, dict):
-        for key in list(value):
-            if _CHECKPOINT_KEY.search(str(key)):
-                value.pop(key, None)
-                changed = True
-            elif _drop_checkpoint_keys(value[key]):
-                changed = True
-    elif isinstance(value, list):
-        for item in value:
-            if _drop_checkpoint_keys(item):
-                changed = True
-    return changed
-
-
-def _scrub_text_checkpoint(path: str) -> None:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except Exception:
-        return
-    changed = False
-    updated = []
-    for line in lines:
-        match = re.match(r"^(\s*)([A-Za-z0-9_\-]+)(\s*[:=]\s*)(-?\d+)(\s*)$", line)
-        if match and _CHECKPOINT_KEY.search(match.group(2)) and match.group(4) != "0":
-            updated.append(f"{match.group(1)}{match.group(2)}{match.group(3)}0{match.group(5)}")
-            changed = True
-        else:
-            updated.append(line)
-    if not changed:
-        return
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.writelines(updated)
-    except Exception:
-        pass
+_SAFE_SYNC_SETTING_KEYS = (
+    "telegram_sync_active",
+    "telegram_sync_attempt_at",
+    "sync_checkpoint",
+    "last_msg_id",
+    "sync_offset",
+)
 
 
 def _wipe_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
-    """يصفّر كل جداول وملفات ومفاتيح المؤشر دون إيقاف سحب جديد."""
+    """يصفّر sync_state ومفاتيح حالة السحب فقط، دون المساس بالجلسة أو البطاقات."""
     conn = get_db_connection()
     try:
-        tables = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-        for (table,) in tables:
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(table)):
-                continue
-            columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
-            for column in columns:
-                column_name = str(column[1])
-                if not _CHECKPOINT_KEY.search(column_name):
-                    continue
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column_name):
-                    continue
-                conn.execute(f"UPDATE {table} SET {column_name} = 0")
         conn.execute("DELETE FROM sync_state")
+        placeholders = ",".join("?" for _ in _SAFE_SYNC_SETTING_KEYS)
         conn.execute(
-            """
-            DELETE FROM app_settings
-            WHERE key LIKE '%sync%'
-               OR key LIKE '%checkpoint%'
-               OR key LIKE '%offset%'
-               OR key LIKE '%last_msg%'
-               OR key LIKE '%jaecoo%'
-            """
+            f"DELETE FROM app_settings WHERE key IN ({placeholders})",
+            _SAFE_SYNC_SETTING_KEYS,
         )
         conn.execute(
             """
@@ -478,7 +386,17 @@ def _wipe_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
         conn.commit()
     finally:
         conn.close()
-    _scrub_checkpoint_files()
+    try:
+        cfg = load_config()
+        changed = False
+        for key in ("last_msg_id", "sync_checkpoint", "sync_offset"):
+            if key in cfg:
+                cfg.pop(key, None)
+                changed = True
+        if changed:
+            save_config(cfg)
+    except Exception:
+        pass
 
 
 def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
@@ -491,7 +409,7 @@ def reset_sync_checkpoint(group_key: str = SYNC_GROUP_KEY) -> None:
         clear_stop_sync()
 
 
-def update_last_synced_id(msg_id: int, group_key: str = "main_group") -> None:
+def update_last_synced_id(msg_id: int, group_key: str = SYNC_GROUP_KEY) -> None:
     """يحرك نقطة الاستئناف للأمام فقط. الصفر يُستخدم عند إعادة الضبط الصريحة."""
     target = int(msg_id)
     if target != 0 and _STOP_SYNC_EVENT.is_set():
@@ -789,6 +707,51 @@ async def _attach_missing_parents(client, entity, messages: list) -> list:
     return merged
 
 
+async def _find_cursor_before_date(client, target, start_date: datetime) -> int:
+    """يجد آخر رسالة أقدم من 1/1/2026. إذا لم تكن النتيجة أقدم من التاريخ نبدأ من 0."""
+    try:
+        async for message in client.iter_messages(target, offset_date=start_date, limit=1):
+            msg_dt = getattr(message, "date", None)
+            if msg_dt is None:
+                return 0
+            if msg_dt.tzinfo is None:
+                msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+            if msg_dt < start_date:
+                return int(message.id)
+            return 0
+    except Exception:
+        pass
+    return 0
+
+
+async def _resolve_author_name(message, sender_cache: dict[int, str]) -> str:
+    """يقرأ اسم الكاتب من الكائن المحمّل أو الذاكرة المؤقتة لتقليل طلبات الشبكة."""
+    sid = _sender_id(message)
+    if sid and sid in sender_cache:
+        return sender_cache[sid]
+    sender = getattr(message, "sender", None)
+    if sender is None:
+        try:
+            sender = await message.get_sender()
+        except Exception:
+            sender = None
+    if sender is not None:
+        first = getattr(sender, "first_name", "") or ""
+        last = getattr(sender, "last_name", "") or ""
+        name = f"{first} {last}".strip() or getattr(sender, "title", None) or "عضو"
+    else:
+        name = "عضو"
+    if sid:
+        sender_cache[sid] = name
+    return name
+
+
+def _build_thread_url(public_username: str, public_id: str, root_id: int) -> str:
+    if public_username:
+        return f"https://t.me/{public_username}/{root_id}"
+    return f"https://t.me/c/{public_id}/{root_id}"
+
+
 async def _forward_page(client, target, after_id: int, page_size: int) -> list:
     """يجلب صفحة تصاعدية من الرسالة التالية لـ after_id. لا يُستخدم offset_date مع reverse."""
     page = []
@@ -858,6 +821,7 @@ async def sync_and_analyze(
     api_key: str = "",
     skip_media: bool = False,
     force_from_start: bool = False,
+    use_batch_ai: bool = False,
 ) -> dict:
     logs = []
     result = {
@@ -908,37 +872,49 @@ async def sync_and_analyze(
             _note(logs, result["error"], "error")
             return result
 
-        result["group"] = target.name or str(target.id)
+        group_name = target.name or str(target.id)
+        result["group"] = group_name
         chat_id = str(target.id)
         public_id = chat_id[4:] if chat_id.startswith("-100") else chat_id.lstrip("-")
+        public_username = (getattr(target.entity, "username", None) or "").strip()
         group_key = SYNC_GROUP_KEY
         requested = max(1, min(SESSION_PULL_CAP, int(limit or SESSION_PULL_CAP)))
 
         def _span(done_units: float) -> float:
             return min(0.98, 0.08 + 0.90 * (done_units / requested))
 
-        if force_from_start:
+        ignore_date_filter = bool(force_from_start)
+        if ignore_date_filter:
             _wipe_sync_checkpoint(group_key)
-        last_id = 0 if force_from_start else get_last_synced_id(group_key)
-        from_start = bool(force_from_start) or last_id <= 0
-        cursor_id = 0 if from_start else last_id
-        if from_start:
+            cursor_id = 0
             start_note = (
-                f"يبدأ السحب من الرسالة رقم 1 نحو الأحدث بلا offset_date. "
+                f"يبدأ السحب الشامل من الرسالة رقم 1 نحو الأحدث (شامل كل التواريخ). "
                 f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
             )
         else:
-            start_note = (
-                f"يكمل السحب تصاعدياً من الرسالة رقم {last_id + 1} نحو الأحدث. "
-                f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
-            )
-        _report(on_progress, start_note, 0.08)
-        _report(on_progress, f"نقطة البداية الفعلية بعد الفحص: من الرسالة رقم {cursor_id}", 0.09)
+            last_id = get_last_synced_id(group_key)
+            if last_id <= 0:
+                _report(on_progress, "جاري تحديد موقع أول رسالة بتاريخ 1/1/2026...", 0.08)
+                cursor_id = await _find_cursor_before_date(client, target, START_SYNC_DATE)
+                start_note = (
+                    f"يبدأ السحب من تاريخ 1/1/2026 (بعد الرسالة #{cursor_id}) نحو الأحدث. "
+                    f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
+                )
+            else:
+                cursor_id = last_id
+                start_note = (
+                    f"يكمل السحب تصاعدياً من الرسالة رقم {last_id + 1} نحو الأحدث. "
+                    f"المطلوب {requested} رسالة على دفعات من {SYNC_CHAIN_BATCH}."
+                )
+        _report(on_progress, start_note, 0.09)
+        _report(on_progress, f"نقطة البداية الفعلية بعد الفحص: من الرسالة رقم {cursor_id}", 0.095)
         _report(on_progress, "البطاقات السابقة تبقى محفوظة. نقطة آخر رسالة تُحفظ بعد كل نقاش.", 0.1)
-        _note(logs, f"متابعة أرشفة {result['group']} بعد الرسالة {cursor_id}. المطلوب {requested}.")
+        _note(logs, f"متابعة أرشفة {group_name} بعد الرسالة {cursor_id}. المطلوب {requested}.")
 
+        sender_cache: dict[int, str] = {}
         pulled = 0
         batch_no = 0
+        empty_date_pages = 0
         while pulled < requested:
             if _STOP_SYNC_EVENT.is_set():
                 result["stopped"] = True
@@ -962,10 +938,10 @@ async def sync_and_analyze(
                 continue
             if not page or page[-1].id <= cursor_id:
                 saved_checkpoint = get_last_synced_id(group_key)
-                if pulled == 0 and not from_start and saved_checkpoint > 0:
+                if pulled == 0 and not ignore_date_filter and saved_checkpoint > 0:
                     stall = (
                         f"المؤشر متوقف عند آخر رسالة رقم {saved_checkpoint} — "
-                        "اضغط زر (سحب القروب كاملاً من البداية) لإعادة فحص كافة الرسائل"
+                        "اضغط زر (سحب القروب كاملاً من البداية) أو (إعادة الضبط للبدء من 1/1/2026)."
                     )
                 elif pulled == 0:
                     stall = "لا توجد رسائل جديدة. انتهت رسائل القروب عند نقطة التوقف."
@@ -980,10 +956,10 @@ async def sync_and_analyze(
             raw_messages = []
             fetched = 0
             for message in page:
+                if not ignore_date_filter and not _message_is_after_start(message):
+                    continue
                 fetched += 1
                 pulled += 1
-                if not from_start and not _message_is_after_start(message):
-                    continue
                 result["scanned"] += 1
                 fraction = _span(batch_base + fetched * 0.45)
                 msg_date = message.date.strftime("%Y-%m-%d") if getattr(message, "date", None) else ""
@@ -996,7 +972,19 @@ async def sync_and_analyze(
                     fraction,
                 )
                 raw_messages.append(message)
-            cursor_id = page[-1].id
+                if pulled >= requested:
+                    cursor_id = message.id
+                    break
+            else:
+                cursor_id = page[-1].id
+            if not raw_messages:
+                update_last_synced_id(cursor_id, group_key)
+                empty_date_pages += 1
+                if empty_date_pages >= 50:
+                    result["hint"] = "تجاوزنا صفحات ما قبل 1/1/2026 دون العثور على رسائل أحدث."
+                    break
+                continue
+            empty_date_pages = 0
 
             referenced_ids = {reply_id for reply_id in (_reply_to_id(message) for message in raw_messages) if reply_id}
             batch = [
@@ -1022,6 +1010,7 @@ async def sync_and_analyze(
                 _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                 _span(batch_base),
             )
+            prepared_threads = []
             ordered_threads = sorted(
                 threads.items(),
                 key=lambda item: min((getattr(message, "id", 0) or 0) for message in item[1]),
@@ -1033,7 +1022,8 @@ async def sync_and_analyze(
                 checkpoint_id = max((getattr(message, "id", 0) or 0) for message in thread_messages)
                 if _thread_is_noise(thread_messages):
                     result["skipped"] += 1
-                    update_last_synced_id(checkpoint_id, group_key)
+                    if not use_batch_ai:
+                        update_last_synced_id(checkpoint_id, group_key)
                     _report(
                         on_progress,
                         _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
@@ -1049,11 +1039,7 @@ async def sync_and_analyze(
                 for index, message in enumerate(thread_messages):
                     role = "الرسالة الأساسية (طرح المشكلة أو الموضوع)" if index == 0 else f"الرد رقم {index} (الإجابة أو الحل)"
                     if index == 0:
-                        try:
-                            sender = await message.get_sender()
-                            author_name = getattr(sender, "first_name", None) or "عضو"
-                        except Exception:
-                            author_name = "عضو"
+                        author_name = await _resolve_author_name(message, sender_cache)
                     try:
                         parsed_text, media_kind, media_b64 = await _run_with_backoff(
                             lambda message=message: _extract_message_content(client, groq_key, message, skip_media),
@@ -1078,8 +1064,20 @@ async def sync_and_analyze(
                 if hold_checkpoint:
                     break
                 thread_text = "\n\n".join(blocks).strip()
-                if not thread_text.strip() and dominant_media == "text":
-                    update_last_synced_id(checkpoint_id, group_key)
+                if not thread_text:
+                    if not use_batch_ai:
+                        update_last_synced_id(checkpoint_id, group_key)
+                    continue
+                if use_batch_ai:
+                    prepared_threads.append({
+                        "root_id": root_id,
+                        "checkpoint_id": checkpoint_id,
+                        "thread_text": thread_text,
+                        "author_name": author_name,
+                        "dominant_media": dominant_media,
+                        "best_thumb": best_thumb,
+                        "fraction": fraction,
+                    })
                     continue
                 _report(
                     on_progress,
@@ -1092,7 +1090,7 @@ async def sync_and_analyze(
                             thread_text,
                             groq_key,
                             on_switch=lambda note, fraction=fraction: _report(on_progress, note, fraction),
-                            group_name=result.get("group") or "",
+                            group_name=group_name,
                         ),
                         on_progress,
                     )
@@ -1108,15 +1106,16 @@ async def sync_and_analyze(
                     update_last_synced_id(checkpoint_id, group_key)
                     continue
                 reason = card_rejection_reason(card)
+                thread_url = _build_thread_url(public_username, public_id, root_id)
                 if reason or save_card(
                     card,
                     root_id,
-                    f"https://t.me/c/{public_id}/{root_id}",
+                    thread_url,
                     author_name,
                     thread_text,
                     dominant_media,
                     best_thumb,
-                    group_name=result.get("group") or "",
+                    group_name=group_name,
                 ) is not True:
                     rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
                     notice = f"رفض النقاش {root_id}: {rejection}"
@@ -1132,6 +1131,65 @@ async def sync_and_analyze(
                     _pull_digest(result["group"], result["scanned"], result["threads"], result["skipped"], result["saved"]),
                     fraction,
                 )
+            if use_batch_ai and prepared_threads and not hold_checkpoint and not stopped_page:
+                for start_idx in range(0, len(prepared_threads), AI_BATCH_SIZE):
+                    if _STOP_SYNC_EVENT.is_set():
+                        stopped_page = True
+                        break
+                    chunk = prepared_threads[start_idx:start_idx + AI_BATCH_SIZE]
+                    payload = [{"thread_id": item["root_id"], "text": item["thread_text"]} for item in chunk]
+                    chunk_fraction = chunk[-1]["fraction"]
+                    _report(
+                        on_progress,
+                        f"الدفعة {batch_no}: تحليل حزمة من {len(chunk)} نقاشات عبر Groq | بطاقات {result['saved']}",
+                        chunk_fraction,
+                    )
+                    batch_cards = await _run_with_backoff(
+                        lambda payload=payload: analyze_threads_batch_with_ai(payload, groq_key, group_name=group_name),
+                        on_progress,
+                    )
+                    cards_by_id = {
+                        int(card["thread_id"]): card
+                        for card in batch_cards
+                        if isinstance(card, dict) and card.get("thread_id") is not None
+                    }
+                    for item in chunk:
+                        root_id = item["root_id"]
+                        checkpoint_id = item["checkpoint_id"]
+                        card = cards_by_id.get(int(root_id)) or {}
+                        if card.get("_error"):
+                            notice = f"خطأ Groq في النقاش {root_id}: {card.get('_error_type')}: {str(card.get('_error'))[:100]}"
+                            _note(logs, notice, "error")
+                            _report(on_progress, notice, chunk_fraction)
+                            if card.get("_key_failure"):
+                                hold_checkpoint = True
+                                result["error"] = notice
+                                break
+                            update_last_synced_id(checkpoint_id, group_key)
+                            continue
+                        reason = card_rejection_reason(card)
+                        thread_url = _build_thread_url(public_username, public_id, root_id)
+                        if reason or save_card(
+                            card,
+                            root_id,
+                            thread_url,
+                            item["author_name"],
+                            item["thread_text"],
+                            item["dominant_media"],
+                            item["best_thumb"],
+                            group_name=group_name,
+                        ) is not True:
+                            rejection = reason or card_rejection_reason(card) or "لم تُحفظ البطاقة"
+                            notice = f"رفض النقاش {root_id}: {rejection}"
+                            _note(logs, notice, "error")
+                            _report(on_progress, notice, chunk_fraction)
+                            update_last_synced_id(checkpoint_id, group_key)
+                            continue
+                        result["saved"] += 1
+                        update_last_synced_id(checkpoint_id, group_key)
+                        _note(logs, f"تم حفظ بطاقة: [{card.get('category')}] {card.get('title')}")
+                    if hold_checkpoint:
+                        break
             if stopped_page:
                 result["stopped"] = True
                 result["ok"] = True
@@ -1311,6 +1369,7 @@ def run_sync(
     api_key: str = "",
     skip_media: bool = False,
     force_from_start: bool = False,
+    use_batch_ai: bool = False,
 ) -> dict:
     """نقطة التشغيل التي يستدعيها زر Streamlit دون فتح الطرفية."""
     global _SYNC_ROUND_ACTIVE
@@ -1319,6 +1378,7 @@ def run_sync(
     chosen_key = str(api_key or os.environ.get("GROQ_API_KEY") or "").strip()
     media_skipped = bool(skip_media)
     start_over = bool(force_from_start)
+    batched = bool(use_batch_ai)
     acquired = False
     try:
         acquired = _CLIENT_LOCK.acquire(blocking=False)
@@ -1344,6 +1404,7 @@ def run_sync(
                 api_key=chosen_key,
                 skip_media=media_skipped,
                 force_from_start=start_over,
+                use_batch_ai=batched,
             )
         )
     finally:
@@ -1360,7 +1421,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--mode", type=str, default="history")
+    parser.add_argument("--batch-ai", action="store_true")
     args, _ = parser.parse_known_args()
-    summary = run_sync(limit=args.limit)
+    summary = run_sync(limit=args.limit, use_batch_ai=args.batch_ai)
     if not summary["ok"]:
         raise SystemExit(summary["error"] or "فشل السحب")
