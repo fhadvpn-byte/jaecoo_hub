@@ -567,13 +567,12 @@ def save_card(
 # 4. محرك Groq الذكي مع إدارة الحصص الدقيقة
 # ==========================================
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.3-70b-versatile",
     "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
 ]
 _GROQ_COOLDOWN: dict[tuple[str, str], float] = {}
 _GROQ_LAST_ERROR: dict[tuple[str, str], Exception] = {}
@@ -769,14 +768,16 @@ def _groq_create(client, model_name: str, messages: list, temperature: float, us
 
 
 def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_mode: bool = False, on_switch=None):
-    """يدور بين المفاتيح والنماذج السبعة، وينتظر تلقائياً إذا امتلأت حصة الدقيقة المؤقتة."""
+    """يدور بين المفاتيح والنماذج، ويفصل خطأ كبر الحزمة (413) عن نفاد الحصة (429)."""
     keys = collect_groq_keys(api_key)
     if not keys:
         raise RuntimeError("401 مفتاح Groq API غير موجود")
     payload = _with_json_word(messages) if json_mode else messages
     last_error = None
+    saw_payload_too_large = False
     for _wait_round in range(3):
         now = time.time()
+        saw_payload_too_large = False
         for key in keys:
             client = Groq(api_key=key)
             for model_name in GROQ_MODELS:
@@ -801,6 +802,9 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
                         _GROQ_UNAVAILABLE.add(pair)
                         _GROQ_COOLDOWN[pair] = time.time() + _GROQ_MISSING_MODEL_COOLDOWN
                         continue
+                    if "413" in message or "request too large" in message or "context_length" in message:
+                        saw_payload_too_large = True
+                        continue
                     if "401" in message or "invalid_api_key" in message or "invalid api key" in message:
                         break
                     if "429" in message or "rate_limit" in message or "rate limit" in message:
@@ -809,15 +813,16 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
                         if on_switch:
                             on_switch(f"ضغط على {model_name.split('/')[-1]} (تهدئة {pause}ث) — التبديل للبديل...")
                     continue
+        if saw_payload_too_large:
+            raise ValueError("413 حجم الحزمة أكبر من سقف النموذج الحالي؛ سيتم التحويل للتحليل الفردي")
         now = time.time()
+        all_candidates = [(key, model) for key in keys for model in GROQ_MODELS if (key, model) not in _GROQ_UNAVAILABLE]
         active_waits = [
             (_GROQ_COOLDOWN[pair] - now, pair)
-            for pair in [
-                (key, model) for key in keys for model in GROQ_MODELS
-                if (key, model) not in _GROQ_UNAVAILABLE and _GROQ_COOLDOWN.get((key, model), 0) > now
-            ]
+            for pair in all_candidates
+            if _GROQ_COOLDOWN.get(pair, 0) > now
         ]
-        if not active_waits:
+        if not active_waits or len(active_waits) < len(all_candidates):
             break
         min_wait, nearest_pair = min(active_waits, key=lambda item: item[0])
         if min_wait <= 95:
@@ -833,9 +838,6 @@ def _groq_complete(api_key: str, messages: list, temperature: float = 0.1, json_
         )
     if last_error is not None:
         raise last_error
-    fallback_err = next(iter(_GROQ_LAST_ERROR.values()), None)
-    if fallback_err is not None:
-        raise fallback_err
     raise RuntimeError("429 تعذر الوصول إلى نماذج Groq حالياً")
 
 
@@ -1178,14 +1180,15 @@ def _prepare_batch_card(raw: dict, thread_text: str, thread_id, group_name: str)
 
 
 def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, group_name: str = "", on_switch=None) -> list[dict]:
-    payload = [item for item in (threads_payload or []) if str(item.get("text") or "").strip()][:8]
+    payload = [item for item in (threads_payload or []) if str(item.get("text") or "").strip()][:4]
     if not payload:
         return []
 
     def _fallback_one(item: dict) -> dict:
         thread_id = item.get("thread_id")
+        trimmed_text = str(item.get("text") or "")[:3500]
         try:
-            card = analyze_thread_with_ai(str(item.get("text") or ""), api_key, on_switch=on_switch, group_name=group_name)
+            card = analyze_thread_with_ai(trimmed_text, api_key, on_switch=on_switch, group_name=group_name)
             return _prepare_batch_card(card, str(item.get("text") or ""), thread_id, group_name)
         except Exception as exc:
             return {
@@ -1199,7 +1202,7 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
         return [_fallback_one(item) for item in payload]
 
     packed = "\n\n".join(
-        f"### THREAD {item.get('thread_id')}\n{item.get('text')}"
+        f"### THREAD {item.get('thread_id')}\n{str(item.get('text') or '')[:2200]}"
         for item in payload
     )
     messages = [

@@ -1288,7 +1288,7 @@ if is_admin:
         )
     with opt_col2:
         use_batch_ai = st.checkbox(
-            "🧠 التحليل المجمّع (دمج كل 8 نقاشات في طلب واحد لتوفير حصة Groq)",
+            "🧠 التحليل المجمّع (دمج كل 4 نقاشات في طلب واحد لتوفير حصة Groq)",
             value=False,
             key="batch_ai_toggle",
         )
