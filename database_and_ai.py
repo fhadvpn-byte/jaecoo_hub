@@ -452,13 +452,17 @@ def save_telegram_session(session_text: str) -> None:
     """يحفظ String Session الجديدة محلياً ويعلّم الجلسة صالحة."""
     set_app_setting("telegram_string_session", session_text.strip())
     set_app_setting("telegram_session_status", "ok")
+    set_app_setting("invalid_tg_session", "")
     cfg = load_config()
     cfg["tg_session"] = session_text.strip()
     save_config(cfg)
 
 
 def mark_telegram_session_invalid() -> None:
+    current = str(get_app_setting("telegram_string_session") or "").strip()
     set_app_setting("telegram_session_status", "invalid")
+    if current:
+        set_app_setting("invalid_tg_session", current)
 
 
 def telegram_session_status() -> str:

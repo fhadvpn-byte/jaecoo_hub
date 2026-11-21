@@ -32,7 +32,6 @@ from database_and_ai import (
     load_telegram_session,
     save_card,
     save_config,
-    telegram_session_status,
     transcribe_media_bytes,
 )
 from telegram_scraper import (
@@ -244,15 +243,20 @@ def _card_text(value) -> str:
 
 
 def _telegram_login_needed(config: dict) -> bool:
-    if st.session_state.get("tg_phone_code_hash") or st.session_state.get("tg_active_session"):
+    from database_and_ai import get_app_setting
+    if st.session_state.get("tg_phone_code_hash"):
         return True
-    if telegram_session_status() == "invalid":
+    current_session = _clean_tg_session(
+        st.session_state.get("tg_active_session")
+        or read_cloud_string_session()
+        or load_telegram_session()
+        or config.get("tg_session")
+        or ""
+    )
+    if not current_session:
         return True
-    error = str(st.session_state.get("sync_error") or "")
-    if any(part in error for part in ("أُلغيت جلسة", "غير صالحة", "غير مفعّلة", "authorization key")):
-        return True
-    has_session = bool(load_telegram_session() or str(config.get("tg_session") or "").strip())
-    return not has_session
+    known_bad = _clean_tg_session(get_app_setting("invalid_tg_session"))
+    return bool(known_bad and known_bad == current_session)
 
 
 def render_telegram_login(config: dict, expanded: bool = False) -> None:
@@ -437,28 +441,68 @@ def _read_saved(cfg: dict, names: tuple[str, ...]) -> str:
     return ""
 
 
+def _clean_tg_session(raw: str) -> str:
+    text = str(raw or "").strip()
+    if "=" in text and text.upper().startswith("TELEGRAM_SESSION"):
+        text = text.split("=", 1)[1].strip()
+    quotes = "\"'`“”‘’"
+    while len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
+        text = text[1:-1].strip()
+    return re.sub(r"\s+", "", text)
+
+
 def read_cloud_string_session() -> str:
-    """يقرأ String Session من st.secrets['TELEGRAM_SESSION'] لسحب السحابة."""
+    """يبحث عن TELEGRAM_SESSION في الجذر وفي كل أقسام Secrets وينظفه من المسافات والأسطر."""
+    target_keys = ("TELEGRAM_SESSION", "tg_session", "telegram_session", "TG_SESSION", "SESSION_STRING")
     try:
-        return str(st.secrets["TELEGRAM_SESSION"] or "").strip()
+        secrets_obj = st.secrets
     except Exception:
         return ""
+    for key in target_keys:
+        try:
+            val = _clean_tg_session(secrets_obj.get(key, ""))
+            if val:
+                return val
+        except Exception:
+            pass
+    try:
+        sections = list(secrets_obj.keys())
+    except Exception:
+        sections = []
+    for sec in sections:
+        try:
+            bag = secrets_obj[sec]
+            if hasattr(bag, "get"):
+                for key in target_keys:
+                    val = _clean_tg_session(bag.get(key, ""))
+                    if val:
+                        return val
+        except Exception:
+            continue
+    return ""
 
 
 def apply_cloud_string_session(cfg: dict) -> dict:
-    fresh = str(st.session_state.get("tg_active_session") or load_telegram_session() or "").strip()
-    if fresh:
-        cfg["tg_session"] = fresh
-        os.environ["TELEGRAM_SESSION"] = fresh
+    from database_and_ai import set_app_setting
+    just_activated = _clean_tg_session(st.session_state.get("tg_active_session", ""))
+    if just_activated:
+        cfg["tg_session"] = just_activated
+        os.environ["TELEGRAM_SESSION"] = just_activated
         return cfg
-    secret = read_cloud_string_session() or _read_secret(("TELEGRAM_SESSION", "tg_session", "telegram_session"))
+    secret = read_cloud_string_session()
     if secret:
+        stored_db = _clean_tg_session(load_telegram_session())
+        if secret != stored_db:
+            set_app_setting("telegram_string_session", secret)
+            set_app_setting("telegram_session_status", "ok")
+            set_app_setting("invalid_tg_session", "")
         cfg["tg_session"] = secret
         os.environ["TELEGRAM_SESSION"] = secret
-    else:
-        saved = str(cfg.get("tg_session") or "").strip()
-        if saved:
-            os.environ["TELEGRAM_SESSION"] = saved
+        return cfg
+    local_saved = _clean_tg_session(load_telegram_session() or cfg.get("tg_session") or "")
+    if local_saved:
+        cfg["tg_session"] = local_saved
+        os.environ["TELEGRAM_SESSION"] = local_saved
     return cfg
 
 
