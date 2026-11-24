@@ -48,6 +48,7 @@ JAECOO_MODELS = [
     "Jaecoo J8",
     "Jaecoo J8 SHS",
     "Jaecoo J7",
+    "Jaecoo J7 SHS",
     "Jaecoo J5",
     "جميع الطرازات / عام",
 ]
@@ -1210,13 +1211,15 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         _render_stat_card("إجمالي البطاقات", total_cards, "🔹")
     with col_verified:
         _render_stat_card("الحلول المؤكدة", verified_cards, "✅")
-    col_j8, col_j8_shs, col_j7, col_j5, col_all = st.columns(5)
+    col_j8, col_j8_shs, col_j7, col_j7_shs, col_j5, col_all = st.columns(6)
     with col_j8:
         _render_stat_card("بطاقات Jaecoo J8", _model_count(frame, "Jaecoo J8"), "🚙")
     with col_j8_shs:
         _render_stat_card("بطاقات Jaecoo J8 SHS", _model_count(frame, "Jaecoo J8 SHS"), "⚡")
     with col_j7:
         _render_stat_card("بطاقات Jaecoo J7", _model_count(frame, "Jaecoo J7"), "🚘")
+    with col_j7_shs:
+        _render_stat_card("بطاقات Jaecoo J7 SHS", _model_count(frame, "Jaecoo J7 SHS"), "⚡")
     with col_j5:
         _render_stat_card("بطاقات Jaecoo J5", _model_count(frame, "Jaecoo J5"), "🚗")
     with col_all:
@@ -1518,7 +1521,7 @@ with col_s2:
     model_filter = st.selectbox(
         "🚙 تصفية حسب الطراز:",
         ["الكل", *JAECOO_MODELS],
-        help="يشمل Jaecoo J8 SHS للسيارات الهجينة: SHS، هايبرد، هجين، الشاحن، والبطارية الكبيرة.",
+        help="Jaecoo J7 SHS لطراز 7 مع SHS أو الهايبرد. Jaecoo J8 SHS عند SHS أو الهايبرد دون تحديد J7.",
     )
 
 with st.expander("🤖 استشارة المهندس الذكي", expanded=False):

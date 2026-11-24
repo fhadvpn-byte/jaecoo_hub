@@ -57,7 +57,7 @@ class KnowledgeCardSchema(BaseModel):
         "نبض القروب والدردشة العامة",
     ] = Field(description="القسم الأنسب من الأقسام الثمانية")
 
-    car_model: Literal["Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "جميع الطرازات / عام"] = Field(
+    car_model: Literal["Jaecoo J8", "Jaecoo J8 SHS", "Jaecoo J5", "Jaecoo J7", "Jaecoo J7 SHS", "جميع الطرازات / عام"] = Field(
         description="طراز السيارة"
     )
     sub_system: Literal[
@@ -91,7 +91,7 @@ class KnowledgeCardSchema(BaseModel):
 COMPACT_SCHEMA_GUIDE = """{
   "is_worth_archiving": true,
   "category": "أحد الأقسام: الأعطال والتشخيص | الإصلاحات والحلول المؤكدة | بنك القطع البديلة والمطابقات | الأنظمة الذكية والشاشات | الصيانة الدورية والوكالات | الإكسسوارات والتجهيزات | تجارب القيادة والأداء الفعلي | نبض القروب والدردشة العامة",
-  "car_model": "أحد الطرازات: Jaecoo J8 | Jaecoo J8 SHS | Jaecoo J7 | Jaecoo J5 | جميع الطرازات / عام",
+  "car_model": "أحد الطرازات: Jaecoo J8 | Jaecoo J8 SHS | Jaecoo J7 SHS | Jaecoo J7 | Jaecoo J5 | جميع الطرازات / عام",
   "sub_system": "أحد الأنظمة: الوكيل والمراكز المعتمدة | جدول وتكاليف الصيانة الدورية | المحرك والتيربو والمنظومة الهجين SHS | القير والدفع الرباعي AWD | الكهرباء والبطارية والحساسات | الشاشة والنظام الصوتي والربط | التكييف والتبريد | العضلات والفرامل والتعليق | الهيكل الخارجي والمقصورة | الإكسسوارات ومنتجات AliExpress | تقييم العملية والمميزات والعيوب | عام",
   "title": "عنوان عربي فصيح من 5 إلى 10 كلمات",
   "problem_or_topic": "وصف المشكلة أو الاستفسار أو الموضوع بالعربية",
@@ -154,8 +154,10 @@ SYSTEM_PROMPT = """
 شروط صارمة:
 - العربية الفصحى فقط مع السماح بروابط الإنترنت وأرقام القطع والمصطلحات مثل AGM وCarPlay وTbox وOBD وAWD وSHS. ممنوع nan.
 - التحيات والدردشة الفارغة بلا معلومة ولا استفسار تعني is_worth_archiving = false.
-- Jaecoo J7 مع هايبرد أو PHEV تبقى Jaecoo J7 ما لم يُذكر J8 أو SHS.
-- Jaecoo J8 SHS عند ذكر SHS، أو هايبرد مع J8، أو هايبرد دون تحديد J7 أو J5.
+- الطرازات المعتمدة: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
+- Jaecoo J7 SHS عند ذكر J7 أو جايكو 7 أو جايكو7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو منفذ الشحن أو كهرباء.
+- Jaecoo J7 يبقى للبنزين عندما يُذكر J7 دون هذه المصطلحات.
+- Jaecoo J8 SHS عند ذكر SHS أو هايبرد مع J8، أو هايبرد دون تحديد J7 أو J5.
 """
 
 # ==========================================
@@ -211,6 +213,7 @@ def init_db():
     """)
     _ensure_service_tables(conn)
     _seed_service_reference(conn)
+    _reclassify_j7_shs_cards(conn)
     conn.commit()
     conn.close()
 
@@ -908,8 +911,53 @@ def _mentions_shs_name(text: str) -> bool:
     return bool(re.search(r"(?<![a-z0-9])shs(?![a-z0-9])", (text or "").lower()))
 
 
+_J7_HYBRID_TERMS = ("shs", "هايبرد", "هجين", "phev", "شحن", "منفذ الشحن", "كهرباء")
+
+
+def _mentions_j7_signal(text: str) -> bool:
+    """يتعرف على J7 حتى في صيغ جايكو7 و7 SHS التي لا يلتقطها الفحص العام."""
+    raw = text or ""
+    lowered = raw.lower()
+    compact = re.sub(r"[\s\u200c\u200d\u200e\u200f]+", "", lowered)
+    if re.search(r"(?<![a-z0-9])j7(?![0-9])", lowered):
+        return True
+    if re.search(r"(?<![a-z0-9])7\s*shs(?![a-z0-9])", lowered):
+        return True
+    if any(marker in compact for marker in ("جايكو7", "جيكو7", "جايكو٧", "جيكو٧")):
+        return True
+    return _mentions_model(raw, "Jaecoo J7")
+
+
+def _mentions_j7_hybrid_terms(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(term in lowered for term in _J7_HYBRID_TERMS)
+
+
+def _text_is_j7_shs(text: str) -> bool:
+    return _mentions_j7_signal(text) and _mentions_j7_hybrid_terms(text)
+
+
+def _reclassify_j7_shs_cards(conn) -> None:
+    """ينقل البطاقات القديمة التي تذكر J7 مع SHS أو الهايبرد إلى Jaecoo J7 SHS."""
+    rows = conn.execute(
+        """
+        SELECT id, title, problem_or_topic, solution_or_summary,
+               part_numbers_or_specs, keywords, raw_thread_text
+        FROM knowledge_cards
+        WHERE car_model IN ('Jaecoo J7', 'Jaecoo J8 SHS')
+        """
+    ).fetchall()
+    for row in rows:
+        blob = "\n".join(str(part or "") for part in row[1:])
+        if _text_is_j7_shs(blob):
+            conn.execute(
+                "UPDATE knowledge_cards SET car_model = ? WHERE id = ? AND car_model IN ('Jaecoo J7', 'Jaecoo J8 SHS')",
+                ("Jaecoo J7 SHS", row[0]),
+            )
+
+
 def assign_jaecoo_model(data: dict, source_text: str = "") -> dict:
-    """J7/J5 الهايبرد تبقى لطرازها. J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا طراز."""
+    """J7 مع SHS أو الهايبرد يصبح J7 SHS قبل فحص J8 SHS. J5 الهايبرد تبقى J5."""
     if not isinstance(data, dict):
         return data
     blob = _card_blob(data, source_text)
@@ -918,7 +966,9 @@ def assign_jaecoo_model(data: dict, source_text: str = "") -> dict:
     has_j8 = _mentions_model(blob, "Jaecoo J8")
     hybrid = _mentions_hybrid(blob)
     shs_name = _mentions_shs_name(blob)
-    if shs_name or (hybrid and has_j8) or (hybrid and not has_j7 and not has_j5):
+    if _text_is_j7_shs(blob):
+        data["car_model"] = "Jaecoo J7 SHS"
+    elif shs_name or (hybrid and has_j8) or (hybrid and not has_j7 and not has_j5):
         data["car_model"] = "Jaecoo J8 SHS"
     elif has_j8:
         data["car_model"] = "Jaecoo J8"
@@ -1214,7 +1264,8 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
                 '"sub_system": "", "title": "", "problem_or_topic": "", "solution_or_summary": "", '
                 '"part_numbers_or_specs": "", "is_verified_solution": false, "keywords": ""}]} '
                 "بطاقة واحدة لكل THREAD مع نسخ thread_id كما هو وبالعربية الفصحى. "
-                "Jaecoo J7 مع هايبرد تبقى J7 إذا لم يُذكر J8 أو SHS. "
+                "Jaecoo J7 SHS عند J7 أو جايكو 7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو كهرباء. "
+                "Jaecoo J7 للبنزين دون هذه المصطلحات. "
                 "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا J7 وJ5."
             ),
         },
