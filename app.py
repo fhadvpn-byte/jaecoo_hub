@@ -1187,10 +1187,22 @@ _render_service_reference()
 
 df = _load_cards_dataframe()
 
+def _model_key(value) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
 def _model_count(frame: pd.DataFrame, model: str) -> int:
     if frame.empty or "car_model" not in frame.columns:
         return 0
-    return int(frame["car_model"].fillna("").str.strip().str.upper().eq(model.upper()).sum())
+    keys = frame["car_model"].fillna("").map(_model_key)
+    return int(keys.eq(_model_key(model)).sum())
+
+
+def _model_titles(frame: pd.DataFrame, model: str, limit: int = 3) -> str:
+    if frame.empty or "car_model" not in frame.columns or "title" not in frame.columns:
+        return ""
+    matched = frame.loc[frame["car_model"].fillna("").map(_model_key).eq(_model_key(model)), "title"]
+    return "، ".join(title for title in matched.fillna("").head(limit) if str(title).strip())
 
 
 def _render_stat_card(title: str, count: int, icon: str) -> None:
@@ -1224,16 +1236,23 @@ def _render_metrics(frame: pd.DataFrame) -> None:
         _render_stat_card("بطاقات Jaecoo J5", _model_count(frame, "Jaecoo J5"), "🚗")
     with col_all:
         _render_stat_card("جميع الطرازات / عام", _model_count(frame, "جميع الطرازات / عام"), "🌐")
-    shs_count = _model_count(frame, "Jaecoo J8 SHS")
-    if frame.empty or "car_model" not in frame.columns or shs_count == 0:
-        st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: 0.")
-    else:
-        shs_titles = frame.loc[
-            frame["car_model"].fillna("").str.strip().str.upper().eq("JAECOO J8 SHS"),
-            "title",
-        ].fillna("").head(3)
-        latest = "، ".join(title for title in shs_titles if str(title).strip())
-        st.caption(f"إجمالي البطاقات الآن {total_cards}. بطاقات Jaecoo J8 SHS الظاهرة: {shs_count}. أحدثها: {latest}")
+    j8_shs_count = _model_count(frame, "Jaecoo J8 SHS")
+    j7_shs_count = _model_count(frame, "Jaecoo J7 SHS")
+    caption = (
+        f"إجمالي البطاقات الآن {total_cards}. "
+        f"بطاقات Jaecoo J8 SHS الظاهرة: {j8_shs_count}. "
+        f"بطاقات Jaecoo J7 SHS الظاهرة: {j7_shs_count}."
+    )
+    latest_bits = []
+    j8_latest = _model_titles(frame, "Jaecoo J8 SHS")
+    j7_latest = _model_titles(frame, "Jaecoo J7 SHS")
+    if j8_latest:
+        latest_bits.append(f"أحدث J8 SHS: {j8_latest}")
+    if j7_latest:
+        latest_bits.append(f"أحدث J7 SHS: {j7_latest}")
+    if latest_bits:
+        caption = f"{caption} {' | '.join(latest_bits)}."
+    st.caption(caption)
 
 @st.fragment(run_every=timedelta(seconds=4))
 def _live_archive_metrics():
@@ -1339,7 +1358,9 @@ if is_admin:
                     f"سلاسل النقاش: {result.get('threads', 0)} | "
                     f"استُبعدت كترحيب عابر: {result.get('skipped', 0)} | "
                     f"حُفظت/حُدثت: {result.get('saved', 0)} بطاقة. "
-                    f"الإجمالي الآن {total_cards}. بطاقات Jaecoo J8 SHS: {_model_count(fresh_df, 'Jaecoo J8 SHS')}."
+                    f"الإجمالي الآن {total_cards}. "
+                    f"بطاقات Jaecoo J8 SHS: {_model_count(fresh_df, 'Jaecoo J8 SHS')}. "
+                    f"بطاقات Jaecoo J7 SHS: {_model_count(fresh_df, 'Jaecoo J7 SHS')}."
                 )
             else:
                 st.session_state["sync_error"] = str(result.get("error") or "توقف السحب بسبب خطأ غير متوقع.")
@@ -1571,7 +1592,7 @@ with st.expander("🤖 استشارة المهندس الذكي", expanded=False
 filtered_df = df.copy()
 if model_filter != "الكل" and not filtered_df.empty and "car_model" in filtered_df.columns:
     filtered_df = filtered_df[
-        filtered_df["car_model"].fillna("").str.strip().str.upper() == model_filter.strip().upper()
+        filtered_df["car_model"].fillna("").map(_model_key) == _model_key(model_filter)
     ]
 
 if search_q.strip() and not filtered_df.empty:

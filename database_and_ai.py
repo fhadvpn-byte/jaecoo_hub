@@ -155,7 +155,7 @@ SYSTEM_PROMPT = """
 - العربية الفصحى فقط مع السماح بروابط الإنترنت وأرقام القطع والمصطلحات مثل AGM وCarPlay وTbox وOBD وAWD وSHS. ممنوع nan.
 - التحيات والدردشة الفارغة بلا معلومة ولا استفسار تعني is_worth_archiving = false.
 - الطرازات المعتمدة: Jaecoo J8، Jaecoo J8 SHS، Jaecoo J7 SHS، Jaecoo J7، Jaecoo J5، جميع الطرازات / عام.
-- Jaecoo J7 SHS عند ذكر J7 أو جايكو 7 أو جايكو7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو منفذ الشحن أو كهرباء.
+- Jaecoo J7 SHS عند ذكر J7 أو جايكو 7 أو جايكو7 أو ج7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو منفذ الشحن.
 - Jaecoo J7 يبقى للبنزين عندما يُذكر J7 دون هذه المصطلحات.
 - Jaecoo J8 SHS عند ذكر SHS أو هايبرد مع J8، أو هايبرد دون تحديد J7 أو J5.
 """
@@ -213,7 +213,7 @@ def init_db():
     """)
     _ensure_service_tables(conn)
     _seed_service_reference(conn)
-    _reclassify_j7_shs_cards(conn)
+    _normalize_knowledge_models(conn)
     conn.commit()
     conn.close()
 
@@ -911,7 +911,7 @@ def _mentions_shs_name(text: str) -> bool:
     return bool(re.search(r"(?<![a-z0-9])shs(?![a-z0-9])", (text or "").lower()))
 
 
-_J7_HYBRID_TERMS = ("shs", "هايبرد", "هجين", "phev", "شحن", "منفذ الشحن", "كهرباء")
+_J7_HYBRID_TERMS = ("shs", "هايبرد", "هجين", "phev", "شحن", "منفذ الشحن")
 
 
 def _mentions_j7_signal(text: str) -> bool:
@@ -922,6 +922,8 @@ def _mentions_j7_signal(text: str) -> bool:
     if re.search(r"(?<![a-z0-9])j7(?![0-9])", lowered):
         return True
     if re.search(r"(?<![a-z0-9])7\s*shs(?![a-z0-9])", lowered):
+        return True
+    if re.search(r"(?<![\u0600-\u06FF])ج\s*[7٧](?!\d)", raw):
         return True
     if any(marker in compact for marker in ("جايكو7", "جيكو7", "جايكو٧", "جيكو٧")):
         return True
@@ -937,22 +939,65 @@ def _text_is_j7_shs(text: str) -> bool:
     return _mentions_j7_signal(text) and _mentions_j7_hybrid_terms(text)
 
 
-def _reclassify_j7_shs_cards(conn) -> None:
-    """ينقل البطاقات القديمة التي تذكر J7 مع SHS أو الهايبرد إلى Jaecoo J7 SHS."""
+APPROVED_CAR_MODELS = (
+    "Jaecoo J8",
+    "Jaecoo J8 SHS",
+    "Jaecoo J7",
+    "Jaecoo J7 SHS",
+    "Jaecoo J5",
+    "جميع الطرازات / عام",
+)
+_APPROVED_BY_KEY = {model.casefold(): model for model in APPROVED_CAR_MODELS}
+_LABEL_ALIASES = {
+    "j5": "Jaecoo J5",
+    "j7": "Jaecoo J7",
+    "j8": "Jaecoo J8",
+    "j7 shs": "Jaecoo J7 SHS",
+    "j8 shs": "Jaecoo J8 SHS",
+    "jaecoo j7 phev": "Jaecoo J7 SHS",
+    "jaecoo j7 hybrid": "Jaecoo J7 SHS",
+    "j7 phev": "Jaecoo J7 SHS",
+    "j7 hybrid": "Jaecoo J7 SHS",
+}
+
+
+def _canonical_car_model(value: str) -> str:
+    key = " ".join(str(value or "").split()).casefold()
+    if not key:
+        return ""
+    return _APPROVED_BY_KEY.get(key) or _LABEL_ALIASES.get(key, "")
+
+
+def _resolved_car_model(car_model: str, blob: str) -> str:
+    """يوحّد حالة الأحرف، ثم يفرز نص J7 الهجين قبل الإبقاء على الطراز المعتمد."""
+    canonical = _canonical_car_model(car_model)
+    if _text_is_j7_shs(blob) and canonical in {"", "Jaecoo J7", "Jaecoo J8 SHS", "Jaecoo J7 SHS"}:
+        return "Jaecoo J7 SHS"
+    if canonical:
+        return canonical
+    guessed = str(assign_jaecoo_model({}, blob).get("car_model") or "").strip()
+    if guessed in APPROVED_CAR_MODELS:
+        return guessed
+    return "جميع الطرازات / عام"
+
+
+def _normalize_knowledge_models(conn) -> None:
+    """يوحّد صيغة الطرازات في knowledge_cards ويفرز بطاقات J7 الهجينة."""
     rows = conn.execute(
         """
-        SELECT id, title, problem_or_topic, solution_or_summary,
+        SELECT id, car_model, title, problem_or_topic, solution_or_summary,
                part_numbers_or_specs, keywords, raw_thread_text
         FROM knowledge_cards
-        WHERE car_model IN ('Jaecoo J7', 'Jaecoo J8 SHS')
         """
     ).fetchall()
     for row in rows:
-        blob = "\n".join(str(part or "") for part in row[1:])
-        if _text_is_j7_shs(blob):
+        current = row[1] or ""
+        blob = "\n".join(str(part or "") for part in row[2:])
+        resolved = _resolved_car_model(current, blob)
+        if resolved != current:
             conn.execute(
-                "UPDATE knowledge_cards SET car_model = ? WHERE id = ? AND car_model IN ('Jaecoo J7', 'Jaecoo J8 SHS')",
-                ("Jaecoo J7 SHS", row[0]),
+                "UPDATE knowledge_cards SET car_model = ? WHERE id = ?",
+                (resolved, row[0]),
             )
 
 
@@ -1264,7 +1309,7 @@ def analyze_threads_batch_with_ai(threads_payload: list[dict], api_key: str, gro
                 '"sub_system": "", "title": "", "problem_or_topic": "", "solution_or_summary": "", '
                 '"part_numbers_or_specs": "", "is_verified_solution": false, "keywords": ""}]} '
                 "بطاقة واحدة لكل THREAD مع نسخ thread_id كما هو وبالعربية الفصحى. "
-                "Jaecoo J7 SHS عند J7 أو جايكو 7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو كهرباء. "
+                "Jaecoo J7 SHS عند J7 أو جايكو 7 أو جايكو7 أو ج7 مع SHS أو هايبرد أو هجين أو PHEV أو شحن أو منفذ الشحن. "
                 "Jaecoo J7 للبنزين دون هذه المصطلحات. "
                 "Jaecoo J8 SHS عند SHS أو هايبرد J8 أو هايبرد بلا J7 وJ5."
             ),
